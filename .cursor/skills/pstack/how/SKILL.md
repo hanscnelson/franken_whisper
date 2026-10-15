@@ -34,3 +34,4 @@ Present the explainer's output. Light edits for clarity or context from the conv
 ## Output format
 
 The explanation uses the sections defined in `references/explainer-prompt.md`, dropping any that do not apply: Overview, Key Concepts, How It Works, Where Things Live, Gotchas.
+x
