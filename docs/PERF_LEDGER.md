@@ -49,6 +49,28 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
+## 2026-10-15 — Sortformer CPU elementwise rows — **4-thread diarization 1032 → 779 ms (1.32×) on a 25.8 s clip; probabilities and 7 turns bit-identical to unmodified `35f7d37`**
+
+**Result class: SELF-SPEEDUP / MAINTENANCE.** Same-binary kill switch
+`FW_SORTFORMER_ELEMENTWISE_PARALLEL=0`. Not a campaign win. The 3–4× target
+is not met on this 4-core host. Full table, host, and the upstream draft:
+`docs/perf/sortformer-cpu-threading.md`.
+
+- **Host:** hypervisor Intel Xeon, 4 cores / 4 threads, 15 GiB, 1 NUMA node.
+  Governor not exposed. Binary `release-perf`, opt-level 3, thin LTO,
+  `-C target-cpu=x86-64-v3`. The `franken_whisper` crate used
+  `codegen-units=8` because `codegen-units=1` was OOM-killed on this machine.
+  Requested threads 1/4/12; 12 is oversubscribed.
+- **Signal:** `tests/fixtures/sortformer_representative_speech.wav`, 412109
+  samples, 16 kHz mono, Sortformer v2.1 f32, `SortformerSession::diarize`.
+- **4-thread e2e median:** serial elementwise 1031.870 ms, parallel 778.971 ms
+  (1.32×). Versus 1-thread serial 1283.418 ms the parallel arm is 1.65×.
+  12-thread parallel is 864.230 ms, slower than 4.
+- **Identity:** serial@4 matches parallel and serial at 1, 4, and 12 threads
+  in one binary. A separate unmodified `35f7d37` binary matched the committed
+  golden: 1288 f32 probability bits and 7 turn start/end/speaker values.
+- **ReLU** stayed serial. Splitting the 609×2048 loop was slower.
+
 ## 2026-10-09 — model load under `--threads N`: tiled f16→f32 transpose and streaming load by default (bd-ct0y) — **single clip at `--threads 8`: load spans 856 → 442 ms, wall 0.923× (CI95 0.903–0.937); peak RSS 4.56 → 3.22 GB; transcripts byte-identical; thread bound unchanged**
 
 **Result class: SELF-SPEEDUP / MAINTENANCE.** franken against franken

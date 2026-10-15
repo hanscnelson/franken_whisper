@@ -10,7 +10,10 @@
 //! incremental preemphasis/STFT continuity remain separate, uncertified seams.
 
 use std::fmt;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::error::{FwError, FwResult};
@@ -826,9 +829,7 @@ impl SortformerF32Facade {
         relu_in_place(&mut hidden.data);
         let logits = self.speaker_logits.forward(&hidden)?;
         let mut probabilities = logits;
-        for value in &mut probabilities.data {
-            *value = sigmoid_f32(*value)?;
-        }
+        sigmoid_slice_in_place(&mut probabilities.data)?;
         let chunk_predictions = Self::update_streaming_state_transactionally(
             state,
             &chunk_embeddings,
@@ -1210,9 +1211,7 @@ impl SortformerF32Facade {
         relu_in_place(&mut activated_hidden.data);
         let logits = self.speaker_logits.forward(&activated_hidden)?;
         let mut probabilities = logits.clone();
-        for value in &mut probabilities.data {
-            *value = sigmoid_f32(*value)?;
-        }
+        sigmoid_slice_in_place(&mut probabilities.data)?;
         let prefix = format!("fixture.{fixture}.step.{step:03}.l5");
         let candidates = [
             (format!("{prefix}.hidden"), hidden),
@@ -2168,18 +2167,22 @@ impl BatchNorm1d {
                 "BatchNorm input has invalid geometry or a non-finite value",
             ));
         }
-        for row in input.data.chunks_mut(self.width) {
+        let mean = &self.running_mean;
+        let variance = &self.running_var;
+        let scale = &self.scale;
+        let bias = &self.bias;
+        map_rows_mut(&mut input.data, self.width, |_row, row| {
             for (channel, value) in row.iter_mut().enumerate() {
-                let variance = self.running_var[channel];
-                if variance < 0.0 {
+                let channel_variance = variance[channel];
+                if channel_variance < 0.0 {
                     return Err(reference_error(
                         "batch_norm_state",
                         "BatchNorm running variance is negative",
                     ));
                 }
-                *value = (*value - self.running_mean[channel]) / (variance + Self::EPSILON).sqrt()
-                    * self.scale[channel]
-                    + self.bias[channel];
+                *value = (*value - mean[channel]) / (channel_variance + Self::EPSILON).sqrt()
+                    * scale[channel]
+                    + bias[channel];
                 if !value.is_finite() {
                     return Err(reference_error(
                         "batch_norm_output",
@@ -2187,8 +2190,8 @@ impl BatchNorm1d {
                     ));
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -2251,6 +2254,18 @@ impl ConformerConvolution {
     }
 
     fn forward(&self, input: &Mat) -> FwResult<ConformerConvolutionTrace> {
+        self.forward_with_trace(input, true)
+    }
+
+    fn forward_output(&self, input: &Mat) -> FwResult<Mat> {
+        Ok(self.forward_with_trace(input, false)?.output)
+    }
+
+    fn forward_with_trace(
+        &self,
+        input: &Mat,
+        capture_channel_major: bool,
+    ) -> FwResult<ConformerConvolutionTrace> {
         let frames = input.rows;
         let gated = self.pointwise1.forward(input)?;
         let glu_values = frames
@@ -2259,29 +2274,21 @@ impl ConformerConvolution {
         let mut glu = Vec::new();
         glu.try_reserve_exact(glu_values)
             .map_err(|_| reference_error("allocation", "GLU allocation failed"))?;
-        for row in gated.data.chunks(SORTFORMER_ENCODER_WIDTH * 2) {
-            for channel in 0..SORTFORMER_ENCODER_WIDTH {
-                glu.push(row[channel] * sigmoid_f32(row[SORTFORMER_ENCODER_WIDTH + channel])?);
-            }
-        }
+        glu.resize(glu_values, 0.0);
+        let width = SORTFORMER_ENCODER_WIDTH;
+        gated_linear_unit_into(&gated.data, width, &mut glu)?;
         let glu = Mat::from_vec(frames, SORTFORMER_ENCODER_WIDTH, glu);
         let mut depthwise = Mat::zeros(frames, SORTFORMER_ENCODER_WIDTH);
-        for time in 0..frames {
-            for channel in 0..SORTFORMER_ENCODER_WIDTH {
-                let mut sum = self.depthwise_bias[channel];
-                for kernel in 0..Self::KERNEL {
-                    if let Some(source_time) = time
-                        .checked_add(kernel)
-                        .and_then(|value| value.checked_sub(Self::PADDING))
-                        .filter(|&value| value < frames)
-                    {
-                        sum += glu.data[source_time * SORTFORMER_ENCODER_WIDTH + channel]
-                            * self.depthwise_weight[channel * Self::KERNEL + kernel];
-                    }
-                }
-                depthwise.data[time * SORTFORMER_ENCODER_WIDTH + channel] = sum;
-            }
-        }
+        depthwise_conv_into(
+            &glu.data,
+            frames,
+            width,
+            &self.depthwise_bias,
+            &self.depthwise_weight,
+            Self::KERNEL,
+            Self::PADDING,
+            &mut depthwise.data,
+        )?;
         if depthwise.data.iter().any(|value| !value.is_finite()) {
             return Err(reference_error(
                 "convolution_nonfinite",
@@ -2289,14 +2296,18 @@ impl ConformerConvolution {
             ));
         }
         let mut depthwise_channel_major = Vec::new();
-        depthwise_channel_major
-            .try_reserve_exact(depthwise.data.len())
-            .map_err(|_| reference_error("allocation", "depthwise trace allocation failed"))?;
-        for channel in 0..SORTFORMER_ENCODER_WIDTH {
-            for time in 0..frames {
-                depthwise_channel_major
-                    .push(depthwise.data[time * SORTFORMER_ENCODER_WIDTH + channel]);
-            }
+        if capture_channel_major && frames > 0 {
+            depthwise_channel_major
+                .try_reserve_exact(depthwise.data.len())
+                .map_err(|_| reference_error("allocation", "depthwise trace allocation failed"))?;
+            depthwise_channel_major.resize(depthwise.data.len(), 0.0);
+            let depthwise_values = &depthwise.data;
+            map_rows_mut(&mut depthwise_channel_major, frames, |channel, dest| {
+                for time in 0..frames {
+                    dest[time] = depthwise_values[time * width + channel];
+                }
+                Ok(())
+            })?;
         }
         self.batch_norm.forward_in_place(&mut depthwise)?;
         swish_in_place(&mut depthwise.data)?;
@@ -2429,20 +2440,47 @@ impl RelPositionAttention {
                     reference_error("allocation", "attention position allocation failed")
                 })?;
             let head_offset = head * Self::HEAD_WIDTH;
-            for frame in 0..frames {
+            query_u.resize(head_values, 0.0);
+            query_v.resize(head_values, 0.0);
+            key_head.resize(head_values, 0.0);
+            value_head.resize(head_values, 0.0);
+            position_head.resize(position_head_values, 0.0);
+            let head_width = Self::HEAD_WIDTH;
+            let bias_u = &self.pos_bias_u;
+            let bias_v = &self.pos_bias_v;
+            let query_data = &query.data;
+            let key_data = &key.data;
+            let value_data = &value.data;
+            let position_data = &position.data;
+            map_rows_mut(&mut query_u, head_width, |frame, slot| {
                 let base = frame * SORTFORMER_ENCODER_WIDTH + head_offset;
-                for inner in 0..Self::HEAD_WIDTH {
-                    let bias_index = head_offset + inner;
-                    query_u.push(query.data[base + inner] + self.pos_bias_u[bias_index]);
-                    query_v.push(query.data[base + inner] + self.pos_bias_v[bias_index]);
-                    key_head.push(key.data[base + inner]);
-                    value_head.push(value.data[base + inner]);
+                for inner in 0..head_width {
+                    slot[inner] = query_data[base + inner] + bias_u[head_offset + inner];
                 }
-            }
-            for position_frame in 0..position_rows {
+                Ok(())
+            })?;
+            map_rows_mut(&mut query_v, head_width, |frame, slot| {
+                let base = frame * SORTFORMER_ENCODER_WIDTH + head_offset;
+                for inner in 0..head_width {
+                    slot[inner] = query_data[base + inner] + bias_v[head_offset + inner];
+                }
+                Ok(())
+            })?;
+            map_rows_mut(&mut key_head, head_width, |frame, slot| {
+                let base = frame * SORTFORMER_ENCODER_WIDTH + head_offset;
+                slot.copy_from_slice(&key_data[base..base + head_width]);
+                Ok(())
+            })?;
+            map_rows_mut(&mut value_head, head_width, |frame, slot| {
+                let base = frame * SORTFORMER_ENCODER_WIDTH + head_offset;
+                slot.copy_from_slice(&value_data[base..base + head_width]);
+                Ok(())
+            })?;
+            map_rows_mut(&mut position_head, head_width, |position_frame, slot| {
                 let base = position_frame * SORTFORMER_ENCODER_WIDTH + head_offset;
-                position_head.extend_from_slice(&position.data[base..base + Self::HEAD_WIDTH]);
-            }
+                slot.copy_from_slice(&position_data[base..base + head_width]);
+                Ok(())
+            })?;
 
             let content = ft_kernel_cpu::matmul_rhs_transposed_contiguous_f32(
                 frames,
@@ -2461,9 +2499,8 @@ impl RelPositionAttention {
             )
             .map_err(|_| reference_error("attention_kernel", "position GEMM failed"))?;
             let head_score_offset = head * frames * frames;
-            for query_frame in 0..frames {
-                let output_row = &mut scores[head_score_offset + query_frame * frames
-                    ..head_score_offset + (query_frame + 1) * frames];
+            let head_scores = &mut scores[head_score_offset..head_score_offset + frames * frames];
+            map_rows_mut(head_scores, frames, |query_frame, output_row| {
                 let content_row = &content[query_frame * frames..(query_frame + 1) * frames];
                 let relative_row =
                     &relative[query_frame * position_rows..(query_frame + 1) * position_rows];
@@ -2472,8 +2509,8 @@ impl RelPositionAttention {
                     output_row[key_frame] =
                         (content_row[key_frame] + relative_row[relative_index]) / scale;
                 }
-                softmax_f32_in_place(output_row)?;
-            }
+                softmax_f32_in_place(output_row)
+            })?;
             let probabilities = Mat::from_vec(
                 frames,
                 frames,
@@ -2484,13 +2521,19 @@ impl RelPositionAttention {
                 &Mat::from_vec(frames, Self::HEAD_WIDTH, value_head),
             )
             .map_err(|_| reference_error("attention_kernel", "value GEMM failed"))?;
-            for frame in 0..frames {
-                let source =
-                    &head_context.data[frame * Self::HEAD_WIDTH..(frame + 1) * Self::HEAD_WIDTH];
-                let destination = &mut context.data[frame * SORTFORMER_ENCODER_WIDTH + head_offset
-                    ..frame * SORTFORMER_ENCODER_WIDTH + head_offset + Self::HEAD_WIDTH];
-                destination.copy_from_slice(source);
-            }
+            let context_width = SORTFORMER_ENCODER_WIDTH;
+            let head_context_data = &head_context.data;
+            map_rows_mut(
+                &mut context.data,
+                context_width,
+                |frame, destination_row| {
+                    let source = &head_context_data
+                        [frame * Self::HEAD_WIDTH..(frame + 1) * Self::HEAD_WIDTH];
+                    destination_row[head_offset..head_offset + Self::HEAD_WIDTH]
+                        .copy_from_slice(source);
+                    Ok(())
+                },
+            )?;
         }
         if context.data.iter().any(|value| !value.is_finite()) {
             return Err(reference_error(
@@ -2717,8 +2760,8 @@ impl FastConformerBlock {
 
         normalized.clone_from(&residual);
         self.norm_conv.forward_in_place(&mut normalized)?;
-        let convolution = self.convolution.forward(&normalized)?;
-        add_scaled_residual_in_place(&mut residual, &convolution.output, 1.0)?;
+        let convolution = self.convolution.forward_output(&normalized)?;
+        add_scaled_residual_in_place(&mut residual, &convolution, 1.0)?;
 
         normalized.clone_from(&residual);
         self.norm_feed_forward2.forward_in_place(&mut normalized)?;
@@ -2802,14 +2845,32 @@ impl TransformerAttention {
                 reference_error("allocation", "Transformer value allocation failed")
             })?;
             let head_offset = head * SORTFORMER_TRANSFORMER_HEAD_WIDTH;
-            for frame in 0..frames {
+            query_head.resize(head_values, 0.0);
+            key_head.resize(head_values, 0.0);
+            value_head.resize(head_values, 0.0);
+            let head_width = SORTFORMER_TRANSFORMER_HEAD_WIDTH;
+            let query_data = &query.data;
+            let key_data = &key.data;
+            let value_data = &value.data;
+            map_rows_mut(&mut query_head, head_width, |frame, slot| {
                 let base = frame * SORTFORMER_TRANSFORMER_WIDTH + head_offset;
-                for inner in 0..SORTFORMER_TRANSFORMER_HEAD_WIDTH {
-                    query_head.push(query.data[base + inner] / scale);
-                    key_head.push(key.data[base + inner] / scale);
-                    value_head.push(value.data[base + inner]);
+                for inner in 0..head_width {
+                    slot[inner] = query_data[base + inner] / scale;
                 }
-            }
+                Ok(())
+            })?;
+            map_rows_mut(&mut key_head, head_width, |frame, slot| {
+                let base = frame * SORTFORMER_TRANSFORMER_WIDTH + head_offset;
+                for inner in 0..head_width {
+                    slot[inner] = key_data[base + inner] / scale;
+                }
+                Ok(())
+            })?;
+            map_rows_mut(&mut value_head, head_width, |frame, slot| {
+                let base = frame * SORTFORMER_TRANSFORMER_WIDTH + head_offset;
+                slot.copy_from_slice(&value_data[base..base + head_width]);
+                Ok(())
+            })?;
             let mut scores = ft_kernel_cpu::matmul_rhs_transposed_contiguous_f32(
                 frames,
                 SORTFORMER_TRANSFORMER_HEAD_WIDTH,
@@ -2823,9 +2884,7 @@ impl TransformerAttention {
                     "attention score GEMM failed",
                 )
             })?;
-            for row in scores.chunks_mut(frames) {
-                softmax_f32_in_place(row)?;
-            }
+            map_rows_mut(&mut scores, frames, |_index, row| softmax_f32_in_place(row))?;
             let head_context = nn::matmul(
                 &Mat::from_vec(frames, frames, scores),
                 &Mat::from_vec(frames, SORTFORMER_TRANSFORMER_HEAD_WIDTH, value_head),
@@ -2836,16 +2895,18 @@ impl TransformerAttention {
                     "attention value GEMM failed",
                 )
             })?;
-            for frame in 0..frames {
-                let source = &head_context.data[frame * SORTFORMER_TRANSFORMER_HEAD_WIDTH
-                    ..(frame + 1) * SORTFORMER_TRANSFORMER_HEAD_WIDTH];
-                let destination = &mut context.data[frame * SORTFORMER_TRANSFORMER_WIDTH
-                    + head_offset
-                    ..frame * SORTFORMER_TRANSFORMER_WIDTH
-                        + head_offset
-                        + SORTFORMER_TRANSFORMER_HEAD_WIDTH];
-                destination.copy_from_slice(source);
-            }
+            let head_context_data = &head_context.data;
+            map_rows_mut(
+                &mut context.data,
+                SORTFORMER_TRANSFORMER_WIDTH,
+                |frame, destination_row| {
+                    let source = &head_context_data[frame * SORTFORMER_TRANSFORMER_HEAD_WIDTH
+                        ..(frame + 1) * SORTFORMER_TRANSFORMER_HEAD_WIDTH];
+                    destination_row[head_offset..head_offset + SORTFORMER_TRANSFORMER_HEAD_WIDTH]
+                        .copy_from_slice(source);
+                    Ok(())
+                },
+            )?;
         }
         let output = self.output.forward(&context)?;
         Ok(TransformerAttentionTrace {
@@ -3366,48 +3427,33 @@ impl Conv2d {
         }
         let mut output = Tensor4::zeros(input.n, self.out_channels, output_h, output_w)?;
         let out_per_group = self.out_channels / self.groups;
+        let plane_len = output_h * output_w;
 
         for batch in 0..input.n {
-            for out_channel in 0..self.out_channels {
+            let start = batch * self.out_channels * plane_len;
+            let batch_values = &mut output.data[start..start + self.out_channels * plane_len];
+            let write_plane = |out_channel: usize, plane: &mut [f32]| -> FwResult<()> {
                 reference_checkpoint(checkpoint)?;
-                let group = out_channel / out_per_group;
-                let input_channel_start = group * self.in_per_group;
-                for out_h in 0..output_h {
-                    for out_w in 0..output_w {
-                        let mut sum = self.bias[out_channel];
-                        for local_input_channel in 0..self.in_per_group {
-                            let input_channel = input_channel_start + local_input_channel;
-                            for kernel_h in 0..self.kernel_h {
-                                let padded_input_h = out_h * stride + kernel_h;
-                                let Some(input_h) = padded_input_h.checked_sub(padding) else {
-                                    continue;
-                                };
-                                if input_h >= input.h {
-                                    continue;
-                                }
-                                for kernel_w in 0..self.kernel_w {
-                                    let padded_input_w = out_w * stride + kernel_w;
-                                    let Some(input_w) = padded_input_w.checked_sub(padding) else {
-                                        continue;
-                                    };
-                                    if input_w >= input.w {
-                                        continue;
-                                    }
-                                    let input_index =
-                                        input.offset(batch, input_channel, input_h, input_w)?;
-                                    let weight_index = (((out_channel * self.in_per_group
-                                        + local_input_channel)
-                                        * self.kernel_h
-                                        + kernel_h)
-                                        * self.kernel_w)
-                                        + kernel_w;
-                                    sum += input.data[input_index] * self.weight[weight_index];
-                                }
-                            }
-                        }
-                        let output_index = output.offset(batch, out_channel, out_h, out_w)?;
-                        output.data[output_index] = sum;
-                    }
+                self.write_grouped_plane(
+                    input,
+                    batch,
+                    out_channel,
+                    stride,
+                    padding,
+                    output_h,
+                    output_w,
+                    out_per_group,
+                    plane,
+                )
+            };
+            if parallelize_independent(self.out_channels) {
+                batch_values
+                    .par_chunks_mut(plane_len)
+                    .enumerate()
+                    .try_for_each(|(out_channel, plane)| write_plane(out_channel, plane))?;
+            } else {
+                for (out_channel, plane) in batch_values.chunks_mut(plane_len).enumerate() {
+                    write_plane(out_channel, plane)?;
                 }
             }
         }
@@ -3418,6 +3464,60 @@ impl Conv2d {
             ));
         }
         Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_grouped_plane(
+        &self,
+        input: &Tensor4,
+        batch: usize,
+        out_channel: usize,
+        stride: usize,
+        padding: usize,
+        output_h: usize,
+        output_w: usize,
+        out_per_group: usize,
+        plane: &mut [f32],
+    ) -> FwResult<()> {
+        let group = out_channel / out_per_group;
+        let input_channel_start = group * self.in_per_group;
+        for out_h in 0..output_h {
+            for out_w in 0..output_w {
+                let mut sum = self.bias[out_channel];
+                for local_input_channel in 0..self.in_per_group {
+                    let input_channel = input_channel_start + local_input_channel;
+                    for kernel_h in 0..self.kernel_h {
+                        let padded_input_h = out_h * stride + kernel_h;
+                        let Some(input_h) = padded_input_h.checked_sub(padding) else {
+                            continue;
+                        };
+                        if input_h >= input.h {
+                            continue;
+                        }
+                        for kernel_w in 0..self.kernel_w {
+                            let padded_input_w = out_w * stride + kernel_w;
+                            let Some(input_w) = padded_input_w.checked_sub(padding) else {
+                                continue;
+                            };
+                            if input_w >= input.w {
+                                continue;
+                            }
+                            let input_index =
+                                input.offset(batch, input_channel, input_h, input_w)?;
+                            let weight_index = (((out_channel * self.in_per_group
+                                + local_input_channel)
+                                * self.kernel_h
+                                + kernel_h)
+                                * self.kernel_w)
+                                + kernel_w;
+                            sum += input.data[input_index] * self.weight[weight_index];
+                        }
+                    }
+                }
+                plane[out_h * output_w + out_w] = sum;
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4343,14 +4443,87 @@ fn compress_speaker_cache(state: &mut SortformerStreamingState) -> FwResult<()> 
     Ok(())
 }
 
+/// Kill switch for the row/channel/chunk parallel elementwise loops.
+///
+/// Default is on. `FW_SORTFORMER_ELEMENTWISE_PARALLEL=0` restores the v0.9.3
+/// serial loops (`35f7d37`) so a paired benchmark can time both in one binary.
+/// The test harness also flips [`SORTFORMER_FORCE_SERIAL_ELEMENTWISE`].
+fn elementwise_parallel_enabled() -> bool {
+    if SORTFORMER_FORCE_SERIAL_ELEMENTWISE.load(Ordering::Relaxed) {
+        return false;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FW_SORTFORMER_ELEMENTWISE_PARALLEL")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
+}
+
+static SORTFORMER_FORCE_SERIAL_ELEMENTWISE: AtomicBool = AtomicBool::new(false);
+
+/// Parallelize only across independent units. One unit (one row, one channel,
+/// one chunk) always runs its original left-to-right float operations.
+fn parallelize_independent(units: usize) -> bool {
+    units >= 2 && rayon::current_num_threads() > 1 && elementwise_parallel_enabled()
+}
+
+fn map_rows_mut(
+    values: &mut [f32],
+    width: usize,
+    op: impl Fn(usize, &mut [f32]) -> FwResult<()> + Sync + Send,
+) -> FwResult<()> {
+    if width > 0
+        && values.len().is_multiple_of(width)
+        && parallelize_independent(values.len() / width)
+    {
+        values
+            .par_chunks_mut(width)
+            .enumerate()
+            .try_for_each(|(index, row)| op(index, row))
+    } else {
+        for (index, row) in values.chunks_mut(width).enumerate() {
+            op(index, row)?;
+        }
+        Ok(())
+    }
+}
+
+fn map_elements_mut(
+    values: &mut [f32],
+    op: impl Fn(&mut f32) -> FwResult<()> + Sync + Send,
+) -> FwResult<()> {
+    // Below this, rayon scheduling costs more than the elementwise body.
+    const GRAIN: usize = 8_192;
+    if values.len() >= GRAIN && parallelize_independent(values.len() / GRAIN) {
+        let threads = rayon::current_num_threads().max(1);
+        let chunk = values.len().div_ceil(threads).max(1);
+        values.par_chunks_mut(chunk).try_for_each(|chunk| {
+            for value in chunk.iter_mut() {
+                op(value)?;
+            }
+            Ok(())
+        })
+    } else {
+        for value in values.iter_mut() {
+            op(value)?;
+        }
+        Ok(())
+    }
+}
+
 fn relu_in_place(values: &mut [f32]) {
-    for value in values {
+    // ReLU is a bandwidth-bound max. Splitting it across the pool was slower
+    // than this loop on the steady-state 609×2048 shape (0.47 ms serial vs
+    // 0.73 ms at 4 threads), so the v0.9.3 left-to-right loop stays.
+    for value in values.iter_mut() {
         *value = value.max(0.0);
     }
 }
 
 fn swish_in_place(values: &mut [f32]) -> FwResult<()> {
-    for value in values {
+    map_elements_mut(values, |value| {
         let sigmoid = 1.0 / (1.0 + (-*value).exp());
         *value *= sigmoid;
         if !value.is_finite() {
@@ -4359,8 +4532,55 @@ fn swish_in_place(values: &mut [f32]) -> FwResult<()> {
                 "Swish produced a non-finite value",
             ));
         }
-    }
-    Ok(())
+        Ok(())
+    })
+}
+
+fn sigmoid_slice_in_place(values: &mut [f32]) -> FwResult<()> {
+    map_elements_mut(values, |value| {
+        *value = sigmoid_f32(*value)?;
+        Ok(())
+    })
+}
+
+fn gated_linear_unit_into(gated: &[f32], width: usize, glu: &mut [f32]) -> FwResult<()> {
+    map_rows_mut(glu, width, |row_index, out| {
+        let start = row_index * width * 2;
+        let row = &gated[start..start + width * 2];
+        for channel in 0..width {
+            out[channel] = row[channel] * sigmoid_f32(row[width + channel])?;
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn depthwise_conv_into(
+    input: &[f32],
+    frames: usize,
+    width: usize,
+    bias: &[f32],
+    weight: &[f32],
+    kernel: usize,
+    padding: usize,
+    output: &mut [f32],
+) -> FwResult<()> {
+    map_rows_mut(output, width, |time, row| {
+        for channel in 0..width {
+            let mut sum = bias[channel];
+            for tap in 0..kernel {
+                if let Some(source_time) = time
+                    .checked_add(tap)
+                    .and_then(|value| value.checked_sub(padding))
+                    .filter(|&value| value < frames)
+                {
+                    sum += input[source_time * width + channel] * weight[channel * kernel + tap];
+                }
+            }
+            row[channel] = sum;
+        }
+        Ok(())
+    })
 }
 
 fn sigmoid_f32(value: f32) -> FwResult<f32> {
@@ -4423,14 +4643,15 @@ fn relative_position_encoding(frames: usize, width: usize) -> FwResult<Vec<f32>>
         .map_err(|_| reference_error("allocation", "relative position allocation failed"))?;
     output.resize(values, 0.0);
     let exponent_scale = -(10_000.0_f32.ln() / width as f32);
-    for row in 0..rows {
+    map_rows_mut(&mut output, width, |row, dest| {
         let position = (frames - 1) as f32 - row as f32;
         for even in (0..width).step_by(2) {
             let angle = position * (even as f32 * exponent_scale).exp();
-            output[row * width + even] = angle.sin();
-            output[row * width + even + 1] = angle.cos();
+            dest[even] = angle.sin();
+            dest[even + 1] = angle.cos();
         }
-    }
+        Ok(())
+    })?;
     Ok(output)
 }
 
@@ -7399,6 +7620,592 @@ mod tests {
                     "context mismatch at ({row}, {column}): actual={actual} expected={expected}"
                 );
             }
+        }
+    }
+
+    fn fill_det(len: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let unit = ((state >> 8) & 0x00ff_ffff) as f32 / 16_777_216.0;
+                unit * 3.0 - 1.5
+            })
+            .collect()
+    }
+
+    fn assert_same_bits(label: &str, left: &[f32], right: &[f32]) {
+        assert_eq!(left.len(), right.len(), "{label} length");
+        for (index, (lhs, rhs)) in left.iter().zip(right).enumerate() {
+            assert_eq!(
+                lhs.to_bits(),
+                rhs.to_bits(),
+                "{label} mismatch at {index}: {lhs} ({:08x}) vs {rhs} ({:08x})",
+                lhs.to_bits(),
+                rhs.to_bits()
+            );
+        }
+    }
+
+    fn with_threads<T: Send>(threads: usize, body: impl FnOnce() -> T + Send) -> T {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("thread pool");
+        pool.install(body)
+    }
+
+    struct ResetSerial;
+    impl Drop for ResetSerial {
+        fn drop(&mut self) {
+            SORTFORMER_FORCE_SERIAL_ELEMENTWISE.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn with_elementwise_mode<T>(serial: bool, body: impl FnOnce() -> T) -> T {
+        let _reset = ResetSerial;
+        SORTFORMER_FORCE_SERIAL_ELEMENTWISE.store(serial, Ordering::Relaxed);
+        body()
+    }
+
+    fn oracle_swish(values: &mut [f32]) {
+        for value in values {
+            let sigmoid = 1.0 / (1.0 + (-*value).exp());
+            *value *= sigmoid;
+        }
+    }
+
+    fn oracle_relu(values: &mut [f32]) {
+        for value in values {
+            *value = value.max(0.0);
+        }
+    }
+
+    fn oracle_sigmoid_slice(values: &mut [f32]) {
+        for value in values {
+            *value = 1.0 / (1.0 + (-*value).exp());
+        }
+    }
+
+    fn oracle_softmax_rows(values: &mut [f32], width: usize) {
+        for row in values.chunks_mut(width) {
+            let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0_f32;
+            for value in row.iter_mut() {
+                *value = (*value - maximum).exp();
+                sum += *value;
+            }
+            for value in row.iter_mut() {
+                *value /= sum;
+            }
+        }
+    }
+
+    fn oracle_batch_norm(values: &mut [f32], width: usize, norm: &BatchNorm1d) {
+        for row in values.chunks_mut(width) {
+            for (channel, value) in row.iter_mut().enumerate() {
+                let variance = norm.running_var[channel];
+                *value = (*value - norm.running_mean[channel])
+                    / (variance + BatchNorm1d::EPSILON).sqrt()
+                    * norm.scale[channel]
+                    + norm.bias[channel];
+            }
+        }
+    }
+
+    fn oracle_glu(gated: &[f32], width: usize, glu: &mut [f32]) {
+        for (row_index, out) in glu.chunks_mut(width).enumerate() {
+            let start = row_index * width * 2;
+            let row = &gated[start..start + width * 2];
+            for channel in 0..width {
+                let sigmoid = 1.0 / (1.0 + (-row[width + channel]).exp());
+                out[channel] = row[channel] * sigmoid;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn oracle_depthwise(
+        input: &[f32],
+        frames: usize,
+        width: usize,
+        bias: &[f32],
+        weight: &[f32],
+        kernel: usize,
+        padding: usize,
+        output: &mut [f32],
+    ) {
+        for time in 0..frames {
+            for channel in 0..width {
+                let mut sum = bias[channel];
+                for tap in 0..kernel {
+                    if let Some(source_time) = time
+                        .checked_add(tap)
+                        .and_then(|value| value.checked_sub(padding))
+                        .filter(|&value| value < frames)
+                    {
+                        sum +=
+                            input[source_time * width + channel] * weight[channel * kernel + tap];
+                    }
+                }
+                output[time * width + channel] = sum;
+            }
+        }
+    }
+
+    fn oracle_relative_positions(frames: usize, width: usize) -> Vec<f32> {
+        let rows = frames * 2 - 1;
+        let mut output = vec![0.0_f32; rows * width];
+        let exponent_scale = -(10_000.0_f32.ln() / width as f32);
+        for row in 0..rows {
+            let position = (frames - 1) as f32 - row as f32;
+            for even in (0..width).step_by(2) {
+                let angle = position * (even as f32 * exponent_scale).exp();
+                output[row * width + even] = angle.sin();
+                output[row * width + even + 1] = angle.cos();
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn sortformer_parallel_elementwise_matches_serial_oracle_bits() {
+        let frames = 65_usize;
+        let width = SORTFORMER_ENCODER_WIDTH;
+        with_threads(4, || {
+            let swish_input = fill_det(frames * 2048, 11);
+            let mut oracle = swish_input.clone();
+            oracle_swish(&mut oracle);
+            let mut parallel = swish_input.clone();
+            swish_in_place(&mut parallel).expect("swish");
+            assert_same_bits("swish", &oracle, &parallel);
+            let mut serial = swish_input;
+            with_elementwise_mode(true, || swish_in_place(&mut serial).expect("serial swish"));
+            assert_same_bits("swish serial branch", &oracle, &serial);
+
+            let relu_input = fill_det(frames * 2048, 12);
+            let mut oracle = relu_input.clone();
+            oracle_relu(&mut oracle);
+            let mut parallel = relu_input;
+            relu_in_place(&mut parallel);
+            assert_same_bits("relu", &oracle, &parallel);
+
+            let sigmoid_input = fill_det(frames * width, 13);
+            let mut oracle = sigmoid_input.clone();
+            oracle_sigmoid_slice(&mut oracle);
+            let mut parallel = sigmoid_input;
+            sigmoid_slice_in_place(&mut parallel).expect("sigmoid");
+            assert_same_bits("sigmoid", &oracle, &parallel);
+
+            let mut scores = fill_det(8 * frames * frames, 14);
+            let mut oracle = scores.clone();
+            oracle_softmax_rows(&mut oracle, frames);
+            map_rows_mut(&mut scores, frames, |_index, row| softmax_f32_in_place(row))
+                .expect("softmax rows");
+            assert_same_bits("softmax rows", &oracle, &scores);
+
+            let norm = BatchNorm1d {
+                width,
+                scale: fill_det(width, 15),
+                bias: fill_det(width, 16),
+                running_mean: fill_det(width, 17),
+                running_var: fill_det(width, 18)
+                    .into_iter()
+                    .map(|value| value.abs() + 0.25)
+                    .collect(),
+            };
+            let batch_input = fill_det(frames * width, 19);
+            let mut oracle = batch_input.clone();
+            oracle_batch_norm(&mut oracle, width, &norm);
+            let mut parallel = Mat::from_vec(frames, width, batch_input);
+            norm.forward_in_place(&mut parallel).expect("batch norm");
+            assert_same_bits("batch norm", &oracle, &parallel.data);
+
+            let gated = fill_det(frames * width * 2, 20);
+            let mut oracle = vec![0.0_f32; frames * width];
+            oracle_glu(&gated, width, &mut oracle);
+            let mut parallel = vec![0.0_f32; frames * width];
+            gated_linear_unit_into(&gated, width, &mut parallel).expect("glu");
+            assert_same_bits("glu", &oracle, &parallel);
+
+            let signal = fill_det(frames * width, 21);
+            let bias = fill_det(width, 22);
+            let weight = fill_det(width * 9, 23);
+            let mut oracle = vec![0.0_f32; frames * width];
+            oracle_depthwise(&signal, frames, width, &bias, &weight, 9, 4, &mut oracle);
+            let mut parallel = vec![0.0_f32; frames * width];
+            depthwise_conv_into(&signal, frames, width, &bias, &weight, 9, 4, &mut parallel)
+                .expect("depthwise");
+            assert_same_bits("depthwise", &oracle, &parallel);
+
+            let positions = relative_position_encoding(frames, width).expect("positions");
+            assert_same_bits(
+                "relative position",
+                &oracle_relative_positions(frames, width),
+                &positions,
+            );
+        });
+    }
+
+    fn time_ms(mut op: impl FnMut()) -> f64 {
+        op();
+        let mut iters = 0_u32;
+        let mut elapsed = std::time::Duration::ZERO;
+        while iters < 3 || (elapsed < std::time::Duration::from_millis(150) && iters < 20) {
+            let tick = std::time::Instant::now();
+            op();
+            elapsed += tick.elapsed();
+            iters += 1;
+        }
+        elapsed.as_secs_f64() * 1.0e3 / f64::from(iters)
+    }
+
+    #[test]
+    #[ignore = "prints per-op and end-to-end Sortformer thread timings"]
+    fn sortformer_cpu_threading_bench() {
+        let steady_frames = 609_usize;
+        let width = SORTFORMER_ENCODER_WIDTH;
+        let model = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        let cpu = model
+            .lines()
+            .find(|line| line.starts_with("model name"))
+            .unwrap_or("model name: unknown");
+        let nproc = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(0);
+        let governor =
+            std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+                .unwrap_or_else(|_| "unknown".to_owned());
+        eprintln!(
+            "HOST {cpu} nproc={nproc} governor={} profile=release-or-caller",
+            governor.trim()
+        );
+        eprintln!("threads\tmode\top\tms");
+        for threads in [1_usize, 4, 12] {
+            with_threads(threads, || {
+                assert_eq!(rayon::current_num_threads(), threads);
+                let swish_input = fill_det(steady_frames * 2048, 31);
+                let relu_input = fill_det(steady_frames * 2048, 32);
+                let sigmoid_input = fill_det(steady_frames * width, 33);
+                let softmax_input = fill_det(8 * steady_frames * steady_frames, 34);
+                let batch_input = fill_det(steady_frames * width, 35);
+                let gated = fill_det(steady_frames * width * 2, 36);
+                let depth_input = fill_det(steady_frames * width, 37);
+                let bias = fill_det(width, 38);
+                let kernel = fill_det(width * 9, 39);
+                let norm = BatchNorm1d {
+                    width,
+                    scale: fill_det(width, 40),
+                    bias: fill_det(width, 41),
+                    running_mean: fill_det(width, 42),
+                    running_var: vec![1.0; width],
+                };
+                let serial_swish = with_elementwise_mode(true, || {
+                    time_ms(|| {
+                        let mut values = swish_input.clone();
+                        swish_in_place(&mut values).expect("swish");
+                    })
+                });
+                let parallel_swish = with_elementwise_mode(false, || {
+                    time_ms(|| {
+                        let mut values = swish_input.clone();
+                        swish_in_place(&mut values).expect("swish");
+                    })
+                });
+                eprintln!("{threads}\tserial\tswish_ffn_609x2048\t{serial_swish:.3}");
+                eprintln!("{threads}\tparallel\tswish_ffn_609x2048\t{parallel_swish:.3}");
+
+                let serial_softmax = with_elementwise_mode(true, || {
+                    time_ms(|| {
+                        let mut values = softmax_input.clone();
+                        for head in values.chunks_mut(steady_frames * steady_frames) {
+                            map_rows_mut(head, steady_frames, |_index, row| {
+                                softmax_f32_in_place(row)
+                            })
+                            .expect("softmax");
+                        }
+                    })
+                });
+                let parallel_softmax = with_elementwise_mode(false, || {
+                    time_ms(|| {
+                        let mut values = softmax_input.clone();
+                        for head in values.chunks_mut(steady_frames * steady_frames) {
+                            map_rows_mut(head, steady_frames, |_index, row| {
+                                softmax_f32_in_place(row)
+                            })
+                            .expect("softmax");
+                        }
+                    })
+                });
+                eprintln!("{threads}\tserial\tsoftmax_8x609x609\t{serial_softmax:.3}");
+                eprintln!("{threads}\tparallel\tsoftmax_8x609x609\t{parallel_softmax:.3}");
+
+                let serial_glu = with_elementwise_mode(true, || {
+                    time_ms(|| {
+                        let mut out = vec![0.0_f32; steady_frames * width];
+                        gated_linear_unit_into(&gated, width, &mut out).expect("glu");
+                    })
+                });
+                let parallel_glu = with_elementwise_mode(false, || {
+                    time_ms(|| {
+                        let mut out = vec![0.0_f32; steady_frames * width];
+                        gated_linear_unit_into(&gated, width, &mut out).expect("glu");
+                    })
+                });
+                eprintln!("{threads}\tserial\tglu_609x512\t{serial_glu:.3}");
+                eprintln!("{threads}\tparallel\tglu_609x512\t{parallel_glu:.3}");
+
+                let serial_depth = with_elementwise_mode(true, || {
+                    time_ms(|| {
+                        let mut out = vec![0.0_f32; steady_frames * width];
+                        depthwise_conv_into(
+                            &depth_input,
+                            steady_frames,
+                            width,
+                            &bias,
+                            &kernel,
+                            9,
+                            4,
+                            &mut out,
+                        )
+                        .expect("depthwise");
+                    })
+                });
+                let parallel_depth = with_elementwise_mode(false, || {
+                    time_ms(|| {
+                        let mut out = vec![0.0_f32; steady_frames * width];
+                        depthwise_conv_into(
+                            &depth_input,
+                            steady_frames,
+                            width,
+                            &bias,
+                            &kernel,
+                            9,
+                            4,
+                            &mut out,
+                        )
+                        .expect("depthwise");
+                    })
+                });
+                eprintln!("{threads}\tserial\tdepthwise_609x512_k9\t{serial_depth:.3}");
+                eprintln!("{threads}\tparallel\tdepthwise_609x512_k9\t{parallel_depth:.3}");
+
+                let serial_bn = with_elementwise_mode(true, || {
+                    time_ms(|| {
+                        let mut values = Mat::from_vec(steady_frames, width, batch_input.clone());
+                        norm.forward_in_place(&mut values).expect("batch norm");
+                    })
+                });
+                let parallel_bn = with_elementwise_mode(false, || {
+                    time_ms(|| {
+                        let mut values = Mat::from_vec(steady_frames, width, batch_input.clone());
+                        norm.forward_in_place(&mut values).expect("batch norm");
+                    })
+                });
+                eprintln!("{threads}\tserial\tbatchnorm_609x512\t{serial_bn:.3}");
+                eprintln!("{threads}\tparallel\tbatchnorm_609x512\t{parallel_bn:.3}");
+
+                let serial_relu = with_elementwise_mode(true, || {
+                    time_ms(|| {
+                        let mut values = relu_input.clone();
+                        relu_in_place(&mut values);
+                    })
+                });
+                let parallel_relu = with_elementwise_mode(false, || {
+                    time_ms(|| {
+                        let mut values = relu_input.clone();
+                        relu_in_place(&mut values);
+                    })
+                });
+                eprintln!("{threads}\tserial\trelu_609x2048\t{serial_relu:.3}");
+                eprintln!("{threads}\tparallel\trelu_609x2048\t{parallel_relu:.3}");
+
+                let serial_sigmoid = with_elementwise_mode(true, || {
+                    time_ms(|| {
+                        let mut values = sigmoid_input.clone();
+                        sigmoid_slice_in_place(&mut values).expect("sigmoid");
+                    })
+                });
+                let parallel_sigmoid = with_elementwise_mode(false, || {
+                    time_ms(|| {
+                        let mut values = sigmoid_input.clone();
+                        sigmoid_slice_in_place(&mut values).expect("sigmoid");
+                    })
+                });
+                eprintln!("{threads}\tserial\tsigmoid_609x512\t{serial_sigmoid:.3}");
+                eprintln!("{threads}\tparallel\tsigmoid_609x512\t{parallel_sigmoid:.3}");
+
+                let serial_pos = with_elementwise_mode(true, || {
+                    time_ms(|| {
+                        relative_position_encoding(steady_frames, width).expect("positions");
+                    })
+                });
+                let parallel_pos = with_elementwise_mode(false, || {
+                    time_ms(|| {
+                        relative_position_encoding(steady_frames, width).expect("positions");
+                    })
+                });
+                eprintln!("{threads}\tserial\trelative_position_609\t{serial_pos:.3}");
+                eprintln!("{threads}\tparallel\trelative_position_609\t{parallel_pos:.3}");
+            });
+        }
+
+        let receipt = std::env::var("SORTFORMER_RECEIPT")
+            .unwrap_or_else(|_| "/tmp/sortformer-model/conversion-receipt.json".to_owned());
+        let package = std::env::var("SORTFORMER_PACKAGE")
+            .unwrap_or_else(|_| "/tmp/sortformer-model/weights.safetensors".to_owned());
+        if !std::path::Path::new(&receipt).is_file() || !std::path::Path::new(&package).is_file() {
+            eprintln!("E2E skipped; model files are absent");
+            return;
+        }
+        let loaded = crate::sortformer_conformance::load_verified_sortformer_package(
+            std::path::Path::new(&receipt),
+            std::path::Path::new(&package),
+        )
+        .expect("authenticated Sortformer package");
+        let session = SortformerSession::from_verified_package(&loaded).expect("session");
+        let samples = representative_diarization_samples();
+        let pcm = SortformerPcm::mono_16khz(&samples);
+        eprintln!(
+            "E2E samples={} duration_s={:.3}",
+            samples.len(),
+            samples.len() as f64 / 16_000.0
+        );
+        let serial_reference = with_threads(4, || {
+            with_elementwise_mode(true, || session.diarize(pcm).expect("serial reference"))
+        });
+        for threads in [1_usize, 4, 12] {
+            for serial in [true, false] {
+                let mode = if serial { "serial" } else { "parallel" };
+                let mut samples_ms = Vec::new();
+                for run in 0..4 {
+                    let started = std::time::Instant::now();
+                    let output = with_threads(threads, || {
+                        with_elementwise_mode(serial, || session.diarize(pcm).expect("diarize"))
+                    });
+                    let elapsed = started.elapsed().as_secs_f64() * 1.0e3;
+                    if run == 0 {
+                        assert_same_bits(
+                            &format!("e2e probabilities {mode}@{threads}"),
+                            &serial_reference.probabilities,
+                            &output.probabilities,
+                        );
+                        assert_eq!(serial_reference.turns.len(), output.turns.len());
+                        for (index, (lhs, rhs)) in
+                            serial_reference.turns.iter().zip(&output.turns).enumerate()
+                        {
+                            assert_eq!(lhs.speaker, rhs.speaker, "speaker {index}");
+                            assert_eq!(
+                                lhs.start_seconds.to_bits(),
+                                rhs.start_seconds.to_bits(),
+                                "turn start {index}"
+                            );
+                            assert_eq!(
+                                lhs.end_seconds.to_bits(),
+                                rhs.end_seconds.to_bits(),
+                                "turn end {index}"
+                            );
+                        }
+                    } else {
+                        samples_ms.push(elapsed);
+                    }
+                }
+                samples_ms.sort_by(|lhs, rhs| lhs.total_cmp(rhs));
+                let median = samples_ms[1];
+                eprintln!(
+                    "{threads}\t{mode}\te2e_representative_speech\t{median:.3}\truns={samples_ms:?}"
+                );
+            }
+        }
+        let reference = serial_reference;
+        maybe_write_diarization_golden(&reference, samples.len());
+        assert_golden_if_present(&reference);
+    }
+
+    fn representative_diarization_samples() -> Vec<f32> {
+        // espeak-ng en-us / en-gb / en-us, concatenated and resampled to
+        // 16 kHz mono s16. Two voices, three turns, about 26 seconds.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sortformer_representative_speech.wav");
+        let mut reader = hound::WavReader::open(&path).expect("speech fixture");
+        let spec = reader.spec();
+        assert_eq!(spec.sample_rate, 16_000, "fixture rate");
+        assert_eq!(spec.channels, 1, "fixture channels");
+        assert_eq!(spec.bits_per_sample, 16, "fixture width");
+        reader
+            .samples::<i16>()
+            .map(|sample| f32::from(sample.expect("pcm")) / 32_768.0)
+            .collect()
+    }
+
+    fn golden_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sortformer_v093_representative_diarization.json")
+    }
+
+    fn diarization_json(output: &SortformerDiarizationOutput, samples: usize) -> serde_json::Value {
+        json!({
+            "baseline_commit": "35f7d37f8f15338460bf20807064eb94451e119c",
+            "signal": "espeak-two-speaker-v1",
+            "sample_rate_hz": SORTFORMER_SAMPLE_RATE_HZ,
+            "samples": samples,
+            "description": "Serial-loop output of the v0.9.3 Sortformer graph on tests/fixtures/sortformer_representative_speech.wav (espeak-ng en-us, en-gb, en-us; 16 kHz mono). Parallel row/channel schedules must match these probability and turn bits. The committed file is checked against an unmodified 35f7d37 binary.",
+            "frames": output.frames,
+            "probability_f32_bits_hex": output.probabilities.iter().map(|value| format!("{:08x}", value.to_bits())).collect::<String>(),
+            "turns": output.turns.iter().map(|turn| json!({
+                "start_bits": turn.start_seconds.to_bits(),
+                "end_bits": turn.end_seconds.to_bits(),
+                "speaker": turn.speaker,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn maybe_write_diarization_golden(output: &SortformerDiarizationOutput, samples: usize) {
+        if std::env::var("SORTFORMER_WRITE_GOLDEN").ok().as_deref() != Some("1") {
+            return;
+        }
+        let path = golden_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("golden directory");
+        }
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&diarization_json(output, samples)).expect("json"),
+        )
+        .expect("write golden");
+    }
+
+    fn assert_golden_if_present(output: &SortformerDiarizationOutput) {
+        let path = golden_path();
+        if !path.is_file() {
+            return;
+        }
+        let golden: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read golden"))
+                .expect("golden json");
+        let expected_hex = golden["probability_f32_bits_hex"]
+            .as_str()
+            .expect("probability hex");
+        let actual_hex = diarization_json(output, 0)["probability_f32_bits_hex"]
+            .as_str()
+            .expect("actual hex")
+            .to_owned();
+        assert_eq!(
+            actual_hex, expected_hex,
+            "probabilities differ from the v0.9.3 golden"
+        );
+        let turns = golden["turns"].as_array().expect("turns");
+        assert_eq!(turns.len(), output.turns.len(), "golden turn count");
+        for (turn, actual) in turns.iter().zip(&output.turns) {
+            assert_eq!(turn["speaker"].as_u64().unwrap() as usize, actual.speaker);
+            assert_eq!(
+                turn["start_bits"].as_u64().unwrap() as u32,
+                actual.start_seconds.to_bits()
+            );
+            assert_eq!(
+                turn["end_bits"].as_u64().unwrap() as u32,
+                actual.end_seconds.to_bits()
+            );
         }
     }
 }
