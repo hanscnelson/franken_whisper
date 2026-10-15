@@ -60,6 +60,9 @@ storage.sqlite3-shm
 *.[rR][aA][wW]
 *.[pP][cC][mM]
 *.wav
+# Speech fixture for the Sortformer bit-identity bench. Kept despite the
+# audio ignore above so the golden probabilities can be regenerated.
+!tests/fixtures/sortformer_representative_speech.wav
 *.ulaw
 *.mp3
 *.flac
