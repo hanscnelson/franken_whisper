@@ -37,6 +37,11 @@
 #   FRANKEN_WHISPER_MODEL_DIR  Override the model cache root
 #   VERSION                    Override version to install
 #
+# CPU baseline: Linux x86_64 prebuilts require x86-64-v3 (AVX2/BMI2/FMA/MOVBE:
+#   Intel Haswell 2013+ / AMD Excavator 2015+). Older CPUs are detected before
+#   the binary runs and offered --from-source with the target-cpu pin replaced
+#   by `native` (issue #5).
+#
 # Platforms (prebuilt binaries — 5 release targets):
 #   Linux x86_64          franken_whisper-X.Y.Z-linux_amd64.tar.gz
 #   Linux aarch64         franken_whisper-X.Y.Z-linux_arm64.tar.gz
@@ -90,7 +95,7 @@ MAX_RETRIES=3
 DOWNLOAD_TIMEOUT=120
 # The two compiled model packages occupy 2,117,087,997 bytes. Reserve modest
 # filesystem/metadata headroom before beginning a fresh default pull.
-MIN_MODEL_CACHE_KB=2250000
+MIN_MODEL_CACHE_KB=2400000
 # shellcheck disable=SC2034  # informational metadata, not read by the script
 INSTALLER_VERSION="2.0.0"
 
@@ -99,7 +104,10 @@ INSTALLER_VERSION="2.0.0"
 VERSION_MARKER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/franken_whisper"
 VERSION_MARKER="$VERSION_MARKER_DIR/.installed-version"
 
-# Proxy args applied to EVERY curl invocation. Empty array expands to nothing.
+# Proxy args applied to EVERY curl invocation (empty when no proxy is set).
+# Expand as ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"}: under `set -u`, bash before 4.4
+# (/bin/bash 3.2 on stock macOS) treats an empty array as unbound, and inside an
+# `if` condition that aborted the whole installer with exit status 0.
 PROXY_ARGS=()
 
 # Colors
@@ -301,6 +309,13 @@ Platforms (prebuilt binaries):
   macOS aarch64 (M-series) franken_whisper-X.Y.Z-darwin_arm64.tar.gz
   Windows x64              franken_whisper-X.Y.Z-windows_amd64.zip
 
+CPU baseline note:
+  Linux x86_64 prebuilts require the x86-64-v3 baseline (AVX2/BMI2/FMA/MOVBE:
+  Intel Haswell 2013+ / AMD Excavator 2015+). On older CPUs (Sandy/Ivy Bridge,
+  2012-era Mac minis) the installer refuses the prebuilt before running it and
+  offers --from-source, which it builds with -C target-cpu=native instead of
+  the pinned x86-64-v3.
+
 Windows note:
   This bash installer covers linux + darwin (and WSL). On native Windows,
   download the windows_amd64.zip from the releases page and unzip
@@ -492,29 +507,183 @@ detect_platform() {
 }
 
 # ============================================================================
+# CPU capability preflight (issue #5)
+# ============================================================================
+# The published x86_64 binaries are compiled with `-C target-cpu=x86-64-v3`
+# (.cargo/config.toml, perf lever L7): AVX2 + BMI1/BMI2 + FMA + MOVBE, i.e.
+# Intel Haswell (2013+) / AMD Excavator (2015+). On an older CPU (Sandy/Ivy
+# Bridge, 2012-era Mac minis) even `fw --version` dies with SIGILL before
+# main() runs — rustc emits `mulx` (BMI2) straight into startup code — so the
+# CPU has to be checked BEFORE the downloaded binary is ever executed.
+#
+# Only Linux exposes /proc/cpuinfo, and linux_amd64 is exactly where the
+# reports came from. Hosts without /proc/cpuinfo (macOS) and non-x86_64
+# architectures skip the check and keep today's behavior.
+
+# The feature flags (as spelled in /proc/cpuinfo) that x86-64-v3 adds over v2
+# and that rustc actually emits unguarded with the pinned baseline.
+readonly X86_64_V3_REQUIRED_FLAGS="avx2 bmi1 bmi2 fma movbe"
+
+# Flags found missing by cpu_supports_x86_64_v3 (for diagnostics).
+CPU_MISSING_FLAGS=""
+
+cpu_supports_x86_64_v3() {
+    CPU_MISSING_FLAGS=""
+    # Only meaningful on Linux/x86_64; elsewhere assume capable (fail open —
+    # the --version probe diagnostic below still names the real cause).
+    [ "$(uname -s)" = "Linux" ] || return 0
+    case "$(uname -m)" in
+        x86_64|amd64) ;;
+        *) return 0 ;;
+    esac
+    [ -r /proc/cpuinfo ] || return 0
+
+    local flags feature missing=""
+    flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null) || return 0
+    [ -n "$flags" ] || return 0
+
+    for feature in $X86_64_V3_REQUIRED_FLAGS; do
+        case " $flags " in
+            *" $feature "*) ;;
+            *) missing="${missing:+$missing }$feature" ;;
+        esac
+    done
+
+    if [ -n "$missing" ]; then
+        CPU_MISSING_FLAGS="$missing"
+        return 1
+    fi
+    return 0
+}
+
+# Called before downloading a linux_amd64 prebuilt. When the CPU lacks the
+# x86-64-v3 baseline: explain why the prebuilt cannot run here, then offer the
+# documented --from-source fallback (build_from_source neutralizes the
+# committed target-cpu pin on such CPUs). Never lets the SIGILL happen.
+require_cpu_for_prebuilt() {
+    [ "$PLATFORM" = "linux_amd64" ] || return 0
+    cpu_supports_x86_64_v3 && return 0
+
+    if [ -n "$ARTIFACT_URL" ]; then
+        # Expert escape hatch: a custom artifact may well be a v2/native build.
+        log_warn "This CPU lacks the x86-64-v3 baseline (missing: ${CPU_MISSING_FLAGS:-unknown})."
+        log_warn "Official linux_amd64 prebuilts would crash with SIGILL here; trusting your --artifact-url to be built for this CPU."
+        return 0
+    fi
+
+    log_error "This CPU cannot run the official Linux x86_64 prebuilt binaries."
+    log_error "Prebuilts are compiled for the x86-64-v3 baseline (AVX2/BMI2/FMA/MOVBE:"
+    log_error "Intel Haswell 2013+ / AMD Excavator 2015+). Missing on this CPU: ${CPU_MISSING_FLAGS:-unknown}."
+    log_error "Running the prebuilt here would crash immediately with SIGILL (illegal instruction)."
+    log_error "A source build works: the installer replaces the pinned -C target-cpu=x86-64-v3"
+    log_error "with -C target-cpu=native on this machine (keeps AVX/F16C where present)."
+
+    if [ "$QUIET" -eq 0 ] && interactive_tty; then
+        local prompt_timeout="${FW_INSTALL_PROMPT_TIMEOUT:-120}"
+        if [[ ! "$prompt_timeout" =~ ^[0-9]+$ ]] || [ "$prompt_timeout" -eq 0 ]; then
+            prompt_timeout=120
+        fi
+        local answer="" read_status=0
+        printf 'Build from source instead (requires Rust; several GB of disk and many minutes)? (y/N): ' >/dev/tty
+        IFS= read -r -t "$prompt_timeout" answer </dev/tty || read_status=$?
+        [ "$read_status" -eq 0 ] || printf '\n' >/dev/tty
+        case "$answer" in
+            y|Y|yes|Yes|YES)
+                FROM_SOURCE=1
+                log_step "Falling back to a source build with the x86-64-v3 pin neutralized (target-cpu=native)."
+                return 0
+                ;;
+        esac
+    fi
+
+    die "Re-run with --from-source to build for this CPU: curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/main/install.sh | bash -s -- --from-source"
+}
+
+# ============================================================================
 # Version Resolution
 # ============================================================================
+# Read GitHub's release list without requiring jq or Python. The API may answer
+# pretty-printed or minified (one-line) JSON, so walk the text character by
+# character instead of assuming one key per line. Only fields of each top-level
+# release object count; a release qualifies when both flags are false and the tag
+# is an exact vX.Y.Z. Missing flags fail closed, and model-package tags never
+# qualify as CLI versions.
+select_stable_release_tag() {
+    awk '
+        function take(v) {
+            if (depth == 2) {
+                if (key == "tag_name") tag = v
+                else if (key == "draft") draft = v
+                else if (key == "prerelease") prerelease = v
+            }
+            key = ""
+        }
+        function flush() { if (lit != "") { take(lit); lit = "" } }
+        { buf = buf $0 "\n" }
+        END {
+            n = length(buf)
+            for (i = 1; i <= n; i++) {
+                c = substr(buf, i, 1)
+                if (instr) {
+                    if (esc) { esc = 0; s = s c }
+                    else if (c == "\\") { esc = 1; s = s c }
+                    else if (c == "\"") {
+                        instr = 0
+                        if (want_key) { name = s } else { take(s) }
+                    }
+                    else { s = s c }
+                    continue
+                }
+                if (c == "\"") { instr = 1; s = ""; continue }
+                if (c == ":") { key = (depth == 2) ? name : ""; want_key = 0; continue }
+                if (c == "{") {
+                    depth++; kind[depth] = "o"; want_key = 1
+                    if (depth == 2) { tag = ""; draft = ""; prerelease = "" }
+                    continue
+                }
+                if (c == "[") { depth++; kind[depth] = "a"; want_key = 0; continue }
+                if (c == ",") { flush(); want_key = (kind[depth] == "o"); continue }
+                if (c == "}") {
+                    flush()
+                    if (depth == 2 && draft == "false" && prerelease == "false" &&
+                        tag ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/) {
+                        print tag
+                        exit
+                    }
+                    depth--; want_key = 0
+                    continue
+                }
+                if (c == "]") { flush(); depth--; want_key = 0; continue }
+                if (c == " " || c == "\t" || c == "\n" || c == "\r") { flush(); continue }
+                lit = lit c
+            }
+        }
+    '
+}
+
 resolve_version() {
     if [ -n "$VERSION" ]; then return 0; fi
 
     log_step "Resolving latest version..."
-    local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
+    # Model packages are published as releases too (e.g. whisper-tiny-f16-v1) and can
+    # hold GitHub's "Latest" flag, so take the first stable exact vX.Y.Z tag.
+    local releases_url="https://api.github.com/repos/${OWNER}/${REPO}/releases?per_page=50"
     local tag="" attempts=0
 
     while [ $attempts -lt $MAX_RETRIES ] && [ -z "$tag" ]; do
         attempts=$((attempts + 1))
         if command -v curl &>/dev/null; then
-            tag=$(curl -fsSL "${PROXY_ARGS[@]}" \
+            tag=$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
                 --connect-timeout 10 --max-time 30 \
                 -H "Accept: application/vnd.github.v3+json" \
-                "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
+                "$releases_url" 2>/dev/null | select_stable_release_tag || echo "")
         elif command -v wget &>/dev/null; then
-            tag=$(wget -qO- --timeout=30 "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
+            tag=$(wget -qO- --timeout=30 "$releases_url" 2>/dev/null | select_stable_release_tag || echo "")
         fi
         [ -z "$tag" ] && [ $attempts -lt $MAX_RETRIES ] && sleep 2
     done
 
-    if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]]; then
+    if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         VERSION="$tag"
         log_success "Latest version: $VERSION"
         return 0
@@ -524,10 +693,10 @@ resolve_version() {
     log_step "Trying redirect-based version resolution..."
     local redirect_url="https://github.com/${OWNER}/${REPO}/releases/latest"
     if command -v curl &>/dev/null; then
-        tag=$(curl -fsSL "${PROXY_ARGS[@]}" -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||' || echo "")
+        tag=$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||' || echo "")
     fi
 
-    if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]] && [[ "$tag" != *"/"* ]]; then
+    if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         VERSION="$tag"
         log_success "Latest version (via redirect): $VERSION"
         return 0
@@ -665,7 +834,7 @@ check_network() {
     [ -n "$OFFLINE_TARBALL" ] && return 0
     [ "$FROM_SOURCE" -eq 1 ] && return 0
     command -v curl >/dev/null 2>&1 || { log_warn "curl not found; skipping network check"; return 0; }
-    if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 3 --max-time 5 -o /dev/null "https://github.com" 2>/dev/null; then
+    if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 3 --max-time 5 -o /dev/null "https://github.com" 2>/dev/null; then
         log_warn "Could not reach github.com; download may fail"
     fi
 }
@@ -682,9 +851,26 @@ preflight_checks() {
 # Installed-version detection
 # ============================================================================
 binary_reported_version() {
-    local binary="$1" reported
+    local binary="$1" reported status=0
     [ -x "$binary" ] || return 1
-    reported=$("$binary" --version 2>/dev/null | head -1 || true)
+    # Group redirection also silences bash's own "Illegal instruction" job
+    # message if the probe dies by signal; the exit status still reports it.
+    reported=$( { "$binary" --version; } 2>/dev/null ) || status=$?
+    if [ "$status" -ge 128 ]; then
+        # Killed by signal (status - 128). 132 = SIGILL: the binary contains
+        # instructions this CPU does not implement — the prebuilts assume the
+        # x86-64-v3 baseline (AVX2/BMI2/FMA, Haswell 2013+) — issue #5.
+        if [ "$status" -eq 132 ]; then
+            log_error "$binary crashed with SIGILL (illegal instruction) while reporting its version."
+            log_error "This binary requires a newer CPU than this machine has (x86-64-v3: AVX2/BMI2/FMA,"
+            log_error "Intel Haswell 2013+ / AMD Excavator 2015+). Re-run the installer with --from-source;"
+            log_error "on a pre-v3 CPU it builds with -C target-cpu=native instead of the pinned x86-64-v3."
+        else
+            log_error "$binary was killed by signal $((status - 128)) while reporting its version."
+        fi
+        return 1
+    fi
+    reported=$(printf '%s\n' "$reported" | head -1)
     if [[ "$reported" =~ ([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?) ]]; then
         printf 'v%s\n' "${BASH_REMATCH[1]}"
         return 0
@@ -764,7 +950,7 @@ download_file() {
         attempt=$((attempt + 1))
         log_debug "Download attempt $attempt for $url"
         if command -v curl &>/dev/null; then
-            if curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 30 --max-time "$DOWNLOAD_TIMEOUT" \
+            if curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 30 --max-time "$DOWNLOAD_TIMEOUT" \
                 --retry 2 -o "$partial" "$url"; then
                 mv -f "$partial" "$dest"; return 0
             fi
@@ -837,6 +1023,9 @@ validate_binary_for_install() {
     local reported expected
     if ! reported=$(binary_reported_version "$src"); then
         log_error "$label failed --version validation"
+        if [ "$(uname -s)" = "Linux" ]; then
+            log_error "Linux releases require the ALSA runtime (libasound.so.2), including for file transcription. Install your distribution's ALSA runtime package and retry."
+        fi
         return 1
     fi
     if [ -n "$VERSION" ]; then
@@ -891,7 +1080,7 @@ is_macos_sidecar_member() {
     esac
     shadowed="${name#._}"
     case "$shadowed" in
-        "$BINARY_NAME"|"$ALIAS_NAME"|"README.md"|"LICENSE"|"NOTICE.sortformer.txt"|"THIRD_PARTY_NOTICES.md"|"AGENTS.md"|".DS_Store")
+        "$BINARY_NAME"|"$ALIAS_NAME"|"README.md"|"LICENSE"|"NOTICE.sortformer.txt"|"THIRD_PARTY_NOTICES.md"|"AGENTS.md"|"CHANGELOG.md"|".DS_Store")
             return 0 ;;
         *) return 1 ;;
     esac
@@ -902,7 +1091,7 @@ is_macos_sidecar_member() {
 # regular, non-symlink binaries before installation.
 validate_archive_members() {
     local archive="$1" archive_ext="$2" members member normalized
-    local binary_count=0 alias_count=0 readme_count=0 license_count=0 sortformer_notice_count=0 third_party_count=0 agents_count=0
+    local binary_count=0 alias_count=0 readme_count=0 license_count=0 sortformer_notice_count=0 third_party_count=0 agents_count=0 changelog_count=0
     if [ "$archive_ext" = "zip" ]; then
         members=$(unzip -Z1 "$archive") || return 1
     else
@@ -922,6 +1111,7 @@ validate_archive_members() {
             "NOTICE.sortformer.txt") sortformer_notice_count=$((sortformer_notice_count + 1)) ;;
             "THIRD_PARTY_NOTICES.md") third_party_count=$((third_party_count + 1)) ;;
             "AGENTS.md") agents_count=$((agents_count + 1)) ;;
+            "CHANGELOG.md") changelog_count=$((changelog_count + 1)) ;;
             *)
                 if is_macos_sidecar_member "$normalized"; then
                     continue
@@ -934,7 +1124,8 @@ validate_archive_members() {
     [ "$binary_count" -eq 1 ] && [ "$alias_count" -eq 1 ] && \
         [ "$readme_count" -le 1 ] && [ "$license_count" -le 1 ] && \
         [ "$sortformer_notice_count" -le 1 ] && \
-        [ "$third_party_count" -le 1 ] && [ "$agents_count" -le 1 ] || {
+        [ "$third_party_count" -le 1 ] && [ "$agents_count" -le 1 ] && \
+        [ "$changelog_count" -le 1 ] || {
         log_error "Archive must contain exactly one $BINARY_NAME, exactly one $ALIAS_NAME, and no duplicate allowlisted members"
         return 1
     }
@@ -1050,7 +1241,7 @@ ensure_rust() {
     log_warn "abort and install Rust yourself if you prefer."
     # The grace period only makes sense when the warning was visible.
     [ "$QUIET" -eq 1 ] || sleep 3
-    curl -fsSL "${PROXY_ARGS[@]}" https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+    curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
     export PATH="$HOME/.cargo/bin:$PATH"
     # shellcheck disable=SC1091  # rustup-generated env file not present at lint time
     [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
@@ -1086,7 +1277,31 @@ build_from_source() {
 
     log_step "Building with cargo (default features; this may take several minutes)..."
     local target_dir="$TMP/target"
-    if ! (cd "$fw_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --locked --release --bins); then
+
+    # Pre-x86-64-v3 CPU escape hatch (issue #5): the committed .cargo/config.toml
+    # pins `-C target-cpu=x86-64-v3`, so an unmodified source build would emit
+    # the same SIGILL-ing AVX2/BMI2 code the prebuilt crashed with. A RUSTFLAGS
+    # environment variable does NOT merge with config rustflags — it replaces
+    # them outright — so the override must re-state the config's non-CPU flag
+    # (`-Z threads=4`, the nightly parallel front-end the pinned toolchain
+    # supports) and swap only the CPU pin. `target-cpu=native` keeps every
+    # feature this CPU actually has (e.g. Ivy Bridge retains AVX/F16C).
+    local rustflags_override=""
+    if [ -n "${RUSTFLAGS:-}" ]; then
+        log_warn "Honoring caller-provided RUSTFLAGS (replaces .cargo/config.toml rustflags): ${RUSTFLAGS}"
+    elif ! cpu_supports_x86_64_v3; then
+        rustflags_override="-Z threads=4 -C target-cpu=native"
+        log_warn "CPU lacks the x86-64-v3 baseline (missing: ${CPU_MISSING_FLAGS:-unknown})."
+        log_warn "Overriding the pinned target-cpu for this build: RUSTFLAGS=\"${rustflags_override}\""
+    fi
+
+    if ! (
+        cd "$fw_dir" || exit 1
+        if [ -n "$rustflags_override" ]; then
+            export RUSTFLAGS="$rustflags_override"
+        fi
+        CARGO_TARGET_DIR="$target_dir" cargo build --locked --release --bins
+    ); then
         log_error "Source build failed."
         log_error "The pinned sibling contract was satisfied, but Cargo still failed."
         log_error "Prefer a prebuilt release binary, or reproduce with the same pinned sibling checkouts:"
@@ -1314,7 +1529,7 @@ provision_default_models() {
             log_success "Verified existing native Whisper and Sortformer models under $cache_root"
             return 0
         fi
-        die "Insufficient free space for both native model packages under $cache_root (need at least 2.25 GB available)"
+        die "Insufficient free space for the native model packages under $cache_root (need at least 2.4 GB available)"
     elif [ -z "$available_model_kb" ]; then
         log_warn "Could not measure free space for the model cache; the verified pull will fail closed on an I/O error"
     fi
@@ -1445,6 +1660,14 @@ main() {
         [ "$VERIFY" -eq 1 ] && run_self_test
         print_summary
         return 0
+    fi
+
+    # Refuse to download a prebuilt this CPU cannot execute (issue #5); may
+    # flip FROM_SOURCE=1 when the operator accepts the source fallback. Runs
+    # after the already-installed short-circuit so a working (e.g. previously
+    # source-built) installation is never disturbed by the refusal.
+    if [ "$FROM_SOURCE" -eq 0 ]; then
+        require_cpu_for_prebuilt
     fi
 
     if [ "$FROM_SOURCE" -eq 0 ] && [ -n "$VERSION" ]; then

@@ -1276,11 +1276,19 @@ const NATIVE_ROLLOUT_TIMESTAMP_TOLERANCE_SEC: f64 = 0.3;
 /// Native-rollout WER gate (greedy-vs-beam; DISC-003).
 const NATIVE_ROLLOUT_MAX_WER: f64 = 0.10;
 
+/// The audio fixture: gitignored (no media in the repo) and provisioned with
+/// the model by `scripts/fetch_test_models.sh`; called only past the gates.
 fn jfk_wav_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(concat!(
+    let path = std::path::PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/native/jfk.wav"
-    ))
+    ));
+    assert!(
+        path.is_file(),
+        "{} is missing: run scripts/fetch_test_models.sh (it fetches the pinned whisper.cpp sample)",
+        path.display()
+    );
+    path
 }
 
 /// Decode a standard 16-bit PCM WAV into 16 kHz mono `f32` samples in `[-1, 1]`,
@@ -1513,4 +1521,288 @@ fn gated_bridge_vs_native_conformance_jfk_tiny_en() {
              (bridge {bend:.3} vs native {nend:.3}; DISC-003)"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// bd-rt-audio-ctx-n4dj — DecodeParams::audio_ctx streaming encoder-context knob
+// ---------------------------------------------------------------------------
+
+/// Deterministic same-invocation A/B of the streaming encoder-context knob on
+/// jfk/tiny.en: `Full` (the byte-exact incumbent default) vs `Auto` vs
+/// `Fixed(512)`.
+///
+/// Gates ONLY on mechanism facts via the timing-free
+/// [`native_engine::decode::DecodeWorkStats::encoder_mel_frames`] counter:
+/// `Full` must retain its historical full-first-window/default-tail behavior;
+/// `Auto`/`Fixed` must feed counts derived from their effective
+/// post-safety-floor policy (first window included — a live stream is all
+/// first-window). Wall-clock and cross-policy WER numbers are PRINTED as
+/// candidate evidence for a future perf-ledger row and deliberately never
+/// asserted: a contended host must not flake this gate.
+#[test]
+fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
+    let Some(model_path) = native_engine::find_model_file("tiny.en") else {
+        eprintln!("SKIP gated_audio_ctx_policy_mechanism_ab: tiny.en model missing");
+        return;
+    };
+    // This is specifically the default-policy, greedy incumbent comparison.
+    // Process-global overrides would silently change that experiment while the
+    // printed row still called it greedy/Full, so reject them explicitly.
+    for key in [
+        "FW_BEAM_SIZE",
+        "FW_TEMP_FALLBACK",
+        "FW_INITIAL_PROMPT",
+        "FW_SIMD_EXP",
+        "FW_NO_CONTEXT",
+        "FW_TINY_EN_TS_CONTEXT",
+        "FW_RETRY_FAILED_WINDOW",
+        "FW_FIRST_WINDOW_MARGIN",
+        "FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE",
+    ] {
+        assert!(
+            std::env::var_os(key).is_none(),
+            "{key} must be unset for the default greedy audio_ctx gate"
+        );
+    }
+    let bytes = std::fs::read(jfk_wav_path()).expect("read jfk.wav");
+    let samples = read_wav_16k_mono(&bytes).expect("decode jfk.wav to 16k mono");
+    let model = NativeWhisperModel::load(&model_path).expect("load tiny.en");
+    let noop = || Ok(());
+
+    let run = |input: &[f32], audio_ctx| {
+        let params = native_engine::decode::DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: true,
+            n_threads: 4,
+            max_text_ctx: None,
+            audio_ctx,
+            // This gate asserts physical encoder work. Make that authority
+            // explicit instead of depending on a freshly loaded, cold LRU.
+            bypass_transcript_cache: true,
+            ..Default::default()
+        };
+        let t = std::time::Instant::now();
+        let out = model.transcribe(input, &params, &noop).expect("transcribe");
+        (out, t.elapsed())
+    };
+
+    // Mirror of the engine's real-frame derivation (decode.rs seek_end_cs):
+    // n_len_org = 1 + (n_samples - 200) / 160, saturated at 0 numerator.
+    let n = samples.len() as i64;
+    let real_frames = usize::try_from(n.saturating_sub(200) / 160 + 1).unwrap_or(0);
+    let auto_ctx = native_engine::decode::AudioCtxPolicy::Auto.effective_enc_ctx(real_frames);
+
+    let (full, full_wall) = run(&samples, native_engine::decode::AudioCtxPolicy::Full);
+    let (auto, auto_wall) = run(&samples, native_engine::decode::AudioCtxPolicy::Auto);
+    let (fixed, fixed_wall) = run(&samples, native_engine::decode::AudioCtxPolicy::fixed(512));
+
+    // Timestamp decoding may legitimately split even a short input into more
+    // than one seek. Check the exact physical work for every seek the model
+    // actually chose instead of assuming a single accepted window. Window
+    // offsets are emitted from integer centiseconds, so round-trip them back to
+    // that timebase before deriving the remaining real audio.
+    let assert_policy_work =
+        |label: &str,
+         input_real_frames: usize,
+         policy: native_engine::decode::AudioCtxPolicy,
+         out: &native_engine::decode::DecodeOutput| {
+            assert!(out.work.encoder_calls >= 1, "{label}: no physical encode");
+            assert_eq!(
+                out.work.encoder_calls,
+                out.windows.len(),
+                "{label}: retries must reuse their seek's physical encode"
+            );
+            let expected_mel_frames = out
+                .windows
+                .iter()
+                .map(|window| {
+                    let seek_cs_f64 = window.window_offset_sec * 100.0;
+                    let seek_cs_rounded = seek_cs_f64.round();
+                    assert!(
+                        (seek_cs_f64 - seek_cs_rounded).abs() < 1e-6,
+                        "{label}: non-centisecond window offset {}",
+                        window.window_offset_sec
+                    );
+                    let seek_cs = seek_cs_rounded as usize;
+                    let remaining_real_frames = input_real_frames.saturating_sub(seek_cs).min(3000);
+                    let enc_ctx = match policy {
+                        // Full is the whisper.cpp default: every seek, tail
+                        // included, encodes the full padded window (the
+                        // opt-in tail truncation env flag is asserted unset
+                        // above; DISC-004).
+                        native_engine::decode::AudioCtxPolicy::Full => 1500,
+                        reduced => reduced.effective_enc_ctx(remaining_real_frames),
+                    };
+                    enc_ctx * 2
+                })
+                .sum::<usize>();
+            assert_eq!(
+                out.work.encoder_mel_frames, expected_mel_frames,
+                "{label}: aggregate encoder work disagrees with observed seek offsets"
+            );
+        };
+
+    // ── Mechanism gates (deterministic, timing-free) ──
+    //
+    // Segmentation can differ by policy (a slightly different transcript can
+    // move the final timestamp and spawn an extra tail seek), so derive every
+    // exact aggregate from the observed seeks. Full encodes every seek at full
+    // context; Auto's 512-frame quality floor and Fixed's
+    // shrink-to-real semantics remain part of their expectations.
+    assert_policy_work(
+        "whole-jfk Full",
+        real_frames,
+        native_engine::decode::AudioCtxPolicy::Full,
+        &full,
+    );
+    assert_policy_work(
+        "whole-jfk Auto",
+        real_frames,
+        native_engine::decode::AudioCtxPolicy::Auto,
+        &auto,
+    );
+    // Auto's saving is per seek: on this fixture every seek it makes encodes
+    // less than half of Full's per-seek context. How many seeks a run takes is
+    // the model's call, not the policy's: with the f32 encoder Auto's first
+    // window closes at 10.74 s and a 0.25 s tail seek follows (Full closes at
+    // the audio end), while with the int8 encoder Auto also closes at the end.
+    // So compare Auto's work with what Full spends per seek, over Auto's seeks.
+    let full_mel_per_seek = full.work.encoder_mel_frames / full.work.encoder_calls;
+    assert!(
+        auto.work.encoder_mel_frames * 2 < full_mel_per_seek * auto.work.encoder_calls,
+        "Auto must at least halve Full's per-seek encoder work on this fixture \
+         ({} mel frames over {} seeks vs Full's {full_mel_per_seek} per seek)",
+        auto.work.encoder_mel_frames,
+        auto.work.encoder_calls
+    );
+    assert_policy_work(
+        "whole-jfk Fixed(512)",
+        real_frames,
+        native_engine::decode::AudioCtxPolicy::fixed(512),
+        &fixed,
+    );
+
+    // ── Exact quality-floor boundary through the real model path ──
+    //
+    // The engine derives real mel frames as
+    // `1 + max(n_samples - 200, 0) / 160`. Choose an actual sub-500 ms decode
+    // plus exact sample counts on the two sides of Auto's 512-ctx floor
+    // transition and at the 1500-ctx ceiling. At 1024 real frames Auto and
+    // Fixed(512) both feed 1024 mel frames on the first seek. At 1025,
+    // ceil(real/2) makes Auto's first seek feed 1026 while Fixed remains capped
+    // at 1024. Later model-directed tail seeks are checked individually through
+    // their observed offsets rather than prohibited by the test.
+    // These model-backed cells fail if first-window reduction is bypassed,
+    // ceil regresses to floor, the Auto quality floor sticks one frame too
+    // long, or Fixed stops enforcing its cap.
+    let samples_for_real_frames = |real_frames: usize| {
+        let sample_count = 200 + 160 * real_frames.saturating_sub(1);
+        assert!(
+            sample_count <= samples.len(),
+            "jfk fixture is too short for {real_frames} exact real mel frames"
+        );
+        &samples[..sample_count]
+    };
+    let sub_500ms_input = samples_for_real_frames(49);
+    let floor_input = samples_for_real_frames(1024);
+    let above_floor_input = samples_for_real_frames(1025);
+    // Exact 3000-real-frame silence exercises Auto at its full-context ceiling
+    // while keeping transcript quality outside this boundary-safety cell. The
+    // exhaustive policy unit test locks the exact 1500-ctx calculation; model
+    // timestamps may legitimately create more than one seek here, so aggregate
+    // work must not assume exactly one accepted window.
+    let ceiling_input = vec![0.0; 200 + 160 * 2999];
+    let (auto_sub_500ms, _) = run(sub_500ms_input, native_engine::decode::AudioCtxPolicy::Auto);
+    assert_policy_work(
+        "sub-500ms Auto",
+        49,
+        native_engine::decode::AudioCtxPolicy::Auto,
+        &auto_sub_500ms,
+    );
+
+    let (auto_ceiling, _) = run(&ceiling_input, native_engine::decode::AudioCtxPolicy::Auto);
+    assert_policy_work(
+        "ceiling Auto",
+        3000,
+        native_engine::decode::AudioCtxPolicy::Auto,
+        &auto_ceiling,
+    );
+
+    let (auto_floor, _) = run(floor_input, native_engine::decode::AudioCtxPolicy::Auto);
+    let (fixed_floor, _) = run(
+        floor_input,
+        native_engine::decode::AudioCtxPolicy::fixed(512),
+    );
+    assert_policy_work(
+        "floor Auto",
+        1024,
+        native_engine::decode::AudioCtxPolicy::Auto,
+        &auto_floor,
+    );
+    assert_policy_work(
+        "floor Fixed(512)",
+        1024,
+        native_engine::decode::AudioCtxPolicy::fixed(512),
+        &fixed_floor,
+    );
+    assert!(
+        !joined_text(&auto_floor.segments).is_empty()
+            && !joined_text(&fixed_floor.segments).is_empty(),
+        "both 512-context policies must decode the speech-bearing floor slice"
+    );
+
+    let (auto_above_floor, _) = run(
+        above_floor_input,
+        native_engine::decode::AudioCtxPolicy::Auto,
+    );
+    let (fixed_above_floor, _) = run(
+        above_floor_input,
+        native_engine::decode::AudioCtxPolicy::fixed(512),
+    );
+    assert_policy_work(
+        "above-floor Auto",
+        1025,
+        native_engine::decode::AudioCtxPolicy::Auto,
+        &auto_above_floor,
+    );
+    assert_policy_work(
+        "above-floor Fixed(512)",
+        1025,
+        native_engine::decode::AudioCtxPolicy::fixed(512),
+        &fixed_above_floor,
+    );
+    assert_eq!(
+        native_engine::decode::AudioCtxPolicy::Auto.effective_enc_ctx(1025) * 2,
+        native_engine::decode::AudioCtxPolicy::fixed(512).effective_enc_ctx(1025) * 2 + 2,
+        "the planted boundary negative must distinguish Auto from Fixed(512)"
+    );
+    assert!(
+        !joined_text(&auto_above_floor.segments).is_empty()
+            && !joined_text(&fixed_above_floor.segments).is_empty(),
+        "both policies must decode the speech-bearing above-floor slice"
+    );
+
+    // ── Published (not asserted) quality/cost numbers for the ledger row ──
+    let full_text = joined_text(&full.segments);
+    let auto_text = joined_text(&auto.segments);
+    let fixed_text = joined_text(&fixed.segments);
+    let wer_auto = word_error_rate_edit(&full_text, &auto_text);
+    let wer_fixed = word_error_rate_edit(&full_text, &fixed_text);
+    eprintln!(
+        "audio_ctx A/B (jfk, tiny.en, greedy, timestamps on): real_frames={real_frames} auto_ctx={auto_ctx}"
+    );
+    eprintln!("  walls: full={full_wall:?} auto={auto_wall:?} fixed={fixed_wall:?}");
+    eprintln!(
+        "  encoder_mel_frames: full={} auto={} fixed={}",
+        full.work.encoder_mel_frames, auto.work.encoder_mel_frames, fixed.work.encoder_mel_frames
+    );
+    eprintln!("  WER vs Full: auto={wer_auto:.4} fixed={wer_fixed:.4}");
+    eprintln!("  FULL : {full_text}");
+    eprintln!("  AUTO : {auto_text}");
+    eprintln!("  FIXED: {fixed_text}");
+    assert!(
+        !full_text.is_empty() && !auto_text.is_empty(),
+        "both policies must produce a transcript on the jfk fixture"
+    );
 }

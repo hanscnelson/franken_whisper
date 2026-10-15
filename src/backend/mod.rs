@@ -491,7 +491,8 @@ impl RouterState {
             BackendKind::WhisperCpp => Some(0),
             BackendKind::InsanelyFast => Some(1),
             BackendKind::WhisperDiarization => Some(2),
-            BackendKind::Auto => None,
+            // The live listen lane is not a comparison-slot backend.
+            BackendKind::NativeListen | BackendKind::Auto => None,
         }
     }
 
@@ -751,6 +752,16 @@ pub fn record_adaptive_prediction(top_ranked_succeeded: bool) {
     if let Ok(mut guard) = ROUTER_STATE.lock() {
         let state = guard.get_or_insert_with(RouterState::new);
         state.record_prediction_outcome(top_ranked_succeeded);
+    }
+}
+
+/// Forget every recorded routing outcome, returning the router to the state a
+/// fresh process starts in. A batch calls this before each input so the
+/// adaptive router cannot learn across inputs: each input then routes exactly
+/// as it would in its own single-input process (bd-batch-transcribe-rraf).
+pub fn reset_router_state() {
+    if let Ok(mut guard) = ROUTER_STATE.lock() {
+        *guard = None;
     }
 }
 
@@ -1204,7 +1215,8 @@ pub fn engine_for(kind: BackendKind) -> Option<Box<dyn Engine>> {
         BackendKind::WhisperCpp => Some(Box::new(WhisperCppEngine)),
         BackendKind::InsanelyFast => Some(Box::new(InsanelyFastEngine)),
         BackendKind::WhisperDiarization => Some(Box::new(WhisperDiarizationEngine)),
-        BackendKind::Auto => None,
+        // The live listen lane drives the engine directly, not via a bridge.
+        BackendKind::NativeListen | BackendKind::Auto => None,
     }
 }
 
@@ -1218,7 +1230,8 @@ pub fn streaming_engine_for(kind: BackendKind) -> Option<Box<dyn StreamingEngine
         BackendKind::WhisperCpp => Some(Box::new(WhisperCppEngine)),
         BackendKind::InsanelyFast => Some(Box::new(InsanelyFastEngine)),
         BackendKind::WhisperDiarization => Some(Box::new(WhisperDiarizationEngine)),
-        BackendKind::Auto => None,
+        // The live listen lane drives the engine directly, not via a bridge.
+        BackendKind::NativeListen | BackendKind::Auto => None,
     }
 }
 
@@ -1240,9 +1253,27 @@ pub struct BackendSelectionOutcome {
     pub recommended_order: Vec<BackendKind>,
     pub evidence_entries: Vec<Value>,
     pub fallback_triggered: bool,
+    /// Why the static order was used, when the router recorded one.
+    pub fallback_reason: Option<String>,
     pub calibration_score: f64,
     pub e_process: f64,
     pub ci_width: f64,
+}
+
+impl BackendSelectionOutcome {
+    /// Whether the static-order fallback signals a detected problem
+    /// (calibration drift, a contract failure) rather than the router's
+    /// steady state: no outcomes observed yet — every fresh process — or a
+    /// native rollout stage that pins the static order. Only the former is
+    /// worth a run warning; both stay in the routing evidence.
+    #[must_use]
+    pub fn fallback_needs_attention(&self) -> bool {
+        self.fallback_triggered
+            && !self.fallback_reason.as_deref().is_some_and(|reason| {
+                reason == "insufficient_data"
+                    || reason.starts_with("native_rollout_forced_static_order(")
+            })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1402,6 +1433,332 @@ pub fn is_available(kind: BackendKind) -> bool {
         BackendKind::WhisperCpp => whisper_cpp::is_available(),
         BackendKind::InsanelyFast => insanely_fast::is_available(),
         BackendKind::WhisperDiarization => whisper_diarization::is_available(),
+        // The in-process lane's availability is model-package driven; the
+        // listen driver reports degradation via session warnings instead.
+        BackendKind::NativeListen => true,
+    }
+}
+
+/// Thousandths of `value`, saturating (the request validator already rejects
+/// non-finite values; the clamp only bounds the cast).
+fn milli_i32(value: f32) -> i32 {
+    (f64::from(value) * 1000.0)
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+/// Map the request's whisper.cpp decoding controls onto the in-process
+/// engine's per-request [`DecodeParams`](native_engine::decode::DecodeParams)
+/// (bd-6goy). Only flags the caller actually passed change anything, so a
+/// request without them decodes byte-identically to before:
+///
+/// - `--best-of`, `--temperature-increment`, `--entropy-threshold`, or
+///   `--logprob-threshold` turn the whisper.cpp quality-gated temperature
+///   fallback ON for this request (they only mean something with it);
+///   `--no-fallback` forces it OFF and wins over all of them.
+/// - The thresholds and the ladder step carry their values; `--no-speech-
+///   threshold` alone only moves the silent-window gate, as upstream.
+/// - `--audio-ctx N` (N > 0) selects a fixed encoder context; 0 / unset keeps
+///   the full 30 s window.
+pub(crate) fn apply_native_decode_controls(
+    params: &mut native_engine::decode::DecodeParams,
+    request: &TranscribeRequest,
+) {
+    let backend_params = &request.backend_params;
+    if let Some(decoding) = backend_params.decoding.as_ref() {
+        params.best_of = decoding.best_of.map(|n| n as usize);
+        params.temperature_increment_milli = decoding
+            .temperature_increment
+            .map(|inc| u32::try_from(milli_i32(inc).max(0)).unwrap_or(0));
+        params.entropy_threshold_milli = decoding.entropy_threshold.map(milli_i32);
+        params.logprob_threshold_milli = decoding.logprob_threshold.map(milli_i32);
+        params.no_speech_threshold_milli = decoding.no_speech_threshold.map(milli_i32);
+        if decoding.best_of.is_some()
+            || decoding.temperature_increment.is_some()
+            || decoding.entropy_threshold.is_some()
+            || decoding.logprob_threshold.is_some()
+        {
+            params.temperature_fallback = Some(true);
+        }
+    }
+    if backend_params.no_fallback {
+        params.temperature_fallback = Some(false);
+    }
+    if let Some(ctx) = backend_params.audio_ctx
+        && let Ok(ctx) = usize::try_from(ctx)
+        && ctx > 0
+    {
+        params.audio_ctx = native_engine::decode::AudioCtxPolicy::fixed(ctx);
+    }
+}
+
+/// How many of the most probable languages a detection result reports.
+const DETECTED_LANGUAGE_TOP_K: usize = 10;
+
+/// The native `--detect-language-only` result (whisper `--detect-language`):
+/// no transcript or segments, the detected language, and the top of the
+/// language posterior in `raw_output`. Shared by every native backend.
+pub(crate) fn native_language_detection_result(
+    backend: BackendKind,
+    engine: &str,
+    spec: &str,
+    detection: &native_engine::decode::LanguageDetection,
+) -> TranscriptionResult {
+    let probabilities: Vec<Value> = detection
+        .probabilities
+        .iter()
+        .take(DETECTED_LANGUAGE_TOP_K)
+        .map(|(language, probability)| {
+            serde_json::json!({ "language": language, "probability": probability })
+        })
+        .collect();
+    TranscriptionResult {
+        backend,
+        transcript: String::new(),
+        language: Some(detection.language.clone()),
+        segments: Vec::new(),
+        acceleration: None,
+        diarization: None,
+        raw_output: serde_json::json!({
+            "engine": engine,
+            "schema_version": "native-v2",
+            "in_process": true,
+            "implementation": "real-inference",
+            "model": spec,
+            "detect_language_only": true,
+            "language": detection.language,
+            "multilingual_model": detection.multilingual,
+            "language_probabilities": probabilities,
+            "windows": [],
+            "word_timestamps": "none",
+        }),
+        artifact_paths: Vec::new(),
+    }
+}
+
+/// Request options the in-process engine cannot honor, as run warnings (so a
+/// whisper.cpp flag never silently does nothing on the default native path).
+#[must_use]
+pub(crate) fn native_ignored_option_warnings(
+    request: &TranscribeRequest,
+    resolved: BackendKind,
+) -> Vec<String> {
+    let backend_params = &request.backend_params;
+    let decoding = backend_params.decoding.as_ref();
+    let mut ignored = Vec::new();
+    if decoding
+        .and_then(|d| d.temperature)
+        .is_some_and(|temperature| temperature > 0.0)
+    {
+        ignored.push("--temperature (the native first pass is greedy; use --temperature-increment/--best-of for the fallback ladder)");
+    }
+    // whisper.cpp-native and insanely-fast-native regroup words to the limit;
+    // the diarization backend keeps the engine's segments.
+    if decoding.and_then(|d| d.max_segment_length).is_some()
+        && resolved == BackendKind::WhisperDiarization
+    {
+        ignored.push("--max-segment-length");
+    }
+    if backend_params.timestamp_level == Some(crate::model::TimestampLevel::Word)
+        && resolved == BackendKind::WhisperDiarization
+    {
+        ignored.push("--timestamp-level word");
+    }
+    if backend_params.word_threshold.is_some() {
+        ignored.push("--word-threshold");
+    }
+    if backend_params.suppress_regex.is_some() {
+        ignored.push("--suppress-regex");
+    }
+    ignored
+        .into_iter()
+        .map(|option| format!("native engine ignored unsupported option {option}"))
+        .collect()
+}
+
+/// The compute-thread count a request runs with: `--threads` /
+/// `BackendParams.threads` when set to at least 1, else the engine default
+/// (see [`crate::native_engine::effective_compute_threads`]). Every native
+/// stage of the run computes on a pool of exactly this many workers
+/// (bd-threads-flag-unbounded-f4pq).
+#[must_use]
+pub fn request_compute_threads(request: &TranscribeRequest) -> usize {
+    crate::native_engine::effective_compute_threads(
+        request
+            .backend_params
+            .threads
+            .and_then(|t| usize::try_from(t).ok()),
+    )
+}
+
+/// `Some` when the request's `--threads` / `BackendParams.threads` exceeds
+/// the CPUs this process may use, so the run computes on fewer threads than
+/// asked (bd-threads-unclamped-pools-never-retired-7kuk). The CLI reports it
+/// on stderr; a run records it as a warning and an
+/// `orchestration.threads_clamped` stage event.
+#[must_use]
+pub fn request_threads_clamp(
+    request: &TranscribeRequest,
+) -> Option<crate::native_engine::ComputeThreadsClamp> {
+    let requested = usize::try_from(request.backend_params.threads?).ok()?;
+    crate::native_engine::ComputeThreadsClamp::for_request(
+        requested,
+        crate::native_engine::usable_cpus(),
+    )
+}
+
+/// The requested `--offset-ms` / `--duration-ms` audio window, if any (bd-vgod).
+///
+/// Returns `None` when neither flag is set (or both are zero-effect), so the
+/// unwindowed path stays byte-identical to the pre-window behavior.
+pub(crate) fn requested_audio_window(request: &TranscribeRequest) -> Option<(u64, Option<u64>)> {
+    let offset_ms = request.backend_params.offset_ms.unwrap_or(0);
+    let duration_ms = request.backend_params.duration_ms.filter(|d| *d > 0);
+    if offset_ms == 0 && duration_ms.is_none() {
+        None
+    } else {
+        Some((offset_ms, duration_ms))
+    }
+}
+
+/// Convert a ms-domain window into clamped sample bounds over 16 kHz PCM.
+pub(crate) fn window_sample_bounds(
+    len: usize,
+    offset_ms: u64,
+    duration_ms: Option<u64>,
+) -> (usize, usize) {
+    const SAMPLES_PER_MS: u64 = (native_engine::mel::SAMPLE_RATE as u64) / 1000;
+    let start = usize::try_from(offset_ms.saturating_mul(SAMPLES_PER_MS))
+        .unwrap_or(usize::MAX)
+        .min(len);
+    let end = match duration_ms {
+        Some(duration_ms) => usize::try_from(
+            offset_ms
+                .saturating_add(duration_ms)
+                .saturating_mul(SAMPLES_PER_MS),
+        )
+        .unwrap_or(usize::MAX)
+        .min(len),
+        None => len,
+    };
+    (start, end.max(start))
+}
+
+/// Apply the requested audio window to normalized 16 kHz samples, returning
+/// the decode input and its offset (ms) in the source timebase. `None` means
+/// the window starts at or past the end of the audio (an empty slice).
+pub(crate) fn windowed_samples(
+    samples: Vec<f32>,
+    window: Option<(u64, Option<u64>)>,
+) -> Option<(Vec<f32>, u64)> {
+    let Some((offset_ms, duration_ms)) = window else {
+        return Some((samples, 0));
+    };
+    let (start, end) = window_sample_bounds(samples.len(), offset_ms, duration_ms);
+    (start < end).then(|| (samples[start..end].to_vec(), offset_ms))
+}
+
+/// Record a windowed run's provenance on a native result's `raw_output`.
+/// Timestamps of windowed native runs are always in the source timebase.
+pub(crate) fn tag_audio_window(
+    raw_output: &mut Value,
+    window: Option<(u64, Option<u64>)>,
+    empty_slice: bool,
+) {
+    let (Value::Object(map), Some((offset_ms, duration_ms))) = (raw_output, window) else {
+        return;
+    };
+    let mut tag = serde_json::json!({
+        "offset_ms": offset_ms,
+        "duration_ms": duration_ms,
+        "timebase": "source",
+    });
+    if empty_slice {
+        tag["empty_slice"] = Value::Bool(true);
+    }
+    map.insert("audio_window".to_owned(), tag);
+}
+
+/// Collapse the per-word units whisper.cpp-native emitted only so native
+/// diarization could attribute speakers word by word back into the engine's
+/// segments, split where the attributed speaker changes. Returns the number of
+/// word units collapsed, or `None` when the result carries no applicable plan.
+pub(crate) fn regroup_diarization_word_units(result: &mut TranscriptionResult) -> Option<usize> {
+    let plan = result
+        .raw_output
+        .get(whisper_cpp_native::DIARIZATION_WORD_UNITS_KEY)
+        .cloned()
+        .and_then(|plan| {
+            serde_json::from_value::<whisper_cpp_native::DiarizationWordUnitPlan>(plan).ok()
+        })?;
+    let segments = plan.regroup(&result.segments)?;
+    let units = result.segments.len();
+    // Keep the acceleration report's raw confidences parallel to the new
+    // segments: regroup a copy of the units carrying the raw values, which
+    // averages them over exactly the runs the normalized values were averaged
+    // over. Drop them rather than misalign when that is not possible.
+    if let Some(report) = result.acceleration.as_mut() {
+        let regrouped_raw = (report.raw_confidences.len() == units)
+            .then(|| {
+                let mut raw_units = result.segments.clone();
+                for (unit, raw) in raw_units.iter_mut().zip(&report.raw_confidences) {
+                    unit.confidence = *raw;
+                }
+                plan.regroup(&raw_units)
+            })
+            .flatten()
+            .map(|raw_segments| {
+                raw_segments
+                    .into_iter()
+                    .map(|segment| segment.confidence)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|raw| raw.len() == segments.len());
+        report.raw_confidences = regrouped_raw.unwrap_or_default();
+    }
+    result.segments = segments;
+    // Keep the projection provenance truthful about what the run outputs.
+    if let Some(timeline) = result
+        .raw_output
+        .get_mut("projection_timeline")
+        .and_then(Value::as_object_mut)
+    {
+        timeline.insert(
+            "output_segments".to_owned(),
+            Value::from(result.segments.len()),
+        );
+    }
+    Some(units)
+}
+
+/// Shift every emitted timestamp in a decode output by a uniform offset,
+/// keeping windowed runs in the source-file timebase.
+pub(crate) fn shift_decode_output(
+    output: &mut native_engine::decode::DecodeOutput,
+    offset_sec: f64,
+) {
+    for segment in &mut output.segments {
+        if let Some(start) = segment.start_sec.as_mut() {
+            *start += offset_sec;
+        }
+        if let Some(end) = segment.end_sec.as_mut() {
+            *end += offset_sec;
+        }
+    }
+    if let Some(word_timings) = output.word_timings.as_mut() {
+        for words in word_timings.iter_mut() {
+            for word in words.iter_mut() {
+                word.start_sec += offset_sec;
+                word.end_sec += offset_sec;
+            }
+        }
+    }
+    for window in &mut output.windows {
+        window.window_offset_sec += offset_sec;
+    }
+    for dropped in &mut output.dropped_windows {
+        dropped.start_sec += offset_sec;
+        dropped.end_sec += offset_sec;
     }
 }
 
@@ -1524,7 +1881,8 @@ fn bridge_runtime_metadata(kind: BackendKind) -> BackendRuntimeMetadata {
                 version: probe_command_version(&python),
             }
         }
-        BackendKind::Auto => BackendRuntimeMetadata {
+        // The live lane runs in-process; it carries no bridge runtime.
+        BackendKind::NativeListen | BackendKind::Auto => BackendRuntimeMetadata {
             identity: "auto-policy".to_owned(),
             version: None,
         },
@@ -1552,6 +1910,11 @@ fn native_runtime_metadata(kind: BackendKind) -> BackendRuntimeMetadata {
         BackendKind::Auto => BackendRuntimeMetadata {
             identity: "auto-policy".to_owned(),
             version: None,
+        },
+        // The live lane IS the native engine; no distinct identity needed.
+        BackendKind::NativeListen => BackendRuntimeMetadata {
+            identity: "native-listen".to_owned(),
+            version,
         },
     }
 }
@@ -1615,6 +1978,9 @@ fn bridge_available(kind: BackendKind) -> bool {
         BackendKind::WhisperCpp => whisper_cpp::is_available(),
         BackendKind::InsanelyFast => insanely_fast::is_available(),
         BackendKind::WhisperDiarization => whisper_diarization::is_available(),
+        // The live lane is always "available" (in-process); model presence
+        // is reported by the listen driver itself.
+        BackendKind::NativeListen => true,
     }
 }
 
@@ -1624,6 +1990,8 @@ fn native_available(kind: BackendKind) -> bool {
         BackendKind::WhisperCpp => whisper_cpp_native::is_available(),
         BackendKind::InsanelyFast => insanely_fast_native::is_available(),
         BackendKind::WhisperDiarization => whisper_diarization_native::is_available(),
+        // The live lane IS the native engine.
+        BackendKind::NativeListen => true,
     }
 }
 
@@ -1722,6 +2090,12 @@ fn run_backend(
     match kind {
         BackendKind::Auto => Err(FwError::InvalidRequest(
             "internal error: auto backend cannot be run directly".to_owned(),
+        )),
+        // The live listen lane persists sessions itself (bd-rt-persist-a66y)
+        // and never executes through the bridge/native request runners.
+        BackendKind::NativeListen => Err(FwError::InvalidRequest(
+            "internal error: native listen sessions are not run through the backend pipeline"
+                .to_owned(),
         )),
         BackendKind::WhisperCpp => run_backend_with_mode_and_runners(
             kind,
@@ -1942,18 +2316,37 @@ struct BackendReadiness {
     reason: Option<String>,
 }
 
+fn unavailable_reason(mode: NativeExecutionMode, request: &TranscribeRequest) -> String {
+    if matches!(
+        mode,
+        NativeExecutionMode::NativePreferred | NativeExecutionMode::NativeOnly
+    ) && let Some(spec) = request.model.as_deref().filter(|spec| !spec.is_empty())
+        && !native_engine::native_model_available(spec)
+    {
+        return match native_engine::resolve_model(spec) {
+            Ok(path) => format!(
+                "requested native model is unavailable after validation: `{}`",
+                path.display()
+            ),
+            Err(error) => format!("requested native model is unavailable: {error}"),
+        };
+    }
+
+    match mode {
+        NativeExecutionMode::BridgeOnly => "binary/script unavailable".to_owned(),
+        NativeExecutionMode::NativePreferred => {
+            "native and bridge engines both unavailable".to_owned()
+        }
+        NativeExecutionMode::NativeOnly => "native engine unavailable".to_owned(),
+    }
+}
+
 fn readiness_for(kind: BackendKind, request: &TranscribeRequest) -> BackendReadiness {
     let mode = native_execution_mode(native_rollout_stage());
     if !available_for_request(kind, mode, request) {
         return BackendReadiness {
             available: false,
-            reason: Some(match mode {
-                NativeExecutionMode::BridgeOnly => "binary/script unavailable".to_owned(),
-                NativeExecutionMode::NativePreferred => {
-                    "native and bridge engines both unavailable".to_owned()
-                }
-                NativeExecutionMode::NativeOnly => "native engine unavailable".to_owned(),
-            }),
+            reason: Some(unavailable_reason(mode, request)),
         };
     }
 
@@ -2234,7 +2627,9 @@ fn check_binary_for_kind(kind: BackendKind) -> (bool, Option<String>) {
         BackendKind::WhisperDiarization => {
             std::env::var("FRANKEN_WHISPER_PYTHON_BIN").unwrap_or_else(|_| "python3".to_owned())
         }
-        BackendKind::Auto => return (false, None),
+        // The live listen lane has no external binary; availability is owned
+        // by the listen pipeline, not backend discovery.
+        BackendKind::NativeListen | BackendKind::Auto => return (false, None),
     };
     match which::which(&bin_name) {
         Ok(path) => (true, Some(path.display().to_string())),
@@ -2252,6 +2647,8 @@ fn probe_version_for_kind(kind: BackendKind) -> Option<String> {
             std::env::var("FRANKEN_WHISPER_PYTHON_BIN").unwrap_or_else(|_| "python3".to_owned())
         }
         BackendKind::Auto => return None,
+        // No external runtime to version-probe for the live listen lane.
+        BackendKind::NativeListen => return None,
     };
     probe_command_version(&bin)
 }
@@ -2686,7 +3083,7 @@ fn static_fallback_selection_outcome(
             .map(|k| k.as_str().to_owned())
             .collect(),
         fallback_active: true,
-        fallback_reason,
+        fallback_reason: fallback_reason.clone(),
         posterior_snapshot: Vec::new(),
         calibration_score,
         brier_score: None,
@@ -2714,6 +3111,7 @@ fn static_fallback_selection_outcome(
         recommended_order,
         evidence_entries,
         fallback_triggered: true,
+        fallback_reason,
         calibration_score,
         e_process,
         ci_width,
@@ -2947,7 +3345,12 @@ pub fn evaluate_backend_selection(
 
     // bd-efr.2: Include Brier score from calibration state.
     let brier_score = rs_ref.and_then(|rs| rs.brier_score());
-    let router_state_fallback_reason = rs_ref.and_then(|rs| rs.fallback_reason());
+    // A process that has not routed yet has no router state: that is the
+    // same "no outcomes observed" condition as an empty state.
+    let router_state_fallback_reason = rs_ref.map_or_else(
+        || RouterState::new().fallback_reason(),
+        RouterState::fallback_reason,
+    );
     // Last use of the borrowed state; release the lock before the post-decision
     // `ROUTER_STATE` update at the tail (std `Mutex` is not reentrant).
     drop(rs_guard);
@@ -3062,6 +3465,7 @@ pub fn evaluate_backend_selection(
         recommended_order,
         evidence_entries,
         fallback_triggered: fallback_active,
+        fallback_reason,
         calibration_score,
         e_process,
         ci_width,
@@ -3095,7 +3499,9 @@ fn prior_for(kind: BackendKind) -> (f64, f64) {
         BackendKind::WhisperCpp => (7.0, 3.0),
         BackendKind::InsanelyFast => (6.0, 4.0),
         BackendKind::WhisperDiarization => (5.0, 5.0),
-        BackendKind::Auto => (1.0, 1.0),
+        // The live listen lane never enters backend routing; the neutral
+        // Auto prior keeps the contract total without inventing evidence.
+        BackendKind::NativeListen | BackendKind::Auto => (1.0, 1.0),
     }
 }
 
@@ -3122,7 +3528,8 @@ fn quality_proxy(kind: BackendKind, request: &TranscribeRequest) -> f64 {
                 0.63
             }
         }
-        BackendKind::Auto => 0.50,
+        // Never routed; neutral placeholder keeps the match total.
+        BackendKind::NativeListen | BackendKind::Auto => 0.50,
     }
 }
 
@@ -3132,7 +3539,8 @@ fn latency_proxy(kind: BackendKind, duration_seconds: f64, diarize: bool) -> f64
         BackendKind::WhisperCpp => 12.0,
         BackendKind::InsanelyFast => 8.0,
         BackendKind::WhisperDiarization => 18.0,
-        BackendKind::Auto => 20.0,
+        // Never routed; neutral placeholder keeps the match total.
+        BackendKind::NativeListen | BackendKind::Auto => 20.0,
     };
     // Sanitize the duration: a NaN/Inf feeds sqrt() -> NaN -> a NaN base loss
     // -> LossMatrix::new() rejection. Negative durations are also nonsensical.
@@ -4181,6 +4589,59 @@ impl ConcurrentTwoLaneExecutor {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- bd-z20h: whisper.cpp v1.7.5 tiny-diarize (tdrz) artifact shape ----
+    // Captured verbatim from `whisper-cli -tdrz -oj` (v1.7.5, ggml-small.en-tdrz)
+    // on a single-speaker 8 s clip. The tdrz dump carries a per-segment
+    // `speaker_turn_next` flag that the extractor must tolerate, and NO
+    // top-level `text` — the transcript must be rebuilt from segments.
+
+    const TDRZ_V175_JSON: &str = r#"{
+	"systeminfo": "WHISPER : CPU",
+	"model": { "type": "small", "multilingual": false, "vocab": 51864 },
+	"result": { "language": "en" },
+	"transcription": [
+		{
+			"timestamps": { "from": "00:00:00,000", "to": "00:00:07,560" },
+			"offsets": { "from": 0, "to": 7560 },
+			"text": " And so my fellow Americans, ask not what your country can do for you.",
+			"speaker_turn_next": false
+		}
+	]
+}"#;
+
+    #[test]
+    fn extract_segments_handles_tdrz_v175_artifact_with_speaker_turn_flag() {
+        let root: serde_json::Value =
+            serde_json::from_str(TDRZ_V175_JSON).expect("fixture must parse");
+        let segments = extract_segments_from_json(&root);
+        assert_eq!(segments.len(), 1, "one tdrz segment expected");
+        assert!(
+            segments[0]
+                .text
+                .contains("And so my fellow Americans, ask not"),
+            "segment text must preserve the spoken sentence verbatim"
+        );
+        // The speaker-turn bookkeeping flag is metadata, not content: it must
+        // never leak into the transcript text.
+        assert!(!segments[0].text.contains("speaker_turn"));
+    }
+
+    #[test]
+    fn tdrz_transcript_rebuilds_from_segments_without_top_level_text() {
+        let root: serde_json::Value =
+            serde_json::from_str(TDRZ_V175_JSON).expect("fixture must parse");
+        // whisper_cpp::run falls back to transcript_from_segments when the
+        // artifact has no top-level `text` (the tdrz dump's shape).
+        assert!(
+            root.get("text").is_none(),
+            "precondition: no top-level text"
+        );
+        let segments = extract_segments_from_json(&root);
+        let rebuilt = transcript_from_segments(&segments);
+        assert!(rebuilt.contains("fellow Americans"));
+    }
+
     use super::{
         ADAPTIVE_FALLBACK_CALIBRATION_THRESHOLD, ADAPTIVE_MIN_SAMPLES, BackendHealthReport,
         BackendImplementation, BackendMetrics, BackendSelectionContract,
@@ -4197,7 +4658,8 @@ mod tests {
         posterior_success_probability, prior_for, probe_system_health,
         probe_system_health_uncached, quality_proxy, runtime_metadata,
         runtime_metadata_with_implementation, sanitize_timestamp, segment_end, segment_start,
-        static_fallback_selection_outcome, transcript_from_segments, update_router_state,
+        static_fallback_selection_outcome, tag_audio_window, transcript_from_segments,
+        unavailable_reason, update_router_state, windowed_samples,
     };
     use crate::conformance::NativeEngineRolloutStage;
     use crate::model::{
@@ -4229,6 +4691,61 @@ mod tests {
             timeout_ms: None,
             backend_params: crate::model::BackendParams::default(),
         }
+    }
+
+    #[test]
+    fn windowed_samples_slice_the_requested_window_or_report_an_empty_one() {
+        let samples: Vec<f32> = (0..48_000).map(|i| i as f32).collect();
+        // No window: the samples pass through untouched at offset 0.
+        let (all, offset) = windowed_samples(samples.clone(), None).expect("unwindowed");
+        assert_eq!((all.len(), offset), (48_000, 0));
+        // 1 s offset, 0.5 s duration at 16 kHz.
+        let (slice, offset) =
+            windowed_samples(samples.clone(), Some((1_000, Some(500)))).expect("window");
+        assert_eq!(offset, 1_000);
+        assert_eq!(slice.len(), 8_000);
+        assert_eq!(slice[0], 16_000.0);
+        // Open-ended window runs to the end; a window past EOF is empty.
+        let (tail, _) = windowed_samples(samples.clone(), Some((2_000, None))).expect("tail");
+        assert_eq!(tail.len(), 16_000);
+        assert!(windowed_samples(samples, Some((3_000, Some(1_000)))).is_none());
+    }
+
+    #[test]
+    fn audio_window_tag_records_source_timebase_provenance() {
+        use serde_json::{Value, json};
+
+        let mut raw = json!({"engine": "insanely-fast-native"});
+        tag_audio_window(&mut raw, None, false);
+        assert!(
+            raw.get("audio_window").is_none(),
+            "unwindowed runs carry no tag"
+        );
+
+        tag_audio_window(&mut raw, Some((3_000, Some(4_000))), false);
+        assert_eq!(
+            raw["audio_window"],
+            json!({"offset_ms": 3_000, "duration_ms": 4_000, "timebase": "source"})
+        );
+        tag_audio_window(&mut raw, Some((9_000, None)), true);
+        assert_eq!(raw["audio_window"]["empty_slice"], json!(true));
+        assert_eq!(raw["audio_window"]["duration_ms"], Value::Null);
+    }
+
+    #[test]
+    fn native_only_unavailability_preserves_explicit_model_cause() {
+        let mut request = test_request(false);
+        request.model = Some("definitely-missing-native-model.bin".to_owned());
+
+        let reason = unavailable_reason(super::NativeExecutionMode::NativeOnly, &request);
+        assert!(reason.contains("requested native model is unavailable"));
+        assert!(reason.contains("definitely-missing-native-model.bin"));
+
+        request.model = None;
+        assert_eq!(
+            unavailable_reason(super::NativeExecutionMode::NativeOnly, &request),
+            "native engine unavailable"
+        );
     }
 
     #[test]
@@ -7621,6 +8138,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reset_router_state_returns_to_the_fresh_process_state() {
+        let _guard = ROUTER_STATE_TEST_MUTEX
+            .lock()
+            .expect("router state test lock");
+        for _ in 0..super::ADAPTIVE_MIN_SAMPLES {
+            update_router_state(BackendKind::WhisperCpp, true, 100, None);
+        }
+        assert!(
+            super::router_state_snapshot().is_some_and(|state| state.has_sufficient_data()),
+            "recorded outcomes make the adaptive router eligible"
+        );
+
+        super::reset_router_state();
+
+        assert!(
+            super::router_state_snapshot().is_none(),
+            "a reset batch input routes like a fresh process (no router state)"
+        );
+    }
+
     // -- RouterState serialization --
 
     #[test]
@@ -9391,6 +9929,39 @@ mod tests {
             NativeEngineRolloutStage::Primary,
         );
         assert_eq!(reason.as_deref(), Some("insufficient_data"));
+    }
+
+    #[test]
+    fn only_anomalous_routing_fallbacks_need_attention() {
+        let outcome = |triggered: bool, reason: Option<&str>| super::BackendSelectionOutcome {
+            routing_log: serde_json::Value::Null,
+            recommended_order: Vec::new(),
+            evidence_entries: Vec::new(),
+            fallback_triggered: triggered,
+            fallback_reason: reason.map(str::to_owned),
+            calibration_score: 0.0,
+            e_process: 0.0,
+            ci_width: 0.0,
+        };
+        // Steady state of every fresh process and of a pinned rollout stage.
+        assert!(!outcome(true, Some("insufficient_data")).fallback_needs_attention());
+        assert!(
+            !outcome(true, Some("native_rollout_forced_static_order(sole)"))
+                .fallback_needs_attention()
+        );
+        assert!(!outcome(false, None).fallback_needs_attention());
+        // Detected problems still warn.
+        assert!(
+            outcome(true, Some("brier_score_above_threshold(0.900 > 0.35)"))
+                .fallback_needs_attention()
+        );
+        assert!(
+            outcome(true, Some("contract_validation_error: bad loss")).fallback_needs_attention()
+        );
+        assert!(
+            outcome(true, None).fallback_needs_attention(),
+            "a contract-side fallback with no router reason is a calibration breach"
+        );
     }
 
     #[test]

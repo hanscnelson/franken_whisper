@@ -95,6 +95,12 @@ const MAX_INITIAL_TS_SEC: f32 = 1.0;
 /// `n_audio_ctx`, never this truncated ctx — whisper.cpp 6322) is unaffected.
 const MIN_ENC_CTX: usize = 64;
 
+/// Quality floor for [`AudioCtxPolicy::Auto`]'s derived context. Below this
+/// the encoder is too under-conditioned for reliable decoding (repetition
+/// loops, dropped clauses — probe evidence on the policy's doc). `Fixed`
+/// deliberately bypasses it: an explicit cap is the caller's decision.
+const AUTO_MIN_ENC_CTX: usize = 512;
+
 /// Full-model encoder context for a 30 s window (`FRAMES_PER_CHUNK / 2`). The
 /// tail-truncation derivation never exceeds this.
 const FULL_ENC_CTX: usize = FRAMES_PER_CHUNK / 2;
@@ -133,6 +139,16 @@ impl LoadedModel {
     /// Propagates [`EncoderWeights::from_ggml`] / [`DecoderWeights::from_ggml`]
     /// shape-validation errors.
     pub fn from_ggml(model: GgmlModel) -> FwResult<Self> {
+        Self::from_ggml_with_checkpoint(model, &|| Ok(()))
+    }
+
+    /// Build inference weights while checking cancellation at every bounded
+    /// cold-load phase boundary.
+    pub fn from_ggml_with_checkpoint(
+        model: GgmlModel,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Self> {
+        checkpoint()?;
         let hparams = model.hparams; // `Copy`, so `model` stays whole for the borrows below.
         // The encoder (~180 ms) and decoder (~102 ms) weight builds are independent
         // and neither saturates RAM bandwidth (~14 GB/s vs ~100+ aggregate), so run
@@ -140,16 +156,15 @@ impl LoadedModel {
         // on the weights build). Bit-identical (disjoint tensors → separate
         // structs); `rayon::join` runs serially on a 1-thread pool, so it is safe
         // everywhere.
-        // FW_LOAD_WORKERS: bound the TOTAL concurrency of the encoder∥decoder
-        // weight build — both builds' internal layer `into_par_iter`s run inside
-        // this pool, so a single cap covers the whole load (incl. the decoder's
-        // ~133 MB token embedding). Defaults to host∧32 (the all-core freq-throttle
-        // knee; ~11% faster model_weights than the uncapped 64-way ambient pool
-        // on the 64-core box). A smaller N further caps the live per-tensor load
-        // buffers — under FW_STREAM_LOAD each in-flight tensor is an owned pread
-        // buffer, so fewer concurrent loaders cut peak RSS, traded against a
-        // longer load. `FW_LOAD_WORKERS=0` restores the uncapped ambient join.
-        // Byte-exact for any cap (thread count never changes the built weights).
+        // The weight build runs in the run's compute pool (`--threads`,
+        // bd-threads-flag-unbounded-f4pq). FW_LOAD_WORKERS=N below that width
+        // opts into a transient N-worker pool for the build — both builds'
+        // internal layer `into_par_iter`s run inside it, so a single cap covers
+        // the whole load (incl. the decoder's ~133 MB token embedding). A smaller
+        // N caps the live per-tensor load buffers — under the streaming loader
+        // each in-flight tensor holds a pooled read buffer, so fewer concurrent loaders
+        // cut peak RSS, traded against a longer load. See `load_worker_cap`.
+        // Byte-exact for any width (thread count never changes the built weights).
         let build_weights = || {
             // wasm32: both builds stay on the calling thread (the tensor host
             // hook is thread-confined; see encoder::from_ggml's note). A
@@ -172,6 +187,7 @@ impl LoadedModel {
         // path. `cfg!` keeps both arms type-checked on every target.
         let (encoder, decoder) = match super::load_worker_cap()
             .filter(|_| cfg!(not(target_arch = "wasm32")))
+            .filter(|&cap| cap < rayon::current_num_threads())
         {
             Some(cap) => rayon::ThreadPoolBuilder::new()
                 .num_threads(cap)
@@ -180,8 +196,10 @@ impl LoadedModel {
                 .install(build_weights),
             None => build_weights(),
         };
+        checkpoint()?;
         let encoder = encoder?;
         let decoder = decoder?;
+        checkpoint()?;
         // Build the tokenizer and take the filterbank AFTER the borrowing weight
         // builds, so both are MOVED out of the now-finished-with `model` (dropped at
         // return) instead of cloned. The vocab move alone drops ~`n_vocab` (~51 865 on
@@ -190,14 +208,17 @@ impl LoadedModel {
         // Byte-identical (same vocab/filters bytes, only the ownership changes).
         let filters = model.filters;
         let tokenizer = Tokenizer::from_vocab(&hparams, model.vocab_tokens);
-        Ok(Self {
+        checkpoint()?;
+        let loaded = Self {
             hparams,
             filters,
             tokenizer,
             encoder,
             decoder,
             transcription_cache: std::sync::Mutex::new(TranscriptionCache::default()),
-        })
+        };
+        checkpoint()?;
+        Ok(loaded)
     }
 
     /// Drop all exact transcription results retained by this model.
@@ -229,11 +250,41 @@ pub struct DecodeParams {
     /// `FW_INITIAL_PROMPT` env var overrides this field when set (a dev/testing
     /// hatch, mirroring the other `FW_*` gates).
     pub initial_prompt: Option<String>,
+    /// Keep the initial prompt in every window's carried context (whisper
+    /// `--carry-initial-prompt`, whisper.cpp `prompt_past0`): its last
+    /// `max(1, max_prompt_ctx - 1)` tokens prefix each carried prompt and the
+    /// rolling decoded context fills the remaining budget. `false` (default)
+    /// seeds only the first window, byte-identical to before.
+    pub carry_initial_prompt: bool,
     /// Beam width for temperature-0 decoding (whisper `--beam-size`). `None` or
     /// `Some(1)` = greedy (byte-identical default); `Some(n)` keeps the `n` best
     /// hypotheses per step and selects the best length-normalized sequence score.
     /// Clamped to `[1, 8]`. `FW_BEAM_SIZE` overrides this field when set.
     pub beam_size: Option<usize>,
+    /// Per-request temperature fallback (whisper `--no-fallback` /
+    /// `--temperature-increment` / `--best-of`, bd-6goy). `None` = the process
+    /// default ([`temp_fallback_enabled`]: `FW_TEMP_FALLBACK`, off when unset ⇒
+    /// byte-identical greedy); `Some(true)` / `Some(false)` turn the
+    /// whisper.cpp quality-gated ladder on / off for this request.
+    pub temperature_fallback: Option<bool>,
+    /// Sampling candidates per `t > 0` ladder rung (whisper `--best-of`,
+    /// default 5). `FW_TEMP_BEST_OF` overrides when set; clamped to `[1, 32]`.
+    pub best_of: Option<usize>,
+    /// Ladder step in thousandths of a temperature unit (whisper
+    /// `--temperature-increment`, default 200 = 0.2): rung `k` decodes at
+    /// `k * step / 1000` while that is at most 1.0. Integer so `DecodeParams`
+    /// stays `Eq + Hash` (the transcript-cache key). `Some(0)` = no rungs.
+    pub temperature_increment_milli: Option<u32>,
+    /// Window quality-gate thresholds in thousandths (whisper
+    /// `--logprob-threshold` -1.0, `--no-speech-threshold` 0.6,
+    /// `--entropy-threshold` 2.4). `None` keeps the whisper.cpp default ⇒
+    /// byte-identical. The logprob/no-speech pair also decides silent windows
+    /// on the greedy path, exactly as upstream.
+    pub logprob_threshold_milli: Option<i32>,
+    /// See [`Self::logprob_threshold_milli`].
+    pub no_speech_threshold_milli: Option<i32>,
+    /// See [`Self::logprob_threshold_milli`].
+    pub entropy_threshold_milli: Option<i32>,
     /// Suppress non-speech tokens (whisper `--suppress-nst` /
     /// `suppress_non_speech_tokens`): masks the vocab's symbol/non-speech tokens
     /// during decoding for cleaner text. `false` = whisper.cpp default
@@ -250,8 +301,12 @@ pub struct DecodeParams {
     /// Emit timestamp tokens and split the transcript into timed segments.
     /// When `false`, each window yields a single segment spanning the window.
     pub timestamps: bool,
-    /// Thread-count hint passed through to the encoder/decoder (the FrankenTorch
-    /// kernels manage their own pool; this is informational).
+    /// Compute threads for this decode: it runs on a pool of exactly this many
+    /// workers (FrankenTorch kernels, band splits, mel and DTW included),
+    /// unless the caller already runs inside a sized run, whose pool it
+    /// inherits. `0` = the default width (`RAYON_NUM_THREADS`, else
+    /// [`super::default_threads`]); see [`super::with_compute_threads`]
+    /// (bd-threads-flag-unbounded-f4pq).
     pub n_threads: usize,
     /// Optional per-window token *budget* — the port of whisper.cpp's
     /// `params.max_tokens` (default off). When set, the EOT-forcing logit
@@ -270,6 +325,151 @@ pub struct DecodeParams {
     /// alignment-head presets that share `(n_text_layer, n_text_state)` (the
     /// large-v1/v2/v3 family). Ignored unless `word_timestamps` is set.
     pub model_hint: Option<String>,
+    /// Per-request encoder-context policy for the audio encoder
+    /// ([`AudioCtxPolicy`], bd-rt-audio-ctx-n4dj). The default ([`AudioCtxPolicy::Full`])
+    /// is byte-exact with all prior behavior; the reduced policies are the
+    /// streaming knob (a live session is ALL first-window, where truncation was
+    /// previously impossible without process-lifetime env flags).
+    pub audio_ctx: AudioCtxPolicy,
+    /// Skip the per-model transcription result LRU for this request
+    /// (bd-rt-cache-bypass-xqz1). Default `false` (cache active). The live
+    /// listen driver sets `true` on every step decode: a rolling buffer
+    /// differs every tick, so the cache can never hit, yet each miss COPIES
+    /// the whole sample buffer (up to 16 MiB) into the cache and evicts
+    /// genuinely useful batch entries. The `FW_TRANSCRIPT_CACHE=0` env flag
+    /// remains the process-wide operator kill-switch (OnceLock, set once for
+    /// the process lifetime); this field is the per-request policy so one
+    /// process can serve batch requests (cache useful) and live sessions
+    /// (cache harmful) at the same time. Effective caching =
+    /// env_enabled && !bypass.
+    pub bypass_transcript_cache: bool,
+    /// Record each greedy token's alignment-head cross-attention argmax
+    /// frame into [`WindowStats::token_attn`] (bd-rt-attn-tap-dfti; feeds
+    /// the AlignAtt streaming emission policy). Greedy-only: combined with
+    /// an effective beam width > 1 the request fails with FW-UNSUPPORTED
+    /// (SimulStreaming shows beam variants exist; future work). Off by
+    /// default and zero-cost when off (attention scores are not
+    /// materialized). Deviation from the bead's "TranscribeOptions, not
+    /// DecodeParams" note, recorded deliberately: a hashable bool with
+    /// output-affecting semantics is transcription-cache-CORRECT (different
+    /// key => different cached output), and a separate options struct would
+    /// churn every public transcribe call site for no safety gain.
+    pub record_token_attn: bool,
+}
+
+/// Per-request encoder-context policy for the audio encoder
+/// (bd-rt-audio-ctx-n4dj).
+///
+/// whisper.cpp answers a live stream's "why pay the full padded 30 s encode
+/// every tick" with `-ac` (reduced `audio_ctx`). Our equivalent math already
+/// existed in `tail_enc_ctx`, but it was gated to NON-first windows behind
+/// process-lifetime env flags — useless for streaming, where every window is a
+/// first window and one process must host both batch (Full) and streaming
+/// (truncated) requests. This enum is the per-request, env-free knob.
+///
+/// - [`AudioCtxPolicy::Full`] (default): today's behavior, byte-exact. The
+///   env gates (`FW_FIRST_WINDOW_MARGIN`,
+///   `FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE`) keep governing exactly as before.
+/// - [`AudioCtxPolicy::Auto`]: derive the effective ctx from the window's REAL
+///   mel frames with the proven tail math (`ceil(real/2)` clamped to the model
+///   band), then apply the 512-frame quality floor established by
+///   `bd-rt-audio-ctx-auto-empty`, FIRST WINDOW INCLUDED. Truncation engages
+///   only in timestamp mode (the no-timestamps repetition-loop failure mode
+///   documented at the loop is honored regardless of policy).
+/// - [`AudioCtxPolicy::Fixed(n)`]: an explicit per-window ctx cap, clamped to
+///   `[MIN_ENC_CTX, FULL_ENC_CTX]` and rounded UP to a multiple of 64
+///   (whisper.cpp discussion ggml-org/whisper.cpp#297). The effective ctx is
+///   then shrunk to the real-audio-derived ctx so short windows never encode
+///   pure padding; after that shrink it need not remain a multiple of 64.
+///
+/// # AUTHORITATIVE over env
+///
+/// When the policy is not [`AudioCtxPolicy::Full`] it requires NO env flag and
+/// IGNORES the truncation env gates for this request: params win over env for
+/// per-request behavior; env gates continue to govern Full requests exactly as
+/// today.
+///
+/// # NOT whisper.cpp's `-ac` positional rescaling
+///
+/// whisper.cpp's `-ac` interpolates the positional embedding to the reduced
+/// context and correspondingly rescales timestamp-token precision. We do NOT:
+/// the encoder slices the file positional tensor verbatim (`add_pos_emb`,
+/// "sliced to the first n_ctx rows"), so a truncated window keeps absolute
+/// 20 ms-per-index timestamp semantics. Consequently `max_initial_tid`
+/// precision stays tied to the FULL model `n_audio_ctx` under every policy
+/// (the in-loop comment cites whisper.cpp 6322). Deliberate deviation from the
+/// bead's initial "recompute from effective ctx" wording, recorded on
+/// bd-rt-audio-ctx-n4dj with the encoder evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AudioCtxPolicy {
+    /// Full 1500-frame context on every window (historical behavior).
+    #[default]
+    Full,
+    /// Effective ctx derived from real buffer frames with a 512-frame quality
+    /// floor, first window included.
+    Auto,
+    /// Explicit cap: clamp/round the request, then shrink to real audio.
+    Fixed(usize),
+}
+
+impl AudioCtxPolicy {
+    /// Construct an [`AudioCtxPolicy::Fixed`] policy, clamping `n` into
+    /// `[MIN_ENC_CTX, FULL_ENC_CTX]` and rounding UP to a multiple of 64.
+    /// Clamping is documented behavior; nothing is rejected.
+    #[must_use]
+    pub fn fixed(n: usize) -> Self {
+        Self::Fixed(fixed_enc_ctx_clamped(n))
+    }
+
+    /// Effective encoder frames for a window holding `real_frames` real mel
+    /// frames (1 mel frame = 1 cs). Always within
+    /// `[MIN_ENC_CTX, FULL_ENC_CTX]`; `Auto` additionally applies its quality
+    /// floor, while `Fixed` shrinks to the real audio so a short window never
+    /// encodes padding.
+    #[must_use]
+    pub fn effective_enc_ctx(self, real_frames: usize) -> usize {
+        let auto = real_frames.div_ceil(2).clamp(MIN_ENC_CTX, FULL_ENC_CTX);
+        match self {
+            Self::Full => FULL_ENC_CTX,
+            // Auto floors at AUTO_MIN_ENC_CTX for QUALITY, not shape
+            // validity: tiny.en on jfk slices at ctx 110/150/221 loops and
+            // degrades ("And so my fellow American," x4 inside one window;
+            // sentence doubling) — the under-conditioned encoder starves the
+            // decoder — while ctx >= ~512 tracks Full-ctx text (probe:
+            // examples/audio_ctx_auto_probe.rs, bd-rt-audio-ctx-auto-empty).
+            // A 512 floor still cuts the per-step encode ~3x vs Full.
+            Self::Auto => auto.max(AUTO_MIN_ENC_CTX.min(FULL_ENC_CTX)),
+            Self::Fixed(n) => fixed_enc_ctx_clamped(n).min(auto),
+        }
+    }
+}
+
+/// Clamp an explicit `Fixed` request to the valid band, rounded UP to a
+/// multiple of 64. Saturating so an extreme request cannot overflow.
+fn fixed_enc_ctx_clamped(n: usize) -> usize {
+    n.div_ceil(64)
+        .saturating_mul(64)
+        .clamp(MIN_ENC_CTX, FULL_ENC_CTX)
+}
+
+/// Per-token alignment-head cross-attention focus (bd-rt-attn-tap-dfti).
+///
+/// `attn_frame` is the argmax encoder frame (20 ms grid, window-relative) of
+/// the alignment heads' mean attention for the token at `token_index` in the
+/// window's decoded stream. Produced by the greedy loop when the
+/// [`DecodeParams::record_token_attn`] flag is set; the AlignAtt streaming
+/// policy commits only tokens whose focus sits safely before the buffer edge.
+///
+/// The window's FINAL accepted token is never forwarded (the loop breaks at
+/// eot/budget/window-end before its forward), so it has no entry here —
+/// consumers must treat a missing tail entry as "at the edge", which is
+/// exactly the conservative reading a holdback policy wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenAttn {
+    /// Index into the window's decoded token stream.
+    pub token_index: u32,
+    /// Argmax encoder frame (1 frame = 20 ms, window-relative).
+    pub attn_frame: u32,
 }
 
 /// Per-window quality-control statistics, surfaced for the evidence ledger.
@@ -283,6 +483,9 @@ pub struct WindowStats {
     pub tokens: usize,
     /// Window start offset in seconds.
     pub window_offset_sec: f64,
+    /// Per-token alignment-head attention focus (empty unless
+    /// [`DecodeParams::record_token_attn`] was set on a greedy decode).
+    pub token_attn: Vec<TokenAttn>,
 }
 
 /// Aggregate decoder work performed by one [`transcribe_samples`] call.
@@ -308,6 +511,23 @@ pub struct DecodeWorkStats {
     pub accepted_result_tokens: usize,
     pub prompt_reset_retries: usize,
     pub temperature_fallback_retries: usize,
+    /// Selected timestamp-mode decode attempts whose `result_len` was populated
+    /// by [`should_rescue_unclosed_window`] without a closed timestamp. This is
+    /// a work/decision counter (temperature fallback may retry and no-speech
+    /// classification may suppress emission afterward), not a count of text or
+    /// final emitted segments.
+    pub unclosed_window_rescue_attempts: usize,
+    /// Total mel frames physically fed to the encoder across all windows
+    /// (bd-rt-audio-ctx-n4dj observability). Full-context windows contribute
+    /// `FRAMES_PER_CHUNK` (3000) each; a reduced [`AudioCtxPolicy`] window
+    /// contributes its truncated `2*effective_enc_ctx`, so this is the
+    /// deterministic, timing-free proof that context reduction engaged
+    /// end-to-end (and the number the live driver surfaces in session stats).
+    pub encoder_mel_frames: usize,
+    /// What computed each counted encoder forward (route and per-family
+    /// arithmetic), as the forwards themselves returned it (bd-nt0d). Counts
+    /// the same forwards as `encoder_calls`, so it is empty on a cache hit.
+    pub encoder_executions: encoder::EncoderExecutionTally,
 }
 
 /// A long-form window the decoder discarded without emitting any transcript
@@ -371,6 +591,12 @@ struct TranscriptionCache {
 }
 
 impl TranscriptionCache {
+    /// Entry count (bypass-path assertions in tests).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     fn lookup(
         &mut self,
         fingerprint: u64,
@@ -762,6 +988,44 @@ fn seeded_prompt_past(prompt: Option<&str>, tokenizer: &Tokenizer) -> Vec<i32> {
     }
 }
 
+/// Split the seeded user-prompt tokens into the static carried prefix
+/// (whisper.cpp `prompt_past0`) and the initial rolling context
+/// (`prompt_past1`). Without `carry_initial_prompt` the prompt is only the
+/// first window's rolling context; with it, the prompt's last
+/// `max(1, max_prompt_ctx - 1)` tokens become the static prefix
+/// (whisper.cpp 6919-6932) and the rolling context starts empty.
+fn split_carried_prompt(
+    prompt_tokens: Vec<i32>,
+    params: &DecodeParams,
+    max_prompt_ctx: usize,
+) -> (Vec<i32>, Vec<i32>) {
+    if !params.carry_initial_prompt || prompt_tokens.is_empty() {
+        return (Vec::new(), prompt_tokens);
+    }
+    let keep = max_prompt_ctx.saturating_sub(1).max(1);
+    let start = prompt_tokens.len().saturating_sub(keep);
+    (prompt_tokens[start..].to_vec(), Vec::new())
+}
+
+/// The carried part of a window prompt: `[sot_prev, static…, rolling tail…]`
+/// where the rolling tail fills what the static prefix leaves of the
+/// `max_prompt_ctx` budget (whisper.cpp 7085-7104).
+fn carried_prompt_tokens(
+    sot_prev: i32,
+    prompt_static: &[i32],
+    prompt_past: &[i32],
+    max_prompt_ctx: usize,
+) -> Vec<i32> {
+    let take = prompt_past
+        .len()
+        .min(max_prompt_ctx.saturating_sub(1 + prompt_static.len()));
+    let mut carried = Vec::with_capacity(1 + prompt_static.len() + take);
+    carried.push(sot_prev);
+    carried.extend_from_slice(prompt_static);
+    carried.extend_from_slice(&prompt_past[prompt_past.len() - take..]);
+    carried
+}
+
 /// Default-OFF: on a window that fails to close any timestamp (`result_len == 0`,
 /// the "decoder failed with no timestamps closed" break) while carrying a
 /// previous-window prompt, RETRY that same seek ONCE with the prompt cleared before
@@ -789,9 +1053,55 @@ fn retry_failed_window_enabled() -> bool {
     })
 }
 
+/// whisper.cpp's default `temperature_inc` (0.2), in thousandths.
+const TEMP_INCREMENT_DEFAULT_MILLI: u32 = 200;
+
+/// Smallest admitted ladder step (0.01): bounds a request to 100 rungs.
+const TEMP_INCREMENT_MIN_MILLI: u32 = 10;
+
 /// whisper.cpp's temperature-fallback ladder (initial greedy pass at 0.0, then
-/// `temperature_inc = 0.2` per retry): the retry temperatures, in order.
-const TEMP_FALLBACK_LADDER: [f64; 5] = [0.2, 0.4, 0.6, 0.8, 1.0];
+/// one retry per `temperature_inc` step up to 1.0): the retry temperatures, in
+/// order. Each rung is `k * step / 1000` (one correctly rounded division, not
+/// an accumulated sum), so the default step yields exactly the historical
+/// `[0.2, 0.4, 0.6, 0.8, 1.0]` and every seeded rung stays byte-identical.
+fn temperature_ladder(params: &DecodeParams) -> Vec<f64> {
+    let step = match params.temperature_increment_milli {
+        Some(0) => return Vec::new(),
+        Some(step) => step.max(TEMP_INCREMENT_MIN_MILLI),
+        None => TEMP_INCREMENT_DEFAULT_MILLI,
+    };
+    (1_u32..)
+        .map_while(|k| k.checked_mul(step).filter(|&t| t <= 1000))
+        .map(|t| f64::from(t) / 1000.0)
+        .collect()
+}
+
+/// The window quality-gate thresholds a request decodes under: whisper.cpp's
+/// defaults unless the request overrides them (bd-6goy).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct QualityGates {
+    logprob: f64,
+    no_speech: f64,
+    entropy: f64,
+}
+
+impl QualityGates {
+    fn for_params(params: &DecodeParams) -> Self {
+        let milli =
+            |value: Option<i32>, default: f64| value.map_or(default, |m| f64::from(m) / 1000.0);
+        Self {
+            logprob: milli(params.logprob_threshold_milli, LOGPROB_THRESHOLD),
+            no_speech: milli(params.no_speech_threshold_milli, NO_SPEECH_THRESHOLD),
+            entropy: milli(params.entropy_threshold_milli, ENTROPY_THRESHOLD),
+        }
+    }
+
+    /// whisper.cpp 7606-7607: a window is silence when the no-speech
+    /// probability is high AND the decode is low-confidence.
+    fn is_no_speech(self, no_speech_prob: f64, avg_logprob: f64) -> bool {
+        no_speech_prob > self.no_speech && avg_logprob < self.logprob
+    }
+}
 
 /// Above this retry temperature the carried prior-window prompt is dropped for the
 /// attempt (whisper.cpp conditions on no previous text once `t > 0.5`) — which is
@@ -855,21 +1165,30 @@ fn temp_fallback_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FW_TEMP_FALLBACK").is_some())
 }
 
+/// Whether a request decodes with the fallback ladder: its explicit
+/// [`DecodeParams::temperature_fallback`] choice, else the process default.
+fn temp_fallback_on(params: &DecodeParams) -> bool {
+    params
+        .temperature_fallback
+        .unwrap_or_else(temp_fallback_enabled)
+}
+
 /// whisper.cpp `greedy.best_of` (default 5): how many independent sampling
 /// candidates each `t > 0` ladder rung decodes before the best
 /// [`sequence_score`] wins. `FW_TEMP_BEST_OF` overrides (clamped to [1, 32]);
 /// `1` restores the single-candidate ladder byte-for-byte (first candidate of
 /// every rung draws from the identical seed stream). Only read under
 /// [`temp_fallback_enabled`], so the default path never consults it.
-fn temp_best_of() -> usize {
+fn temp_best_of(params: &DecodeParams) -> usize {
     use std::sync::OnceLock;
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
+    static ENV: OnceLock<Option<usize>> = OnceLock::new();
+    ENV.get_or_init(|| {
         std::env::var("FW_TEMP_BEST_OF")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .map_or(5, |n| n.clamp(1, 32))
     })
+    .or(params.best_of)
+    .map_or(5, |n| n.clamp(1, 32))
 }
 
 /// whisper.cpp `whisper_sequence_score` under the default `length_penalty =
@@ -1026,6 +1345,7 @@ fn beam_decode_window(
     n_max_tokens: usize,
     user_max_tokens: Option<usize>,
     beam: usize,
+    has_prior_segments: bool,
     checkpoint: &dyn Fn() -> FwResult<()>,
 ) -> FwResult<WindowDecode> {
     let mut active: Vec<BeamHyp> = vec![BeamHyp {
@@ -1103,12 +1423,23 @@ fn beam_decode_window(
             }
 
             let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
-            let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+            let covers_audio_end = seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+            let reached_end = has_ts && covers_audio_end;
             let terminate = bail || tok == tk.eot || budget_reached || reached_end;
 
             if terminate {
                 if !bail {
-                    if result_len == 0 && params.timestamps && reached_end {
+                    // Retain an end-covering unclosed transcript only when it
+                    // cannot duplicate prior output; see
+                    // `should_rescue_unclosed_window`.
+                    if result_len == 0
+                        && params.timestamps
+                        && should_rescue_unclosed_window(
+                            seek_cs,
+                            covers_audio_end,
+                            has_prior_segments,
+                        )
+                    {
                         result_len = i + 1;
                     }
                     if !params.timestamps {
@@ -1733,21 +2064,28 @@ fn make_segment(
 // Tail-window encoder-context truncation (whisper.cpp's audio_ctx / -ac feature)
 // ---------------------------------------------------------------------------
 
-/// Whether tail-window encoder-context truncation is enabled.
+/// Whether tail-window encoder-context truncation is enabled (opt-in).
 ///
 /// Controlled by the `FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE` environment
 /// variable, read **once** (process-lifetime cached via [`OnceLock`]):
-/// - unset / any value other than `"0"`/`"false"` ⇒ **enabled** (the default).
-/// - `"0"` or `"false"` (ASCII-case-insensitive) ⇒ **disabled**, restoring the
-///   exact pre-optimization behavior (every window runs a full 3000-frame /
-///   1500-ctx encoder pass). This is the kill switch / golden-equivalence
-///   escape hatch.
+/// - unset, `"0"`, or `"false"` (ASCII-case-insensitive) ⇒ **disabled** (the
+///   default): every window runs the full 3000-frame / 1500-ctx encoder pass,
+///   exactly like whisper.cpp's default.
+/// - any other value ⇒ **enabled**: non-first partial tail windows encode only
+///   their real audio (`audio_ctx`-style speed lever).
+///
+/// DEFAULT OFF (DISC-004, 2026-10-06): a truncated tail context makes the
+/// decoder hallucinate prior content. large-v3-turbo on JFK×4 emitted a fifth,
+/// verbatim copy of the sentence inside the 0.62 s final window (floors of 64,
+/// 250, and 500 encoder frames all did; only the full context did not), and
+/// tiny.en on gapless JFK×3 re-rendered the final tile (the long-red bd-4ep1
+/// pin). Full context matched whisper.cpp v1.8.2 on every fixture measured.
 fn tail_truncate_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE")
-            .map_or(true, |v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .is_ok_and(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
     })
 }
 
@@ -1993,6 +2331,34 @@ fn tail_enc_ctx(real_frames: usize, is_first: bool, enabled: bool) -> usize {
     base.clamp(MIN_ENC_CTX, FULL_ENC_CTX)
 }
 
+/// Resolve one window's effective encoder context under the request's
+/// [`AudioCtxPolicy`] (bd-rt-audio-ctx-n4dj).
+///
+/// Single decision point shared by the inline encode AND the pipeline
+/// prefetch dispatch, so the two can never disagree on `mel_frames`. A
+/// non-Full policy is AUTHORITATIVE: neither env gate (`first_window_margin`
+/// nor the `FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE` flag folded into
+/// `tail_truncate`) can override it, and `is_first` is irrelevant because a
+/// streaming session is all first-window. The no-timestamps prohibition still
+/// wins for reduced policies: truncating a no_ts window removes the greedy
+/// decoder's only end-of-speech cue (content-loss failure documented at the
+/// call site), so any non-Full policy degrades to full windows there.
+fn resolve_window_enc_ctx(
+    params: &DecodeParams,
+    real_frames: usize,
+    is_first: bool,
+    tail_truncate: bool,
+) -> usize {
+    match params.audio_ctx {
+        AudioCtxPolicy::Full => tail_enc_ctx(real_frames, is_first, tail_truncate),
+        // Reduced policy + no-timestamps mode: honor the documented failure
+        // mode instead of applying the policy (bead constraint: "do not fix
+        // that comment's gate").
+        _ if !params.timestamps => FULL_ENC_CTX,
+        policy => policy.effective_enc_ctx(real_frames),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Top-level transcription (port of whisper_full_with_state greedy path)
 // ---------------------------------------------------------------------------
@@ -2018,6 +2384,68 @@ fn single_timestamp_ending(
         && !budget_forced
         && decoded[decoded.len() - 2] < timestamp_begin
         && decoded[decoded.len() - 1] > timestamp_begin
+}
+
+/// Whether a timestamp-mode decode with no closed timestamp may retain its text.
+///
+/// A short first window can legitimately reach EOT after `<|0.00|>` plus text;
+/// retaining it is required by reduced audio-context streaming. The same shape
+/// can occur after an initial silent window followed by real speech, so window
+/// position alone is not sufficient evidence of duplication. A later unclosed
+/// tail is therefore also safe to retain when the run has emitted no prior
+/// segment: there is literally no earlier transcript for it to duplicate.
+///
+/// Once any segment exists, the conservative first-window repair remains in
+/// force. Distinguishing hallucinated boundary repetition from intentional
+/// repeated speech would require acoustic evidence; text overlap is not a safe
+/// discriminator because verbatim repetition can be real content.
+fn should_rescue_unclosed_window(
+    seek_cs: i64,
+    covers_audio_end: bool,
+    has_prior_segments: bool,
+) -> bool {
+    covers_audio_end && (seek_cs == 0 || !has_prior_segments)
+}
+
+/// TEST-ONLY seam, compiled into this crate's unit-test binary and nowhere
+/// else (release, binaries and integration tests contain none of it). From a
+/// chosen seek onward, the greedy decode masks every closing timestamp token,
+/// so a window can only end `<|0.00|> text <eot>`: the unclosed shape
+/// [`should_rescue_unclosed_window`] decides on. It lets a test drive that
+/// rescue on any architecture; it says nothing about whether real numerics
+/// produce the shape.
+#[cfg(test)]
+mod unclosed_window_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MASK_FROM_SEEK_CS: Cell<Option<i64>> = const { Cell::new(None) };
+        static MASKED_STEPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Arm (`Some(seek_cs)`) or disarm (`None`) the seam on this thread and
+    /// reset its step counter.
+    pub(super) fn arm(from_seek_cs: Option<i64>) {
+        MASK_FROM_SEEK_CS.with(|cell| cell.set(from_seek_cs));
+        MASKED_STEPS.with(|cell| cell.set(0));
+    }
+
+    /// Greedy steps this thread masked since the last [`arm`].
+    pub(super) fn masked_steps() -> usize {
+        MASKED_STEPS.with(Cell::get)
+    }
+
+    pub(super) fn apply(mut filtered: Vec<f32>, timestamp_begin: i32, seek_cs: i64) -> Vec<f32> {
+        let armed = MASK_FROM_SEEK_CS.with(Cell::get);
+        if armed.is_some_and(|from| seek_cs >= from) {
+            let first_closing = usize::try_from(timestamp_begin).map_or(usize::MAX, |b| b + 1);
+            if let Some(closing) = filtered.get_mut(first_closing..) {
+                closing.fill(f32::NEG_INFINITY);
+            }
+            MASKED_STEPS.with(|cell| cell.set(cell.get() + 1));
+        }
+        filtered
+    }
 }
 
 struct IndependentWindowResult {
@@ -2050,7 +2478,7 @@ fn decode_independent_no_timestamp_window(
     let frame_offset = usize::try_from(seek_cs).unwrap_or(0);
 
     let t_enc = crate::native_engine::plat::Instant::now();
-    let enc = encoder::forward_from_full_mel_window(
+    let (enc, execution) = encoder::forward_from_full_mel_window(
         &m.encoder,
         full_mel,
         frame_offset,
@@ -2059,6 +2487,8 @@ fn decode_independent_no_timestamp_window(
         checkpoint,
     )?;
     work.encoder_calls = 1;
+    work.encoder_mel_frames = FRAMES_PER_CHUNK;
+    work.encoder_executions.record(execution);
     super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
 
     let t_xkv = crate::native_engine::plat::Instant::now();
@@ -2111,6 +2541,7 @@ fn decode_independent_no_timestamp_window(
             n_max_tokens,
             user_max_tokens,
             beam,
+            false,
             &cp,
         )?;
         (decoded, plogs, seek_delta_cs, result_len)
@@ -2151,7 +2582,7 @@ fn decode_independent_no_timestamp_window(
     } else {
         EMPTY_WINDOW_AVG_LOGPROB
     };
-    let is_no_speech = no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob < LOGPROB_THRESHOLD;
+    let is_no_speech = QualityGates::for_params(params).is_no_speech(no_speech_prob, avg_logprob);
 
     work.accepted_windows = 1;
     work.accepted_result_tokens = result_len;
@@ -2178,6 +2609,9 @@ fn decode_independent_no_timestamp_window(
             no_speech_prob,
             tokens: result_len,
             window_offset_sec: seek_cs as f64 / 100.0,
+            // Parallel no-context windows are a no-timestamps batch path;
+            // the attention tap is greedy/timestamps streaming machinery.
+            token_attn: Vec::new(),
         },
         work,
     })
@@ -2263,6 +2697,9 @@ fn add_decode_work(total: &mut DecodeWorkStats, part: &DecodeWorkStats) {
     total.accepted_result_tokens += part.accepted_result_tokens;
     total.prompt_reset_retries += part.prompt_reset_retries;
     total.temperature_fallback_retries += part.temperature_fallback_retries;
+    total.unclosed_window_rescue_attempts += part.unclosed_window_rescue_attempts;
+    total.encoder_mel_frames += part.encoder_mel_frames;
+    total.encoder_executions.merge(&part.encoder_executions);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2374,6 +2811,54 @@ fn decode_independent_no_timestamp_windows(
     })
 }
 
+/// Reduce one token's recorded cross-attention to its alignment-head mean
+/// argmax frame (bd-rt-attn-tap-dfti).
+///
+/// `recorded` holds one `[tokens, enc_frames]` matrix per `(layer, head)` in
+/// `layer * n_head + head` order, from the decoder state's
+/// recorded cross-attention weights; during the greedy loop the
+/// token dimension is 1. Returns `None` when nothing usable was recorded
+/// (empty head set, empty mats) — callers treat that as "no tap for this
+/// token", never as frame 0.
+fn reduce_attn_frame(
+    recorded: &[super::Mat],
+    align_heads: &[(usize, usize)],
+    n_head: usize,
+    enc_frames: usize,
+) -> Option<u32> {
+    if recorded.is_empty() || align_heads.is_empty() || enc_frames == 0 || n_head == 0 {
+        return None;
+    }
+    let mut mean = vec![0.0f32; enc_frames];
+    let mut used = 0usize;
+    for &(layer, head) in align_heads {
+        let Some(mat) = recorded.get(layer * n_head + head) else {
+            continue;
+        };
+        if mat.rows == 0 || mat.cols < enc_frames {
+            continue;
+        }
+        // Last row = the most recent token (rows==1 in the greedy loop).
+        let row = mat.row(mat.rows - 1);
+        for (accumulator, &weight) in mean.iter_mut().zip(&row[..enc_frames]) {
+            *accumulator += weight;
+        }
+        used += 1;
+    }
+    if used == 0 {
+        return None;
+    }
+    let mut best = 0usize;
+    let mut best_weight = f32::MIN;
+    for (frame, &weight) in mean.iter().enumerate() {
+        if weight > best_weight {
+            best_weight = weight;
+            best = frame;
+        }
+    }
+    Some(best as u32)
+}
+
 /// Transcribe 16 kHz mono PCM `samples` with the greedy / temperature-0 path of
 /// whisper, returning timed segments + per-window QC statistics.
 ///
@@ -2398,7 +2883,36 @@ pub fn transcribe_samples(
     params: &DecodeParams,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<DecodeOutput> {
-    let cacheable = transcription_cache_enabled()
+    transcribe_samples_with_window_hook(m, samples_16k_mono, params, checkpoint, None)
+}
+
+/// Per-window segment callback: fires on the decode thread with each
+/// finished window's segments (window-relative times).
+pub type WindowHook<'a> = &'a (dyn Fn(&[TranscriptionSegment]) + Sync);
+
+/// Scoped-hook variant of [`transcribe_samples`]
+/// (bd-rt-segment-hook-vo6p): `on_window` receives each finished long-form
+/// window's segments (window-relative times, after timestamp rules, on the
+/// decode thread) while the transcription is still running — the confirm
+/// lane streams long-utterance output through this, and it avoids the
+/// process-global [`crate::native_engine::plat::set_segment_hook`] registry
+/// so concurrent sessions cannot observe each other's windows. The hook is
+/// deliberately NOT part of [`DecodeParams`], which must stay
+/// `Clone + Hash + Eq` as the transcription-cache key. A cache hit returns the full
+/// cached output WITHOUT window-by-window hook calls (hits are instant;
+/// progressive delivery is meaningless there); a panicking hook propagates.
+pub fn transcribe_samples_with_window_hook(
+    m: &LoadedModel,
+    samples_16k_mono: &[f32],
+    params: &DecodeParams,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    on_window: Option<WindowHook<'_>>,
+) -> FwResult<DecodeOutput> {
+    if params.bypass_transcript_cache {
+        tracing::debug!("transcript cache bypassed (per-request)");
+    }
+    let cacheable = !params.bypass_transcript_cache
+        && transcription_cache_enabled()
         && samples_16k_mono
             .len()
             .saturating_mul(std::mem::size_of::<f32>())
@@ -2424,7 +2938,12 @@ pub fn transcribe_samples(
         None
     };
 
-    let output = transcribe_samples_uncached(m, samples_16k_mono, params, checkpoint)?;
+    // `params.n_threads` bounds every pool this decode reaches (inherited when
+    // the caller already runs inside a sized run, e.g. a backend stage).
+    let output = super::with_compute_threads(
+        super::effective_compute_threads(Some(params.n_threads)),
+        || transcribe_samples_uncached(m, samples_16k_mono, params, checkpoint, on_window),
+    )??;
     if let Some(fingerprint) = fingerprint {
         m.transcription_cache
             .lock()
@@ -2439,21 +2958,22 @@ fn transcribe_samples_uncached(
     samples_16k_mono: &[f32],
     params: &DecodeParams,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    on_window: Option<WindowHook<'_>>,
 ) -> FwResult<DecodeOutput> {
     if samples_16k_mono.is_empty() {
         return Err(FwError::InvalidRequest(
             "transcribe_samples: empty audio".into(),
         ));
     }
-    super::ensure_default_rayon_pool();
 
     let tk = &m.tokenizer;
 
     // Full-audio log-mel spectrogram (whisper computes once, then windows it).
     // mel is compute-bound FFT-per-frame (bit-identical for ANY thread count), and
-    // its measured optimum is ~16 workers (8 under-utilizes ~1.39×; >16 cross-CCD-
-    // regresses on this Zen box), so decouple it from the decode's `n_threads` hint.
-    // `FW_MEL_THREADS` (inside `log_mel`) overrides.
+    // its measured optimum is ~16 bands (8 under-utilizes ~1.39×; >16 cross-CCD-
+    // regresses on this Zen box), so the band count is decoupled from the decode's
+    // `n_threads`; the bands run on the run's `n_threads` pool (`plat::scope`).
+    // `FW_MEL_THREADS` (inside `log_mel`) overrides the band count.
     let mel_threads = super::host_parallelism().min(16);
     let t_mel = crate::native_engine::plat::Instant::now();
     let full_mel = mel::log_mel(samples_16k_mono, &m.filters, mel_threads)?;
@@ -2553,12 +3073,30 @@ fn transcribe_samples_uncached(
     // it when set (dev/testing hatch). Its tokens are carried as previous context
     // on the first window and age out via the max_prompt_ctx truncation as decoded
     // text accumulates. Unset → no-op (byte-identical default).
-    let prompt = initial_prompt_from_env().or(params.initial_prompt.as_deref());
-    let mut prompt_past: Vec<i32> = seeded_prompt_past(prompt, &m.tokenizer);
+    //
+    // `carry_initial_prompt` instead keeps the prompt as a static prefix of
+    // every carried prompt (whisper.cpp prompt_past0), so the rolling context
+    // starts empty.
+    let user_prompt = initial_prompt_from_env().or(params.initial_prompt.as_deref());
+    let (mut prompt_static, mut prompt_past) = split_carried_prompt(
+        seeded_prompt_past(user_prompt, &m.tokenizer),
+        params,
+        max_prompt_ctx,
+    );
 
     // Beam width (whisper `--beam-size`): field or FW_BEAM_SIZE override, resolved
     // once. 1 = greedy (byte-identical default).
     let effective_beam_size = resolve_beam_size(params);
+    if params.record_token_attn && effective_beam_size > 1 {
+        return Err(FwError::Unsupported(format!(
+            "record_token_attn requires greedy decoding (effective beam width {effective_beam_size});              AlignAtt-over-beams is future work"
+        )));
+    }
+    let attn_align_heads = if params.record_token_attn {
+        dtw::alignment_heads(&m.hparams, params.model_hint.as_deref())
+    } else {
+        Vec::new()
+    };
 
     // Long no-context jobs have no cross-window dependency: timestamp tokens
     // are masked (fixed 30 s seek), the language is already known, prompt carry
@@ -2600,7 +3138,7 @@ fn transcribe_samples_uncached(
         && cfg.no_timestamps
         && prompt_carry_disabled
         && !params.word_timestamps
-        && !temp_fallback_enabled()
+        && !temp_fallback_on(params)
         && std::env::var_os("PROBE_DUMP_TOKENS").is_none()
         && independent_window_lanes > 1
         && let Some(language) = used_language.as_deref()
@@ -2647,11 +3185,24 @@ fn transcribe_samples_uncached(
     // `thread::scope` joins the encoder thread on ANY exit (incl. `?`). Byte-exact:
     // the prefetched encode is the same fn+args as the inline one. See
     // `pipeline_windows_enabled`.
+    //
+    // Thread bound (bd-threads-flag-unbounded-f4pq): the encoder thread only
+    // waits; its encode computes in the compute pool this decode runs in
+    // (`None` only on wasm32, where the encode runs inline as before). The
+    // decode side waits for a prefetched result with `recv_helping_pool`, so
+    // on a 1-worker pool the waiting worker runs the queued encode itself
+    // instead of deadlocking on it.
     let pipeline = pipeline_windows_enabled() && cfg.no_timestamps;
     let enc_n_threads = params.n_threads;
-    let pipe_result: FwResult<()> = crate::native_engine::plat::scope(|scope| {
+    let enc_pool = if pipeline {
+        super::current_compute_pool()
+    } else {
+        None
+    };
+    let pipe_result: FwResult<()> = crate::native_engine::plat::thread_scope(|scope| {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<(usize, usize)>();
-        let (res_tx, res_rx) = std::sync::mpsc::channel::<FwResult<super::Mat>>();
+        let (res_tx, res_rx) =
+            std::sync::mpsc::channel::<FwResult<(super::Mat, encoder::EncoderExecution)>>();
         let _enc_worker = if pipeline {
             let enc_w = &m.encoder;
             let mel_ref = &full_mel;
@@ -2660,14 +3211,20 @@ fn transcribe_samples_uncached(
                 // MAIN decode still gates progress; a wasted prefetch is harmless).
                 let noop = || Ok(());
                 while let Ok((off, mf)) = req_rx.recv() {
-                    let r = encoder::forward_from_full_mel_window(
-                        enc_w,
-                        mel_ref,
-                        off,
-                        mf,
-                        enc_n_threads,
-                        &noop,
-                    );
+                    let encode = || {
+                        encoder::forward_from_full_mel_window(
+                            enc_w,
+                            mel_ref,
+                            off,
+                            mf,
+                            enc_n_threads,
+                            &noop,
+                        )
+                    };
+                    let r = match &enc_pool {
+                        Some(pool) => pool.install(encode),
+                        None => encode(),
+                    };
                     if res_tx.send(r).is_err() {
                         break;
                     }
@@ -2684,9 +3241,15 @@ fn transcribe_samples_uncached(
         // Set for one iteration when retrying a failed window with the carried prompt
         // cleared (FW_RETRY_FAILED_WINDOW). Reset once the window completes.
         let mut force_empty_prompt = false;
-        // FW_TEMP_FALLBACK ladder position for the CURRENT seek: 0 = the normal
-        // greedy pass; k > 0 = re-decoding at TEMP_FALLBACK_LADDER[k - 1]. Reset to 0
-        // once a window is accepted, so every window starts greedy.
+        // Request-resolved fallback controls (bd-6goy): the ladder is consulted
+        // only when `fallback_on`, so the default path stays byte-identical.
+        let fallback_on = temp_fallback_on(params);
+        let ladder = temperature_ladder(params);
+        let best_of = temp_best_of(params);
+        let gates = QualityGates::for_params(params);
+        // Fallback ladder position for the CURRENT seek: 0 = the normal greedy
+        // pass; k > 0 = re-decoding at ladder[k - 1]. Reset to 0 once a window is
+        // accepted, so every window starts greedy.
         let mut temp_attempt: usize = 0;
         // The temperature the current attempt decodes at (0.0 = argmax/greedy path).
         let mut window_temp: f64 = 0.0;
@@ -2708,24 +3271,28 @@ fn transcribe_samples_uncached(
             // is truncated to `2*enc_ctx` mel frames (`enc_ctx` encoder rows),
             // mirroring whisper.cpp's audio_ctx (-ac) feature — a near-empty final
             // window otherwise pays a full encode for a fraction of a second of
-            // audio (perf hotspot #1). Timestamp/precision semantics are unaffected
-            // (`max_initial_tid` is tied to the full model `n_audio_ctx`, not this
-            // window's ctx — whisper.cpp 6322).
+            // audio (perf hotspot #1). Timestamp/precision semantics are unaffected:
+            // `max_initial_tid` stays tied to the FULL model `n_audio_ctx` under
+            // EVERY policy (whisper.cpp 6322) — unlike whisper.cpp `-ac`, we slice
+            // the file positional embedding verbatim instead of interpolating it,
+            // so timestamp tokens keep absolute 20 ms/index meaning even when this
+            // window's ctx is truncated (see `AudioCtxPolicy`).
             let frame_offset = usize::try_from(seek_cs).unwrap_or(0);
             // Real (unpadded) audio remaining in this window, in mel frames
             // (1 mel frame = 1 cs); capped at the full window, as whisper.cpp does.
             let real_frames = usize::try_from((seek_end_cs - seek_cs).max(0))
                 .unwrap_or(0)
                 .min(FRAMES_PER_CHUNK);
-            let enc_ctx = tail_enc_ctx(real_frames, seek_cs == 0, tail_truncate);
+            let enc_ctx = resolve_window_enc_ctx(params, real_frames, seek_cs == 0, tail_truncate);
             let mel_frames = enc_ctx * 2;
             if mel_frames < FRAMES_PER_CHUNK {
                 tracing::debug!(
                     target: "franken_whisper::native_engine::decode",
                     seek_cs,
                     real_frames,
-                    enc_ctx,
+                    effective_enc_ctx = enc_ctx,
                     mel_frames,
+                    policy=?params.audio_ctx,
                     "tail-window encoder-context truncation engaged"
                 );
             }
@@ -2742,10 +3309,11 @@ fn transcribe_samples_uncached(
             let reuses_cached_encode = retry_enc_cache
                 .as_ref()
                 .is_some_and(|(off, _): &(usize, _)| *off == frame_offset);
-            let enc = if reuses_cached_encode {
-                retry_enc_cache.take().expect("checked is_some_and above").1
+            let (enc, execution) = if reuses_cached_encode {
+                let cached = retry_enc_cache.take().expect("checked is_some_and above").1;
+                (cached, None)
             } else if pipeline && prefetched == Some(frame_offset) {
-                match res_rx.recv() {
+                let (enc, execution) = match super::recv_helping_pool(&res_rx) {
                     Ok(r) => r?,
                     Err(_) => encoder::forward_from_full_mel_window(
                         &m.encoder,
@@ -2755,19 +3323,24 @@ fn transcribe_samples_uncached(
                         params.n_threads,
                         checkpoint,
                     )?,
-                }
+                };
+                (enc, Some(execution))
             } else {
-                encoder::forward_from_full_mel_window(
+                let (enc, execution) = encoder::forward_from_full_mel_window(
                     &m.encoder,
                     &full_mel,
                     frame_offset,
                     mel_frames,
                     params.n_threads,
                     checkpoint,
-                )?
+                )?;
+                (enc, Some(execution))
             };
-            if !reuses_cached_encode {
+            // A reused encode ran no forward, so it is neither counted nor recorded.
+            if let Some(execution) = execution {
                 work.encoder_calls += 1;
+                work.encoder_mel_frames += mel_frames;
+                work.encoder_executions.record(execution);
             }
             // Dispatch the NEXT window's encode NOW so it overlaps this window's decode.
             // no_timestamps advance is always CHUNK_CS, so the next offset is known and
@@ -2788,7 +3361,8 @@ fn transcribe_samples_uncached(
                         let next_real = usize::try_from((seek_end_cs - next_seek).max(0))
                             .unwrap_or(0)
                             .min(FRAMES_PER_CHUNK);
-                        let next_ctx = tail_enc_ctx(next_real, false, tail_truncate);
+                        let next_ctx =
+                            resolve_window_enc_ctx(params, next_real, false, tail_truncate);
                         if req_tx.send((next_off, next_ctx * 2)).is_ok() {
                             prefetched = Some(next_off);
                         }
@@ -2810,6 +3384,7 @@ fn transcribe_samples_uncached(
             // non-first window with under 5 s of audio left drops the carried prompt
             // to avoid repetition/hallucination on the tail.
             if should_clear_short_tail_prompt(seek_cs, seek_end_cs) {
+                prompt_static.clear();
                 prompt_past.clear();
             }
 
@@ -2825,17 +3400,26 @@ fn transcribe_samples_uncached(
             // (whisper.cpp `no_context` / `--no-context`; bd-r0qd escape hatch,
             // `FW_NO_CONTEXT=1`), the tiny.en segment-TS policy suppresses window
             // 2+ carry, this is a failed-window retry (`force_empty_prompt`), or a
-            // FW_TEMP_FALLBACK attempt above the prompt-reset temperature.
+            // FW_TEMP_FALLBACK attempt above the prompt-reset temperature. The
+            // tiny.en policy drops only the rolling decoded context: a carried
+            // user prompt (`carry_initial_prompt`) still prefixes the window.
+            let rolling_context: &[i32] = if suppress_tiny_en_ts_context && seek_cs > 0 {
+                &[]
+            } else {
+                &prompt_past
+            };
             let prompt_carried = !condition_on_prev_disabled()
                 && !force_empty_prompt
                 && window_temp <= TEMP_PROMPT_RESET
-                && !prompt_past.is_empty()
-                && max_prompt_ctx > 1
-                && !(suppress_tiny_en_ts_context && seek_cs > 0);
+                && (!rolling_context.is_empty() || !prompt_static.is_empty())
+                && max_prompt_ctx > 1;
             if prompt_carried {
-                prompt.push(tk.sot_prev);
-                let take = prompt_past.len().min(max_prompt_ctx.saturating_sub(1));
-                prompt.extend_from_slice(&prompt_past[prompt_past.len() - take..]);
+                prompt = carried_prompt_tokens(
+                    tk.sot_prev,
+                    &prompt_static,
+                    rolling_context,
+                    max_prompt_ctx,
+                );
             }
             prompt.extend_from_slice(&sot_seq);
 
@@ -2868,7 +3452,8 @@ fn transcribe_samples_uncached(
             // stay on the greedy sampling path. `beam_size() == 1` (default) ⇒ the
             // greedy branch always runs ⇒ byte-identical to the pre-beam engine.
             let t_loop = crate::native_engine::plat::Instant::now();
-            let (decoded, plogs, _has_ts, seek_delta_cs, result_len) = if effective_beam_size > 1
+            let mut window_token_attn: Vec<TokenAttn> = Vec::new();
+            let (decoded, plogs, has_ts, seek_delta_cs, result_len) = if effective_beam_size > 1
                 && window_temp == 0.0
             {
                 // `st` is left intact (beam clones per hypothesis) for the DTW
@@ -2885,9 +3470,14 @@ fn transcribe_samples_uncached(
                     n_max_tokens,
                     user_max_tokens,
                     effective_beam_size,
+                    !segments.is_empty(),
                     checkpoint,
                 )?
             } else {
+                // bd-rt-attn-tap-dfti: record cross-attention only during the
+                // sampling loop (the prompt prefill above must not pay the
+                // score-materialization cost for prompt tokens).
+                st.record_cross_attn = params.record_token_attn;
                 let mut decoded: Vec<i32> = Vec::new();
                 let mut plogs: Vec<f32> = Vec::new();
                 let mut has_ts = false;
@@ -2914,6 +3504,9 @@ fn transcribe_samples_uncached(
                         seek_delta_cs,
                         decoded.len(),
                     );
+                    #[cfg(test)]
+                    let filtered =
+                        unclosed_window_seam::apply(filtered, tk.timestamp_begin, seek_cs);
                     let (tok, plog) = if window_temp > 0.0 {
                         sample_token_at_temperature(
                             &filtered,
@@ -2945,10 +3538,17 @@ fn transcribe_samples_uncached(
                     // onward, so the token at index `i == mt` is the forced closer and
                     // the window completes here with `decoded.len() == mt + 1`.
                     let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
-                    let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+                    let covers_audio_end = seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+                    let reached_end = has_ts && covers_audio_end;
                     if tok == tk.eot || budget_reached || reached_end {
                         if result_len == 0 && params.timestamps {
-                            if reached_end {
+                            // Retain an end-covering unclosed transcript only when
+                            // it cannot duplicate prior emitted output.
+                            if should_rescue_unclosed_window(
+                                seek_cs,
+                                covers_audio_end,
+                                !segments.is_empty(),
+                            ) {
                                 result_len = i + 1;
                             } else {
                                 // Decoder failed with no timestamps closed.
@@ -2968,10 +3568,34 @@ fn transcribe_samples_uncached(
                     // Forward the just-chosen token to get the next logits.
                     step_logits = decoder::forward_step(&m.decoder, &mut st, &[tok], checkpoint)?;
                     work.greedy_single_token_forwards += 1;
+                    if params.record_token_attn
+                        && let Some(frame) = reduce_attn_frame(
+                            st.cross_attn_weights(),
+                            &attn_align_heads,
+                            m.hparams.n_text_head.max(0) as usize,
+                            st.enc_frames(),
+                        )
+                    {
+                        tracing::trace!(
+                            token_index = i,
+                            token_id = tok,
+                            attn_frame = frame,
+                            enc_frames = st.enc_frames(),
+                            "token attention tap"
+                        );
+                        window_token_attn.push(TokenAttn {
+                            token_index: i as u32,
+                            attn_frame: frame,
+                        });
+                    }
                 }
+                st.record_cross_attn = false;
                 (decoded, plogs, has_ts, seek_delta_cs, result_len)
             };
             work.sampled_tokens += decoded.len();
+            if params.timestamps && result_len > 0 && !has_ts {
+                work.unclosed_window_rescue_attempts += 1;
+            }
 
             // avg_logprob over result tokens (whisper.cpp 6602-6617).
             let result_plogs: &[f32] = if result_len > 0 && result_len <= plogs.len() {
@@ -3001,7 +3625,7 @@ fn transcribe_samples_uncached(
             // Never entered at window_temp == 0.0, so the greedy pass and the
             // whole default path are untouched.
             let (decoded, plogs, result_len, seek_delta_cs, avg_logprob, no_speech_prob) =
-                if temp_fallback_enabled() && window_temp > 0.0 {
+                if fallback_on && window_temp > 0.0 {
                     let cand = WindowCandidate {
                         score: sequence_score(&plogs, result_len),
                         decoded,
@@ -3018,7 +3642,7 @@ fn transcribe_samples_uncached(
                         Some(b) if b.score >= cand.score => b,
                         _ => cand,
                     };
-                    if cand_idx + 1 < temp_best_of() {
+                    if cand_idx + 1 < best_of {
                         rung_best = Some(best);
                         cand_idx += 1;
                         retry_enc_cache = Some((frame_offset, enc));
@@ -3048,10 +3672,9 @@ fn transcribe_samples_uncached(
             // no-speech / failed-window gate (whisper.cpp 7606-7607): treat as
             // silence, emit nothing, advance the full window. At a completed
             // t > 0 rung this evaluates the ADOPTED best candidate.
-            let is_no_speech =
-                no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob < LOGPROB_THRESHOLD;
+            let is_no_speech = gates.is_no_speech(no_speech_prob, avg_logprob);
 
-            // FW_TEMP_FALLBACK (default-off, bd-6goy / bd-r0qd fix-spec #3): the
+            // Temperature fallback (default-off, bd-6goy / bd-r0qd fix-spec #3): the
             // whisper.cpp fallback ladder. A non-silent window that closed no
             // timestamp, averaged below the logprob threshold, or looped into a
             // low-entropy repetitive tail (whisper.cpp entropy_thold, 7540)
@@ -3067,7 +3690,7 @@ fn transcribe_samples_uncached(
             let tail_entropy = {
                 let take = result_len.min(decoded.len());
                 // Only priced when the gate is on: the default path never counts.
-                if temp_fallback_enabled() && take > ENTROPY_WINDOW {
+                if fallback_on && take > ENTROPY_WINDOW {
                     Some(token_tail_entropy(&decoded[..take]))
                 } else {
                     None
@@ -3075,13 +3698,13 @@ fn transcribe_samples_uncached(
             };
             let quality_failed = !is_no_speech
                 && (result_len == 0
-                    || avg_logprob < LOGPROB_THRESHOLD
-                    || tail_entropy.is_some_and(|e| e < ENTROPY_THRESHOLD));
-            if temp_fallback_enabled()
+                    || avg_logprob < gates.logprob
+                    || tail_entropy.is_some_and(|e| e < gates.entropy));
+            if fallback_on
                 && quality_failed
-                && temp_attempt < TEMP_FALLBACK_LADDER.len()
+                && let Some(&next_temp) = ladder.get(temp_attempt)
             {
-                window_temp = TEMP_FALLBACK_LADDER[temp_attempt];
+                window_temp = next_temp;
                 temp_attempt += 1;
                 work.temperature_fallback_retries += 1;
                 cand_idx = 0;
@@ -3114,7 +3737,7 @@ fn transcribe_samples_uncached(
             // should avoid this path; it remains a conservative fallback and supports
             // the explicit historical-context overrides above.
             if retry_failed_window_enabled()
-                && !temp_fallback_enabled()
+                && !fallback_on
                 && result_len == 0
                 && !is_no_speech
                 && !force_empty_prompt
@@ -3199,6 +3822,7 @@ fn transcribe_samples_uncached(
                 no_speech_prob,
                 tokens: result_len,
                 window_offset_sec: seek_cs as f64 / 100.0,
+                token_attn: window_token_attn,
             });
             work.accepted_windows += 1;
             work.accepted_result_tokens += result_len;
@@ -3267,14 +3891,22 @@ fn transcribe_samples_uncached(
                     word_timings.extend(win_words);
                 }
 
-                // wasm32 (bd-m2jm) + iOS (bd-n6wl): live-transcript feed —
-                // each finished window's segments stream to the page/app
-                // before the run completes. Purely observational; desktop
-                // builds compile this away and the decode contract is
-                // untouched.
-                #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
-                if let Ok(json) = serde_json::to_string(&win_segments) {
+                // Live-transcript feed (wasm bd-m2jm, iOS bd-n6wl, desktop
+                // bd-rt-segment-hook-vo6p): each finished window's segments
+                // stream to the host before the run completes. Purely
+                // observational; serialization is skipped entirely when no
+                // global hook is registered, and the scoped per-call hook
+                // (transcribe_samples_with_window_hook) receives the typed
+                // segments without any JSON round-trip. Ordering contract:
+                // fires on the decode thread, after timestamp rules, before
+                // the next window's encode; times are window-relative.
+                if crate::native_engine::plat::segment_hook_active()
+                    && let Ok(json) = serde_json::to_string(&win_segments)
+                {
                     crate::native_engine::plat::emit_partial_segments(&json);
+                }
+                if let Some(hook) = on_window {
+                    hook(&win_segments);
                 }
                 segments.extend(win_segments);
 
@@ -3478,7 +4110,6 @@ pub fn transcribe_samples_batch(
         return vec![transcribe_samples(m, jobs[0].0, &jobs[0].1, checkpoint)];
     }
 
-    super::ensure_default_rayon_pool();
     let groups = if batch_coalesce_enabled() {
         coalesce_batch_jobs(jobs)
     } else {
@@ -3495,27 +4126,40 @@ pub fn transcribe_samples_batch(
         &format!("\"jobs\":{},\"unique\":{}", jobs.len(), groups.len()),
     );
     const MIN_THREADS_PER_FILE: usize = 4;
-    let lanes = groups
-        .len()
-        .min((rayon::current_num_threads() / MIN_THREADS_PER_FILE).max(1));
     let next_group = std::sync::atomic::AtomicUsize::new(0);
-
-    let mut completed: Vec<(usize, FwResult<DecodeOutput>)> = (0..lanes)
-        .into_par_iter()
-        .flat_map_iter(|_| {
-            std::iter::from_fn(|| {
-                let group_index = next_group.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                groups.get(group_index).map(|group| {
-                    let representative = group.representative;
-                    let (samples, params) = &jobs[representative];
-                    (
-                        group_index,
-                        transcribe_samples(m, samples, params, checkpoint),
-                    )
+    // One pool for the whole batch, as wide as the widest job's `n_threads`;
+    // the per-file lanes and every nested decode share it.
+    let width = super::effective_compute_threads(jobs.iter().map(|(_, p)| p.n_threads).max());
+    let run_lanes = || -> Vec<(usize, FwResult<DecodeOutput>)> {
+        let lanes = groups
+            .len()
+            .min((rayon::current_num_threads() / MIN_THREADS_PER_FILE).max(1));
+        (0..lanes)
+            .into_par_iter()
+            .flat_map_iter(|_| {
+                std::iter::from_fn(|| {
+                    let group_index = next_group.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    groups.get(group_index).map(|group| {
+                        let representative = group.representative;
+                        let (samples, params) = &jobs[representative];
+                        (
+                            group_index,
+                            transcribe_samples(m, samples, params, checkpoint),
+                        )
+                    })
                 })
             })
-        })
-        .collect();
+            .collect()
+    };
+    let mut completed = match super::with_compute_threads(width, run_lanes) {
+        Ok(completed) => completed,
+        Err(error) => {
+            return jobs
+                .iter()
+                .map(|_| Err(FwError::Io(std::io::Error::other(error.to_string()))))
+                .collect();
+        }
+    };
     completed.sort_unstable_by_key(|(group_index, _)| *group_index);
 
     let mut outputs: Vec<Option<FwResult<DecodeOutput>>> = (0..jobs.len()).map(|_| None).collect();
@@ -3553,6 +4197,35 @@ pub fn transcribe_samples_batch(
         .into_iter()
         .map(|output| output.expect("every batch group resolves its members"))
         .collect()
+}
+
+/// The DTW alignment pass's decoder prompt `sot [lang] not <text> eot`
+/// (whisper.cpp v1.8.6 `src/whisper.cpp` 8851-8869) plus whisper.cpp's
+/// `sot_sequence_length`: the tokens BEFORE `<|notimestamps|>`, which is also
+/// the index of the `not` row. The `not` row is the one whose attention EMITS
+/// the first text token, so the DTW rows start there; counting `not` into the
+/// sot sequence shifted every word onto the next token's interval
+/// (bd-dtw-word-lag-10ov).
+fn dtw_alignment_prompt(
+    tk: &Tokenizer,
+    language: Option<&str>,
+    text_tokens: &[i32],
+) -> (Vec<i32>, usize) {
+    let mut prompt = Vec::with_capacity(text_tokens.len() + 4);
+    prompt.push(tk.sot);
+    if tk.is_multilingual() {
+        let lang = language.unwrap_or("en");
+        let lang_tok = tk
+            .language_token(lang)
+            .or_else(|| tk.language_token("en"))
+            .unwrap_or(tk.sot + 1);
+        prompt.push(lang_tok);
+    }
+    let sot_sequence_len = prompt.len();
+    prompt.push(tk.no_timestamps);
+    prompt.extend_from_slice(text_tokens);
+    prompt.push(tk.eot);
+    (prompt, sot_sequence_len)
 }
 
 /// Compute DTW word timings for one window, returning per-segment word lists
@@ -3593,21 +4266,7 @@ fn window_word_timings(
         return Ok(vec![Vec::new(); win_segments.len()]);
     }
 
-    // Alignment token sequence: sot + [lang] + not + text + eot (whisper.cpp
-    // 8866-8882). The `no_timestamps` token is always present in this pass.
-    let mut prompt = vec![tk.sot];
-    if tk.is_multilingual() {
-        let lang = language.unwrap_or("en");
-        let lang_tok = tk
-            .language_token(lang)
-            .or_else(|| tk.language_token("en"))
-            .unwrap_or(tk.sot + 1);
-        prompt.push(lang_tok);
-    }
-    prompt.push(tk.no_timestamps);
-    let sot_len = prompt.len();
-    prompt.extend_from_slice(&text_tokens);
-    prompt.push(tk.eot);
+    let (prompt, sot_sequence_len) = dtw_alignment_prompt(tk, language, &text_tokens);
 
     // Single batched forward with cross-attention recording.
     st.reset();
@@ -3623,15 +4282,14 @@ fn window_word_timings(
     // (1 cs = 1 mel frame = 10 ms); two mel frames per encoder frame.
     let n_audio_frames = (seek_delta_cs.clamp(0, CHUNK_CS) / 2) as usize;
 
-    // Per-text-token END times (window-relative seconds), with normalization +
-    // DTW already restricted to the text rows (fix #3) and using upstream's
-    // END-boundary convention (fix #4). `first_text_row = sot_len`,
-    // `n_text_rows = text_tokens.len()` (the trailing eot row is excluded).
+    // Per-text-token END times (window-relative seconds) over the DTW rows
+    // `[not, text...]`, upstream's END-boundary convention (see
+    // `dtw::token_timestamps`).
     let text_ends = dtw::token_timestamps(
         &attn,
         m.hparams.n_text_head.max(0) as usize,
         align_heads,
-        sot_len,
+        sot_sequence_len,
         text_tokens.len(),
         n_audio_frames,
         dtw::DEFAULT_MEDFILT_WIDTH,
@@ -3640,7 +4298,7 @@ fn window_word_timings(
         return Ok(vec![Vec::new(); win_segments.len()]);
     }
 
-    // Reconcile END boundaries → token START times for word grouping (fix #4):
+    // Reconcile END boundaries → token START times for word grouping:
     // a token's start is the previous token's END boundary; the first token
     // starts at the window start (0, window-relative). Add the window seek
     // offset (DTW times are relative to the window start).
@@ -3822,6 +4480,108 @@ fn resolve_language_fast(m: &LoadedModel, params: &DecodeParams) -> Option<Strin
 /// Isomorphism vs the previous separate-encode path: the encoder output for
 /// window 0 is the same tensor either way (encoding is deterministic), so the
 /// detection logits — and every downstream token — are unchanged.
+/// Result of [`detect_language_samples`] (whisper.cpp `whisper_lang_auto_detect`
+/// / `whisper-cli --detect-language`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LanguageDetection {
+    /// The detected language code (the posterior's argmax).
+    pub language: String,
+    /// Softmax over the language-token logits, most probable first.
+    pub probabilities: Vec<(String, f32)>,
+    /// `false` for an English-only model, which has no language tokens: the
+    /// answer is `"en"` without running the model.
+    pub multilingual: bool,
+}
+
+/// Detect the spoken language from the first 30 s window — exactly the
+/// inputs and decision rule the decode loop uses for auto-detection (window-0
+/// encode, one decoder step on `<|startoftranscript|>`, first strict argmax
+/// over the language tokens in [`LANGUAGES`] order), without decoding any
+/// text. Also returns the full posterior, which the decode path never needs.
+///
+/// # Errors
+///
+/// Propagates mel/encoder/decoder failures and `checkpoint` cancellation.
+pub fn detect_language_samples(
+    m: &LoadedModel,
+    samples_16k_mono: &[f32],
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<LanguageDetection> {
+    if !m.tokenizer.is_multilingual() {
+        return Ok(LanguageDetection {
+            language: "en".to_owned(),
+            probabilities: vec![("en".to_owned(), 1.0)],
+            multilingual: false,
+        });
+    }
+    checkpoint()?;
+    // No thread request reaches this entry point: a backend run inherits its
+    // `--threads` pool; a direct call gets the default width.
+    let threads = super::effective_compute_threads(None);
+    let logits = super::with_compute_threads(threads, || {
+        let mel_threads = super::host_parallelism().min(16);
+        let full_mel = mel::log_mel(samples_16k_mono, &m.filters, mel_threads)?;
+        let frames = FRAMES_PER_CHUNK.min(full_mel.n_frames);
+        // A language-only probe reports no encoder provenance.
+        let (enc, _execution) = encoder::forward_from_full_mel_window(
+            &m.encoder, &full_mel, 0, frames, threads, checkpoint,
+        )?;
+        let mut st = DecoderState::new(&m.decoder, &enc)?;
+        decoder::forward_step(&m.decoder, &mut st, &[m.tokenizer.sot], checkpoint)
+    })??;
+
+    let mut language_logits: Vec<(&str, f32)> = Vec::new();
+    for (code, lang_id, _) in LANGUAGES {
+        if *lang_id >= m.tokenizer.num_languages() {
+            continue;
+        }
+        let tok = m.tokenizer.sot + 1 + *lang_id;
+        if let Ok(idx) = usize::try_from(tok)
+            && let Some(&logit) = logits.get(idx)
+        {
+            language_logits.push((code, logit));
+        }
+    }
+    // Same decision rule as `detect_language_from_enc`: the first strictly
+    // greater logit wins, so the reported language always matches what an
+    // auto-detecting transcription of the same audio would decode with.
+    let mut language = "en";
+    let mut best = f32::NEG_INFINITY;
+    for &(code, logit) in &language_logits {
+        if logit > best {
+            best = logit;
+            language = code;
+        }
+    }
+    let max = language_logits
+        .iter()
+        .map(|&(_, logit)| logit)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let weights: Vec<f64> = language_logits
+        .iter()
+        .map(|&(_, logit)| f64::from(logit - max).exp())
+        .collect();
+    let total: f64 = weights.iter().sum();
+    let mut probabilities: Vec<(String, f32)> = language_logits
+        .iter()
+        .zip(&weights)
+        .map(|(&(code, _), &weight)| {
+            let probability = if total > 0.0 && total.is_finite() {
+                (weight / total) as f32
+            } else {
+                0.0
+            };
+            (code.to_owned(), probability)
+        })
+        .collect();
+    probabilities.sort_by(|a, b| b.1.total_cmp(&a.1));
+    Ok(LanguageDetection {
+        language: language.to_owned(),
+        probabilities,
+        multilingual: true,
+    })
+}
+
 fn detect_language_from_enc(
     m: &LoadedModel,
     st: &mut DecoderState,
@@ -3911,6 +4671,11 @@ pub(crate) fn read_wav_16k_mono(bytes: &[u8]) -> FwResult<Vec<f32>> {
         if pos > bytes.len() {
             return Err(bad("truncated chunk padding"));
         }
+    }
+    // 1-7 trailing bytes are a torn chunk header, not a clean end of file
+    // (bd-2skl; matches the strict pre-gate parser in native_audio).
+    if pos != bytes.len() {
+        return Err(bad("truncated chunk header"));
     }
     if bits != 16 {
         return Err(bad("only 16-bit PCM supported"));
@@ -4131,6 +4896,37 @@ mod tests {
         v[4] = b"(".to_vec(); // non-speech symbol
         v[5] = b" -".to_vec(); // non-speech special hyphen
         Tokenizer::from_vocab(&hp(n_vocab), v)
+    }
+
+    #[test]
+    fn dtw_alignment_rows_start_at_the_notimestamps_row() {
+        // bd-dtw-word-lag-10ov: whisper.cpp's sot_sequence_length counts the
+        // tokens BEFORE <|notimestamps|>, so the DTW rows begin at `not` (the
+        // row that emits the first text token). Counting `not` into the sot
+        // sequence started DTW one row late: every word got the next token's
+        // interval.
+        let english = synth_tokenizer();
+        let multilingual = Tokenizer::from_vocab(&hp(51866), vec![b".".to_vec(); 51866]);
+        let text = [2, 3, 2];
+        for (tk, expected_sot_sequence_len) in [(&english, 1), (&multilingual, 2)] {
+            let (prompt, sot_sequence_len) = dtw_alignment_prompt(tk, Some("en"), &text);
+            assert_eq!(sot_sequence_len, expected_sot_sequence_len);
+            assert_eq!(prompt[0], tk.sot);
+            assert_eq!(
+                prompt[sot_sequence_len], tk.no_timestamps,
+                "the first DTW row is <|notimestamps|>"
+            );
+            assert_eq!(
+                &prompt[sot_sequence_len + 1..sot_sequence_len + 1 + text.len()],
+                &text
+            );
+            assert_eq!(prompt.last(), Some(&tk.eot));
+            assert_eq!(prompt.len(), sot_sequence_len + 1 + text.len() + 1);
+        }
+        assert_eq!(
+            dtw_alignment_prompt(&multilingual, Some("en"), &text).0[1],
+            multilingual.language_token("en").expect("en token")
+        );
     }
 
     fn base_cfg(tk: &Tokenizer) -> FilterConfig {
@@ -4407,6 +5203,84 @@ mod tests {
     }
 
     #[test]
+    fn default_temperature_ladder_is_bit_identical_to_the_historical_constant() {
+        // The FW_TEMP_FALLBACK path was pinned to this literal ladder; seeded
+        // sampling rungs stay byte-exact only if the computed ladder matches it
+        // bit for bit (one correctly rounded division per rung, no running sum).
+        let historical = [0.2_f64, 0.4, 0.6, 0.8, 1.0];
+        let ladder = temperature_ladder(&DecodeParams::default());
+        assert_eq!(ladder.len(), historical.len());
+        for (rung, expected) in ladder.iter().zip(historical) {
+            assert_eq!(rung.to_bits(), expected.to_bits());
+        }
+        let step = |milli| DecodeParams {
+            temperature_increment_milli: Some(milli),
+            ..DecodeParams::default()
+        };
+        assert_eq!(temperature_ladder(&step(250)), vec![0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(temperature_ladder(&step(300)), vec![0.3, 0.6, 0.9]);
+        assert!(temperature_ladder(&step(0)).is_empty(), "0 = no retries");
+        assert!(temperature_ladder(&step(1500)).is_empty());
+        // A sub-0.01 step is clamped, bounding the ladder at 100 rungs.
+        assert_eq!(temperature_ladder(&step(1)).len(), 100);
+    }
+
+    #[test]
+    fn quality_gates_default_to_whisper_cpp_and_take_request_overrides() {
+        let defaults = QualityGates::for_params(&DecodeParams::default());
+        assert_eq!(
+            defaults,
+            QualityGates {
+                logprob: LOGPROB_THRESHOLD,
+                no_speech: NO_SPEECH_THRESHOLD,
+                entropy: ENTROPY_THRESHOLD,
+            }
+        );
+        let custom = QualityGates::for_params(&DecodeParams {
+            logprob_threshold_milli: Some(-500),
+            no_speech_threshold_milli: Some(900),
+            entropy_threshold_milli: Some(2000),
+            ..DecodeParams::default()
+        });
+        assert_eq!(custom.logprob, -0.5);
+        assert_eq!(custom.no_speech, 0.9);
+        assert_eq!(custom.entropy, 2.0);
+        // Silence needs BOTH a high no-speech probability and low confidence.
+        assert!(defaults.is_no_speech(0.7, -1.5));
+        assert!(!defaults.is_no_speech(0.7, -0.5));
+        assert!(!defaults.is_no_speech(0.5, -1.5));
+        assert!(
+            !custom.is_no_speech(0.7, -1.5),
+            "0.7 is under the raised 0.9 bar"
+        );
+    }
+
+    #[test]
+    fn request_fallback_choice_wins_over_the_process_default() {
+        // FW_TEMP_FALLBACK is unset in the unit-test environment.
+        if std::env::var_os("FW_TEMP_FALLBACK").is_some() {
+            return;
+        }
+        assert!(!temp_fallback_on(&DecodeParams::default()));
+        let with = |choice| DecodeParams {
+            temperature_fallback: Some(choice),
+            ..DecodeParams::default()
+        };
+        assert!(temp_fallback_on(&with(true)));
+        assert!(!temp_fallback_on(&with(false)));
+        if std::env::var_os("FW_TEMP_BEST_OF").is_none() {
+            assert_eq!(temp_best_of(&DecodeParams::default()), 5);
+            let best_of = |n| DecodeParams {
+                best_of: Some(n),
+                ..DecodeParams::default()
+            };
+            assert_eq!(temp_best_of(&best_of(3)), 3);
+            assert_eq!(temp_best_of(&best_of(0)), 1);
+            assert_eq!(temp_best_of(&best_of(99)), 32);
+        }
+    }
+
+    #[test]
     fn sample_token_degenerate_inputs_fall_back_to_argmax() {
         // All-masked (no finite lane) and empty inputs must not panic or draw a
         // masked id — they defer to argmax's established conventions.
@@ -4629,6 +5503,25 @@ mod tests {
         // Degenerate lengths.
         assert!(!single_timestamp_ending(&[beg + 10], beg, true, None));
         assert!(!single_timestamp_ending(&[], beg, true, None));
+    }
+
+    #[test]
+    fn unclosed_window_rescue_requires_no_prior_output() {
+        // Positive cell: a short first-window streaming slice reaches EOT after
+        // `<|0.00|>` plus text and must retain that transcript.
+        assert!(should_rescue_unclosed_window(0, true, false));
+
+        // Positive cell: after an initial silent window, a later short tail has
+        // no prior transcript to duplicate and must retain genuine new speech.
+        assert!(should_rescue_unclosed_window(3_000, true, false));
+
+        // Negative cell: once prior output exists, a later short tail also
+        // satisfies the default full-chunk coverage arithmetic but may overlap
+        // the preceding transcript and must not be emitted a second time.
+        assert!(!should_rescue_unclosed_window(2_800, true, true));
+
+        // Coverage remains mandatory even on the first window.
+        assert!(!should_rescue_unclosed_window(0, false, false));
     }
 
     #[test]
@@ -5055,6 +5948,176 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // AudioCtxPolicy (bd-rt-audio-ctx-n4dj)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn audio_ctx_fixed_clamps_and_rounds_up_to_64() {
+        // Round UP to the multiple-of-64 band, clamped to [64, 1500].
+        assert_eq!(AudioCtxPolicy::fixed(0), AudioCtxPolicy::Fixed(MIN_ENC_CTX));
+        assert_eq!(AudioCtxPolicy::fixed(63), AudioCtxPolicy::Fixed(64));
+        assert_eq!(AudioCtxPolicy::fixed(64), AudioCtxPolicy::Fixed(64));
+        assert_eq!(AudioCtxPolicy::fixed(65), AudioCtxPolicy::Fixed(128));
+        assert_eq!(AudioCtxPolicy::fixed(512), AudioCtxPolicy::Fixed(512));
+        assert_eq!(
+            AudioCtxPolicy::fixed(FULL_ENC_CTX),
+            AudioCtxPolicy::Fixed(FULL_ENC_CTX)
+        );
+        // 1499 rounds up to 1536, which clamps back down to the 1500 ceiling.
+        assert_eq!(
+            AudioCtxPolicy::fixed(FULL_ENC_CTX - 1),
+            AudioCtxPolicy::Fixed(FULL_ENC_CTX)
+        );
+        // An extreme request saturates instead of overflowing.
+        assert_eq!(
+            AudioCtxPolicy::fixed(usize::MAX),
+            AudioCtxPolicy::Fixed(FULL_ENC_CTX)
+        );
+    }
+
+    #[test]
+    fn audio_ctx_effective_enc_ctx_bands() {
+        // Auto = ceil(real/2) clamped, then floored at AUTO_MIN_ENC_CTX for
+        // decode QUALITY (bd-rt-audio-ctx-auto-empty: repetition loops below
+        // it), FIRST WINDOW INCLUDED (a live session is all first window).
+        assert_eq!(AudioCtxPolicy::Auto.effective_enc_ctx(24), AUTO_MIN_ENC_CTX);
+        assert_eq!(
+            AudioCtxPolicy::Auto.effective_enc_ctx(128),
+            AUTO_MIN_ENC_CTX
+        );
+        assert_eq!(
+            AudioCtxPolicy::Auto.effective_enc_ctx(600),
+            AUTO_MIN_ENC_CTX
+        );
+        assert_eq!(AudioCtxPolicy::Auto.effective_enc_ctx(1200), 600);
+        assert_eq!(
+            AudioCtxPolicy::Auto.effective_enc_ctx(FRAMES_PER_CHUNK),
+            FULL_ENC_CTX
+        );
+        // Fixed = clamped cap shrunk by the window's real audio.
+        assert_eq!(AudioCtxPolicy::Fixed(512).effective_enc_ctx(2000), 512);
+        assert_eq!(AudioCtxPolicy::Fixed(512).effective_enc_ctx(400), 200);
+        // Full always full regardless of real frames.
+        for rf in [0, 1, 240, 2999] {
+            assert_eq!(AudioCtxPolicy::Full.effective_enc_ctx(rf), FULL_ENC_CTX);
+        }
+    }
+
+    #[test]
+    fn audio_ctx_auto_property_band_across_buffer_lengths() {
+        // Property: for every buffer length 0.5-29.5 s (50..2950 mel frames),
+        // Auto's effective ctx == ceil(real/2) clamped to the model band and
+        // then floored at 512 for decode quality; the exact floor/ceiling
+        // boundary lengths hold without panicking.
+        for rf in 50..=2950 {
+            let ctx = AudioCtxPolicy::Auto.effective_enc_ctx(rf);
+            let expected = rf
+                .div_ceil(2)
+                .clamp(MIN_ENC_CTX, FULL_ENC_CTX)
+                .max(AUTO_MIN_ENC_CTX);
+            assert_eq!(ctx, expected, "real_frames={rf}");
+            assert!((AUTO_MIN_ENC_CTX..=FULL_ENC_CTX).contains(&ctx));
+        }
+        // Short audio floors at the QUALITY floor (bd-rt-audio-ctx-auto-empty:
+        // under-conditioned encoders loop below it), not the shape minimum.
+        assert_eq!(
+            AudioCtxPolicy::Auto.effective_enc_ctx(2 * MIN_ENC_CTX),
+            AUTO_MIN_ENC_CTX
+        );
+        assert_eq!(
+            AudioCtxPolicy::Auto.effective_enc_ctx(FRAMES_PER_CHUNK),
+            FULL_ENC_CTX
+        );
+    }
+
+    #[test]
+    fn resolve_window_enc_ctx_policy_overrides_env_gates() {
+        // The env-on/off x param Full/Auto interplay: a non-Full policy is
+        // AUTHORITATIVE — `tail_truncate` (the env-gated flag) and `is_first`
+        // cannot force a full window when Auto/Fixed is requested in timestamp
+        // mode; Full delegates to the historical tail math unchanged.
+        let auto = DecodeParams {
+            audio_ctx: AudioCtxPolicy::Auto,
+            timestamps: true,
+            ..DecodeParams::default()
+        };
+        let full = DecodeParams::default();
+        // Env truncation OFF (tail_truncate=false): Auto still truncates the
+        // FIRST window (env gates ignored); Full stays byte-exact full.
+        assert_eq!(resolve_window_enc_ctx(&auto, 600, true, false), 512);
+        assert_eq!(
+            resolve_window_enc_ctx(&full, 600, true, false),
+            FULL_ENC_CTX
+        );
+        // Env truncation ON: Auto identical (env irrelevant); Full truncates a
+        // non-first short window exactly as today, never the first.
+        assert_eq!(resolve_window_enc_ctx(&auto, 600, false, true), 512);
+        assert_eq!(resolve_window_enc_ctx(&full, 600, false, true), 300);
+        assert_eq!(resolve_window_enc_ctx(&full, 600, true, true), FULL_ENC_CTX);
+        // Fixed caps regardless of gates.
+        let fixed = DecodeParams {
+            audio_ctx: AudioCtxPolicy::fixed(512),
+            timestamps: true,
+            ..DecodeParams::default()
+        };
+        assert_eq!(resolve_window_enc_ctx(&fixed, 600, true, false), 300);
+        // Reduced policies honor the no-timestamps prohibition (full windows —
+        // truncation there removes the greedy decoder's only end-of-speech cue).
+        for policy in [AudioCtxPolicy::Auto, AudioCtxPolicy::fixed(512)] {
+            let p = DecodeParams {
+                audio_ctx: policy,
+                timestamps: false,
+                ..DecodeParams::default()
+            };
+            assert_eq!(resolve_window_enc_ctx(&p, 24, false, true), FULL_ENC_CTX);
+            assert_eq!(resolve_window_enc_ctx(&p, 24, true, true), FULL_ENC_CTX);
+        }
+        // Full delegates to the HISTORICAL tail math unchanged — including its
+        // env-gated non-first tail truncation in no-timestamps mode
+        // (byte-exactness contract; the prohibition is a reduced-policy rule).
+        let full_no_ts = DecodeParams {
+            timestamps: false,
+            ..DecodeParams::default()
+        };
+        assert_eq!(
+            resolve_window_enc_ctx(&full_no_ts, 24, false, true),
+            MIN_ENC_CTX
+        );
+        assert_eq!(
+            resolve_window_enc_ctx(&full_no_ts, 24, true, true),
+            FULL_ENC_CTX
+        );
+    }
+
+    #[test]
+    fn audio_ctx_participates_in_cache_fingerprint() {
+        // TranscriptionCache keys on batch_job_fingerprint(samples, params);
+        // params hash via the derived Hash, so distinct policies must never
+        // alias onto each other's cached outputs.
+        let samples = vec![0.5f32; 160];
+        let full = DecodeParams::default();
+        let auto = DecodeParams {
+            audio_ctx: AudioCtxPolicy::Auto,
+            ..DecodeParams::default()
+        };
+        assert_ne!(
+            batch_job_fingerprint(&samples, &full),
+            batch_job_fingerprint(&samples, &auto)
+        );
+        // Equal params (same policy) still fingerprint identically.
+        assert_eq!(
+            batch_job_fingerprint(&samples, &auto),
+            batch_job_fingerprint(
+                &samples,
+                &DecodeParams {
+                    audio_ctx: AudioCtxPolicy::Auto,
+                    ..DecodeParams::default()
+                }
+            )
+        );
+    }
+
     #[test]
     fn confidence_is_clamped_and_monotone() {
         // mean logprob 0 => exp(0)=1 (clamped); very negative => ~0.
@@ -5130,6 +6193,26 @@ mod tests {
                 .to_string()
                 .contains("inside a PCM frame")
         );
+    }
+
+    #[test]
+    fn wav_reader_rejects_every_torn_trailing_chunk_header() {
+        let wav = synthetic_pcm_wav(1, &0_i16.to_le_bytes());
+        assert!(
+            read_wav_16k_mono(&wav).is_ok(),
+            "the untorn file must parse"
+        );
+        for trailing in 1..8 {
+            let mut torn = wav.clone();
+            torn.extend(std::iter::repeat_n(0_u8, trailing));
+            assert!(
+                read_wav_16k_mono(&torn)
+                    .expect_err("a partial chunk header is not a clean EOF")
+                    .to_string()
+                    .contains("truncated chunk header"),
+                "{trailing} trailing byte(s)"
+            );
+        }
     }
 
     #[test]
@@ -5226,6 +6309,411 @@ mod tests {
             max_text_ctx: None,
             ..DecodeParams::default()
         }
+    }
+
+    #[test]
+    fn gated_window_hook_streams_each_window_in_order() {
+        let _hook_guard = crate::native_engine::plat::SEGMENT_HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // bd-rt-segment-hook-vo6p acceptance: a 2-window decode fires the
+        // scoped hook once per window, in order, with exactly the segments
+        // the final DecodeOutput contains for those windows; the GLOBAL
+        // desktop hook receives the same windows as JSON; the no-hook path
+        // is byte-identical (covered by the existing goldens).
+        let Some(loaded) = load_tiny_en() else {
+            eprintln!("SKIP gated_window_hook: tiny.en not found");
+            return;
+        };
+        let Some(jfk) = load_jfk_samples() else {
+            eprintln!("SKIP gated_window_hook: jfk.wav missing");
+            return;
+        };
+        // Tile jfk (~11 s) x3 => ~33 s => 2 long-form windows.
+        let mut tiled = Vec::with_capacity(jfk.len() * 3);
+        for _ in 0..3 {
+            tiled.extend_from_slice(&jfk);
+        }
+
+        // The global hook is process-wide, so every decode the parallel test
+        // runner has in flight emits into it too. Attribute payloads to THIS
+        // decode by thread: the decode loop fires the global hook and then the
+        // scoped hook back to back on the same decode thread for each window,
+        // and concurrent runs never share pool workers. The global hook parks
+        // its payload on its own thread; the scoped hook claims it.
+        thread_local! {
+            static LAST_GLOBAL_PAYLOAD: std::cell::RefCell<Option<String>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        crate::native_engine::plat::set_segment_hook(Box::new(|json| {
+            LAST_GLOBAL_PAYLOAD.with(|slot| *slot.borrow_mut() = Some(json.to_owned()));
+        }));
+
+        let scoped: std::sync::Mutex<Vec<Vec<TranscriptionSegment>>> =
+            std::sync::Mutex::new(Vec::new());
+        let global: std::sync::Mutex<Vec<Option<String>>> = std::sync::Mutex::new(Vec::new());
+        let params = DecodeParams {
+            bypass_transcript_cache: true,
+            ..e2e_params()
+        };
+        let hook = |windows: &[TranscriptionSegment]| {
+            global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(LAST_GLOBAL_PAYLOAD.with(|slot| slot.borrow_mut().take()));
+            scoped
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(windows.to_vec());
+        };
+        let out = transcribe_samples_with_window_hook(&loaded, &tiled, &params, &noop, Some(&hook))
+            .expect("tiled transcribe");
+
+        let scoped = scoped
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(
+            scoped.len() >= 2,
+            "expected >=2 window callbacks on ~33s audio, got {}",
+            scoped.len()
+        );
+        // Concatenated hook segments == final output segments, in order.
+        let streamed: Vec<&TranscriptionSegment> = scoped.iter().flatten().collect();
+        assert_eq!(streamed.len(), out.segments.len());
+        for (streamed_segment, final_segment) in streamed.iter().zip(&out.segments) {
+            assert_eq!(streamed_segment.text, final_segment.text);
+        }
+        // The global hook received each of this decode's windows, in order,
+        // as the JSON array of exactly that window's segments.
+        let global = global
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(global.len(), scoped.len(), "global hook window count");
+        for (index, (json, window)) in global.iter().zip(&scoped).enumerate() {
+            let json = json
+                .as_deref()
+                .unwrap_or_else(|| panic!("global hook missed window {index}"));
+            assert!(json.starts_with('['), "hook payload must be a JSON array");
+            assert_eq!(
+                json,
+                serde_json::to_string(window).expect("serialize window segments"),
+                "global hook payload for window {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn reduce_attn_frame_synthetic_argmax_and_head_selection() {
+        use super::super::Mat;
+        let enc = 8usize;
+        let n_head = 2usize; // 2 layers x 2 heads => 4 mats
+        let mk = |peak: usize| {
+            let mut row = vec![0.0f32; enc];
+            row[peak] = 1.0;
+            Mat::from_vec(1, enc, row)
+        };
+        // layer0: heads peak at 2 and 4; layer1: heads peak at 6 and 7.
+        let recorded = vec![mk(2), mk(4), mk(6), mk(7)];
+
+        // Align heads = layer0 only: mean peaks flat between 2 and 4 -> argmax
+        // takes the FIRST max (2) deterministically.
+        assert_eq!(
+            reduce_attn_frame(&recorded, &[(0, 0), (0, 1)], n_head, enc),
+            Some(2)
+        );
+        // Single head (1,1) -> its own peak.
+        assert_eq!(
+            reduce_attn_frame(&recorded, &[(1, 1)], n_head, enc),
+            Some(7)
+        );
+        // Weighted dominance: double weight on head (1,0) via duplication.
+        assert_eq!(
+            reduce_attn_frame(&recorded, &[(1, 0), (1, 0), (0, 0)], n_head, enc),
+            Some(6)
+        );
+        // Degenerate inputs -> None, never frame 0.
+        assert_eq!(reduce_attn_frame(&[], &[(0, 0)], n_head, enc), None);
+        assert_eq!(reduce_attn_frame(&recorded, &[], n_head, enc), None);
+        assert_eq!(reduce_attn_frame(&recorded, &[(9, 9)], n_head, enc), None);
+        assert_eq!(reduce_attn_frame(&recorded, &[(0, 0)], n_head, 0), None);
+    }
+
+    #[test]
+    fn record_token_attn_defaults_off_and_rejects_beam() {
+        assert!(!DecodeParams::default().record_token_attn);
+        let Some(loaded) = load_tiny_en() else {
+            eprintln!("SKIP record_token_attn beam guard: tiny.en not found");
+            return;
+        };
+        let params = DecodeParams {
+            record_token_attn: true,
+            beam_size: Some(4),
+            ..e2e_params()
+        };
+        let err = transcribe_samples(&loaded, &vec![0.0f32; 16_000], &params, &noop)
+            .expect_err("beam + attention tap must be rejected");
+        assert_eq!(err.error_code(), "FW-UNSUPPORTED");
+    }
+
+    #[test]
+    fn gated_token_attn_tap_tracks_speech_signal() {
+        // Model-gated live-signal check (bd-rt-attn-tap-dfti acceptance,
+        // adapted): tap frames must be in-range, cover nearly every forwarded
+        // token, and land near DTW-timed words for the same audio. WordTiming
+        // carries no token span, so parity is measured as the median distance
+        // from each tapped time to the nearest DTW word INTERVAL — same
+        // signal, loose bound (<= 0.30 s), actual value printed for the bead
+        // close note.
+        let Some(loaded) = load_tiny_en() else {
+            eprintln!("SKIP gated_token_attn_tap: tiny.en not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_token_attn_tap: jfk.wav missing");
+            return;
+        };
+        let params = DecodeParams {
+            record_token_attn: true,
+            word_timestamps: true,
+            bypass_transcript_cache: true,
+            ..e2e_params()
+        };
+        let out = transcribe_samples(&loaded, &samples, &params, &noop).expect("transcribe");
+        assert!(!out.windows.is_empty());
+        let mut tap_times: Vec<f64> = Vec::new();
+        for window in &out.windows {
+            assert!(
+                window.token_attn.len() + 1 >= window.tokens.min(window.token_attn.len() + 1),
+                "tap must cover forwarded tokens (missing only the unforwarded tail)"
+            );
+            for tap in &window.token_attn {
+                // 1 encoder frame = 20 ms.
+                tap_times.push(window.window_offset_sec + f64::from(tap.attn_frame) * 0.02);
+            }
+        }
+        assert!(
+            tap_times.len() >= 20,
+            "expected a rich tap stream on jfk, got {}",
+            tap_times.len()
+        );
+        let words: Vec<(f64, f64)> = out
+            .word_timings
+            .iter()
+            .flatten()
+            .flatten()
+            .map(|w| (w.start_sec, w.end_sec))
+            .collect();
+        assert!(
+            !words.is_empty(),
+            "word timings required for the parity check"
+        );
+        let mut distances: Vec<f64> = tap_times
+            .iter()
+            .map(|&t| {
+                words
+                    .iter()
+                    .map(|&(a, b)| {
+                        if t < a {
+                            a - t
+                        } else if t > b {
+                            t - b
+                        } else {
+                            0.0
+                        }
+                    })
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .collect();
+        distances.sort_by(f64::total_cmp);
+        let median = distances[distances.len() / 2];
+        eprintln!(
+            "token-attn parity: {} taps, median distance to nearest DTW word {:.3}s, p90 {:.3}s",
+            distances.len(),
+            median,
+            distances[distances.len() * 9 / 10]
+        );
+        assert!(
+            median <= 0.30,
+            "tap frames drifted from DTW word intervals: median {median:.3}s"
+        );
+
+        // Off path stays empty.
+        let out_off =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe off");
+        assert!(out_off.windows.iter().all(|w| w.token_attn.is_empty()));
+    }
+
+    #[test]
+    fn bypass_transcript_cache_defaults_off_and_is_cache_key_safe() {
+        // Default: caching stays active (bypass=false).
+        assert!(!DecodeParams::default().bypass_transcript_cache);
+        // The field participates in Hash/Eq (derives), so a bypass job can
+        // never coalesce with a cached job of identical audio in
+        // transcribe_samples_batch — assert the inequality that guarantees it.
+        let cached = DecodeParams::default();
+        let bypass = DecodeParams {
+            bypass_transcript_cache: true,
+            ..DecodeParams::default()
+        };
+        assert_ne!(cached, bypass);
+    }
+
+    #[test]
+    fn gated_bypass_transcript_cache_skips_lookup_and_insert() {
+        // Model-gated end-to-end proof: with bypass=true the LRU stays empty
+        // across repeated identical transcriptions (no lookup, no insert, no
+        // sample copy), and physical decode work happens every time; with
+        // bypass=false the second run is a cache hit doing zero decode work.
+        let Some(loaded) = load_tiny_en() else {
+            eprintln!("SKIP gated_bypass_transcript_cache: tiny.en not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_bypass_transcript_cache: jfk.wav missing");
+            return;
+        };
+        let noop = noop;
+        let bypass_params = DecodeParams {
+            bypass_transcript_cache: true,
+            ..e2e_params()
+        };
+        loaded.clear_transcription_cache();
+        let first =
+            transcribe_samples(&loaded, &samples, &bypass_params, &noop).expect("bypass run 1");
+        let second =
+            transcribe_samples(&loaded, &samples, &bypass_params, &noop).expect("bypass run 2");
+        assert!(first.work.sampled_tokens > 0);
+        assert!(
+            second.work.sampled_tokens > 0,
+            "bypass second run must do real work (no cache hit)"
+        );
+        assert_eq!(
+            loaded
+                .transcription_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            0,
+            "bypass runs must not insert into the cache"
+        );
+
+        // Control: same audio without bypass populates and then hits.
+        let cached_params = e2e_params();
+        let third =
+            transcribe_samples(&loaded, &samples, &cached_params, &noop).expect("cached run 1");
+        let fourth =
+            transcribe_samples(&loaded, &samples, &cached_params, &noop).expect("cached run 2");
+        assert!(third.work.sampled_tokens > 0);
+        assert_eq!(
+            fourth.work.sampled_tokens, 0,
+            "second cached run must be a pure cache hit"
+        );
+        assert_eq!(fourth.segments.len(), third.segments.len());
+        // A cache hit ran no encoder forward, so it records no execution.
+        assert!(third.work.encoder_executions.single_route().is_some());
+        assert!(fourth.work.encoder_executions.entries().is_empty());
+    }
+
+    /// bd-nt0d: two decodes in one process, with different encoder
+    /// arithmetic, each report what THEIR encoder forwards ran. Run A encodes
+    /// its window, then waits inside its window hook while run B (another
+    /// thread, another model) encodes and decodes; A's record is completed
+    /// only after B's forward. A process-wide "last route" read when the
+    /// record is built hands A run B's record.
+    #[test]
+    fn gated_interleaved_decodes_each_record_their_own_encoder_execution() {
+        let Some(path) = super::super::find_model_file("tiny.en") else {
+            eprintln!("SKIP gated_interleaved_encoder_execution: tiny.en not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_interleaved_encoder_execution: jfk.wav missing");
+            return;
+        };
+        let load = || LoadedModel::from_ggml(GgmlModel::load(&path).expect("parse tiny.en"));
+        let mut a = load().expect("load A");
+        a.encoder = EncoderWeights::from_ggml_with_quality_safe_int8(
+            &GgmlModel::load(&path).expect("parse tiny.en"),
+            false,
+        )
+        .expect("A encoder");
+        let mut b = load().expect("load B");
+        b.encoder = EncoderWeights::from_ggml_with_quality_safe_int8(
+            &GgmlModel::load(&path).expect("parse tiny.en"),
+            true,
+        )
+        .expect("B encoder");
+        if a.encoder.cpu_precision() == b.encoder.cpu_precision() {
+            eprintln!(
+                "SKIP gated_interleaved_encoder_execution: an int8 owner gate \
+                 (FRANKEN_WHISPER_ENC_INT8 / FW_ENC_INT8_ATTN_IN) makes both encoders equal"
+            );
+            return;
+        }
+        // tiny.en (width 384) runs the CPU encoder on every target.
+        let route = if !cfg!(target_os = "macos") {
+            "cpu:no_gpu_backend"
+        } else if std::env::var("FRANKEN_WHISPER_FUSED_ENC").as_deref() == Ok("0") {
+            "cpu:fused_disabled"
+        } else {
+            "cpu:model_below_gpu_width_gate"
+        };
+        let expected = |m: &LoadedModel| {
+            let (precision, precision_source) = m.encoder.cpu_precision();
+            encoder::EncoderExecution {
+                route,
+                precision,
+                precision_source,
+            }
+        };
+        let params = DecodeParams {
+            bypass_transcript_cache: true,
+            ..e2e_params()
+        };
+
+        let (a_encoded_tx, a_encoded_rx) = std::sync::mpsc::channel::<()>();
+        let (b_done_tx, b_done_rx) = std::sync::mpsc::channel::<()>();
+        // The hook runs on A's decode thread and must be `Sync`.
+        let handoff = std::sync::Mutex::new(Some((a_encoded_tx, b_done_rx)));
+        let (a_out, b_out) = std::thread::scope(|scope| {
+            let (b_ref, samples_ref, params_ref) = (&b, &samples, &params);
+            let run_b = scope.spawn(move || {
+                a_encoded_rx.recv().expect("A encoded its window");
+                let out = transcribe_samples(b_ref, samples_ref, params_ref, &noop).expect("run B");
+                b_done_tx.send(()).expect("signal B done");
+                out
+            });
+            let hook = |_window: &[TranscriptionSegment]| {
+                let first = handoff
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some((encoded, b_done)) = first {
+                    encoded.send(()).expect("signal A encoded");
+                    b_done.recv().expect("B finished");
+                }
+            };
+            let a_out =
+                transcribe_samples_with_window_hook(&a, &samples, &params, &noop, Some(&hook))
+                    .expect("run A");
+            (a_out, run_b.join().expect("run B thread"))
+        });
+
+        for (name, out, model) in [("A", &a_out, &a), ("B", &b_out, &b)] {
+            let tally = &out.work.encoder_executions;
+            assert_eq!(
+                tally.entries(),
+                [(expected(model), out.work.encoder_calls)],
+                "run {name} must record its own encoder's forwards"
+            );
+            assert_eq!(tally.single_route(), Some(route), "run {name}");
+        }
+        assert_ne!(
+            a_out.work.encoder_executions, b_out.work.encoder_executions,
+            "the two runs' records must differ (A f32, B quality-safe int8)"
+        );
     }
 
     #[test]
@@ -5498,6 +6986,100 @@ mod tests {
             "max_context=0 must decode each tile exactly once: {}",
             joined(&nocarry_out)
         );
+        assert_eq!(
+            default_out.work.unclosed_window_rescue_attempts, 0,
+            "the tiled duplicate tail must not be rescued"
+        );
+        assert_eq!(
+            nocarry_out.work.unclosed_window_rescue_attempts, 0,
+            "the tiled no-carry duplicate tail must not be rescued"
+        );
+    }
+
+    #[test]
+    fn gated_later_unclosed_tail_without_prior_output_is_retained() {
+        // Positive control for bd-4ep1's evidence-aware rescue: a later window
+        // that ends `<|0.00|> text <eot>` (no closed timestamp) while no earlier
+        // window emitted a segment must be retained, not dropped. A
+        // window-position-only rescue drops it and records a DroppedWindow.
+        //
+        // TEST-ONLY TRIGGER. Real decodes do not reliably produce that shape:
+        // on x86_64, with the f32 and the int8 encoder, 580 natural tiny.en
+        // fixtures (silence plus JFK tails and cuts under Auto, Full and Fixed
+        // contexts) produced none. `unclosed_window_seam` masks closing
+        // timestamps from the second window on, which forces the shape on every
+        // architecture. This proves the rescue logic once triggered; it does NOT
+        // show that the trigger occurs naturally on x86_64.
+        //
+        // Fixture: 30 s of silence, then the last 3 s of JFK. With the default
+        // thresholds the silent first window emits "[BLANK_AUDIO]", which counts
+        // as earlier output and rightly disables the rescue; the logprob
+        // threshold below makes that window a no-speech window instead, so no
+        // earlier segment exists.
+        let (Some(model), Some(jfk)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP gated_later_unclosed_tail: tiny.en model or jfk.wav missing");
+            return;
+        };
+        let tail_samples = 3 * SAMPLE_RATE;
+        assert!(
+            jfk.len() >= tail_samples,
+            "jfk fixture must contain a 3 s tail"
+        );
+        let mut silence_then_tail = vec![0.0; 30 * SAMPLE_RATE];
+        silence_then_tail.extend_from_slice(&jfk[jfk.len() - tail_samples..]);
+
+        let params = DecodeParams {
+            audio_ctx: AudioCtxPolicy::Auto,
+            bypass_transcript_cache: true,
+            logprob_threshold_milli: Some(0),
+            ..e2e_params()
+        };
+        unclosed_window_seam::arm(Some(1));
+        let decoded = transcribe_samples_uncached(&model, &silence_then_tail, &params, &noop, None);
+        let masked_steps = unclosed_window_seam::masked_steps();
+        unclosed_window_seam::arm(None);
+        let out = decoded.expect("decode silence followed by genuine final-tail speech");
+        for (window, stats) in out.windows.iter().enumerate() {
+            eprintln!(
+                "window {window}: offset {:.2} s, {} tokens, avg_logprob {:.3}, no_speech {:.3}",
+                stats.window_offset_sec, stats.tokens, stats.avg_logprob, stats.no_speech_prob
+            );
+        }
+        let text = out
+            .segments
+            .iter()
+            .map(|segment| segment.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(
+            masked_steps > 0,
+            "the seam must have masked the later window's decode"
+        );
+        assert!(
+            out.windows.len() >= 2,
+            "fixture must exercise a later window"
+        );
+        assert!(
+            out.segments
+                .iter()
+                .all(|segment| segment.start_sec.is_some_and(|start| start >= 30.0)),
+            "the first window must emit no segment: {:?}",
+            out.segments
+        );
+        assert!(
+            text.to_lowercase().contains("country"),
+            "genuine later-tail speech must be retained: {text:?}"
+        );
+        assert!(
+            out.dropped_windows.is_empty(),
+            "genuine later-tail speech must not be reported as dropped: {:?}",
+            out.dropped_windows
+        );
+        assert_eq!(
+            out.work.unclosed_window_rescue_attempts, 1,
+            "fixture must exercise exactly one later unclosed-window rescue"
+        );
     }
 
     #[test]
@@ -5576,6 +7158,58 @@ mod tests {
             BEAM_PUNCTUATION_VARIANTS.contains(&beam.as_str()),
             "beam=5 produced an unreviewed punctuation variant: {beam}"
         );
+    }
+
+    #[test]
+    fn carried_prompt_is_a_static_prefix_only_when_requested() {
+        let tokens = vec![10, 11, 12, 13, 14];
+        let mut params = DecodeParams::default();
+        // Default: the prompt is only the first window's rolling context.
+        assert_eq!(
+            split_carried_prompt(tokens.clone(), &params, 224),
+            (Vec::new(), tokens.clone())
+        );
+        params.carry_initial_prompt = true;
+        assert_eq!(
+            split_carried_prompt(tokens.clone(), &params, 224),
+            (tokens.clone(), Vec::new())
+        );
+        // whisper.cpp keeps the prompt's LAST max(1, ctx - 1) tokens.
+        assert_eq!(
+            split_carried_prompt(tokens.clone(), &params, 4),
+            (vec![12, 13, 14], Vec::new())
+        );
+        assert_eq!(
+            split_carried_prompt(tokens, &params, 1),
+            (vec![14], Vec::new())
+        );
+        assert_eq!(
+            split_carried_prompt(Vec::new(), &params, 224),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn carried_prompt_fills_the_budget_left_by_the_static_prefix() {
+        const PREV: i32 = 50_360;
+        let rolling = [1, 2, 3, 4, 5, 6];
+        // No static prefix: [prev] + the rolling tail within ctx - 1 tokens,
+        // exactly the historical uncarried layout.
+        assert_eq!(
+            carried_prompt_tokens(PREV, &[], &rolling, 4),
+            vec![PREV, 4, 5, 6]
+        );
+        // The static prefix comes first and shrinks the rolling share.
+        assert_eq!(
+            carried_prompt_tokens(PREV, &[90, 91], &rolling, 6),
+            vec![PREV, 90, 91, 4, 5, 6]
+        );
+        // A prefix that fills the budget leaves no rolling tokens.
+        assert_eq!(
+            carried_prompt_tokens(PREV, &[90, 91, 92], &rolling, 4),
+            vec![PREV, 90, 91, 92]
+        );
+        assert_eq!(carried_prompt_tokens(PREV, &[90], &[], 224), vec![PREV, 90]);
     }
 
     #[test]
@@ -5686,7 +7320,59 @@ mod tests {
     }
 
     #[test]
+    fn gated_detect_language_samples_reports_jfk_posterior() {
+        // Model-gated: the `--detect-language-only` entry point must make the
+        // same decision as auto-detection and return a normalized posterior.
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_detect_language_samples: jfk.wav missing");
+            return;
+        };
+        if let Some(path) = super::super::find_model_file("large-v3-turbo") {
+            let m = LoadedModel::from_ggml(GgmlModel::load(&path).expect("load turbo"))
+                .expect("build turbo engine");
+            let detection = detect_language_samples(&m, &samples, &noop).expect("detect");
+            assert!(detection.multilingual);
+            assert_eq!(detection.language, "en");
+            assert_eq!(
+                detection.probabilities[0].0, "en",
+                "argmax leads the posterior"
+            );
+            assert!(
+                detection
+                    .probabilities
+                    .windows(2)
+                    .all(|pair| pair[0].1 >= pair[1].1),
+                "posterior sorted most probable first"
+            );
+            let total: f32 = detection.probabilities.iter().map(|(_, p)| p).sum();
+            assert!((total - 1.0).abs() < 1e-3, "posterior sums to {total}");
+            assert!(
+                detection.probabilities[0].1 > 0.5,
+                "en must dominate JFK: {:?}",
+                &detection.probabilities[..3]
+            );
+        } else {
+            eprintln!("SKIP gated_detect_language_samples(turbo): model missing");
+        }
+        if let Some(path) = super::super::find_model_file("tiny.en") {
+            let m = LoadedModel::from_ggml(GgmlModel::load(&path).expect("load tiny.en"))
+                .expect("build tiny.en engine");
+            let detection = detect_language_samples(&m, &samples, &noop).expect("detect");
+            assert!(
+                !detection.multilingual,
+                "English-only models skip detection"
+            );
+            assert_eq!(detection.language, "en");
+            assert_eq!(detection.probabilities, vec![("en".to_owned(), 1.0)]);
+        }
+    }
+
+    #[test]
     fn gated_language_detect_jfk_turbo_matches_oracle() {
+        if !super::super::implicit_home_models_enabled() {
+            eprintln!("SKIP gated_language_detect: ultra stress mode is disabled");
+            return;
+        }
         // The ONLY coverage of the multilingual language-auto-detect path
         // (detect_language_from_enc, a port of whisper.cpp whisper_lang_auto_detect).
         // Every other on-box test uses English-only tiny.en, which skips detection
@@ -5714,7 +7400,7 @@ mod tests {
         let mel_threads = super::super::host_parallelism().min(16);
         let mel = mel::log_mel(&samples, &m.filters, mel_threads).expect("mel");
         let frames = FRAMES_PER_CHUNK.min(mel.n_frames);
-        let enc = encoder::forward_from_full_mel_window(&m.encoder, &mel, 0, frames, 4, &noop)
+        let (enc, _) = encoder::forward_from_full_mel_window(&m.encoder, &mel, 0, frames, 4, &noop)
             .expect("encode window 0");
         let mut st = DecoderState::new(&m.decoder, &enc).expect("decoder state");
 
@@ -5768,8 +7454,66 @@ mod tests {
         );
     }
 
+    /// DISC-004 regression: JFK ×4 with 1.5 s digital-silence gaps ends in a
+    /// 0.62 s final window. With a truncated tail encoder context turbo
+    /// hallucinated a fifth verbatim copy of the sentence there (47.88-47.90 s);
+    /// whisper.cpp v1.8.2 emits exactly four segments ending at 47.88 s, as the
+    /// default full-context tail must.
+    #[test]
+    fn gated_turbo_tiled_jfk_final_window_emits_no_repeat() {
+        if !super::super::implicit_home_models_enabled() {
+            eprintln!("SKIP gated_turbo_tiled_jfk_tail: ultra stress mode is disabled");
+            return;
+        }
+        let Some(path) = super::super::find_model_file("large-v3-turbo") else {
+            eprintln!("SKIP gated_turbo_tiled_jfk_tail: ggml-large-v3-turbo.bin not found");
+            return;
+        };
+        let Some(jfk) = load_jfk_samples() else {
+            eprintln!("SKIP gated_turbo_tiled_jfk_tail: jfk.wav missing");
+            return;
+        };
+        let gap = vec![0.0_f32; SAMPLE_RATE * 3 / 2];
+        let mut tiled = jfk.clone();
+        for _ in 0..3 {
+            tiled.extend_from_slice(&gap);
+            tiled.extend_from_slice(&jfk);
+        }
+        let model = GgmlModel::load(&path).expect("load turbo");
+        let loaded = LoadedModel::from_ggml(model).expect("build turbo engine");
+        let params = DecodeParams {
+            bypass_transcript_cache: true,
+            ..e2e_params()
+        };
+        let out = transcribe_samples(&loaded, &tiled, &params, &noop)
+            .expect("transcribe tiled jfk on turbo");
+        let country: usize = out
+            .segments
+            .iter()
+            .map(|s| s.text.to_lowercase().matches("country").count())
+            .sum();
+        assert_eq!(
+            country, 8,
+            "four spoken sentences must render exactly four times: {:?}",
+            out.segments
+        );
+        let last_end = out
+            .segments
+            .last()
+            .and_then(|s| s.end_sec)
+            .expect("timed segments");
+        assert!(
+            (last_end - 47.88).abs() <= 0.1,
+            "final segment must end where the speech does (wc 47.88 s), got {last_end}"
+        );
+    }
+
     #[test]
     fn gated_e2e_jfk_large_v3_turbo_no_ts_matches_oracle() {
+        if !super::super::implicit_home_models_enabled() {
+            eprintln!("SKIP gated_e2e_turbo_no_ts: ultra stress mode is disabled");
+            return;
+        }
         // Faithfulness has a MODE axis (ts / no_ts / word-ts); the flagship was
         // only proven in TS mode. no_ts uses a different SOT (`sot, <|en|>,
         // <|transcribe|>, <|notimestamps|>`) and suppresses ALL timestamp logits —
@@ -5859,6 +7603,10 @@ mod tests {
 
     #[test]
     fn gated_e2e_jfk_large_v3_turbo_autodetect_transcribes() {
+        if !super::super::implicit_home_models_enabled() {
+            eprintln!("SKIP gated_e2e_turbo_autodetect: ultra stress mode is disabled");
+            return;
+        }
         // The full multilingual pipeline end to end on the FLAGSHIP: encode →
         // auto-detect language → build the multilingual SOT (sot, <|en|>,
         // <|transcribe|>) → decode. Every other e2e test uses English-only tiny.en
@@ -6201,8 +7949,8 @@ mod tests {
         // Exercise two physical decodes. Calling `transcribe_samples` twice on
         // one model would make the second result an exact-cache hit and prove
         // only that the cache can clone its first answer.
-        let a = transcribe_samples_uncached(&model, &samples, &params, &noop).expect("run a");
-        let b = transcribe_samples_uncached(&model, &samples, &params, &noop).expect("run b");
+        let a = transcribe_samples_uncached(&model, &samples, &params, &noop, None).expect("run a");
+        let b = transcribe_samples_uncached(&model, &samples, &params, &noop, None).expect("run b");
         assert_eq!(a.segments.len(), b.segments.len(), "segment count");
         for (index, (left, right)) in a.segments.iter().zip(&b.segments).enumerate() {
             assert_eq!(left.start_sec, right.start_sec, "segment {index} start");
@@ -6264,18 +8012,19 @@ mod tests {
         );
     }
 
-    /// Gated end-to-end DTW word-timestamp check (bd-rjsx).
+    /// Gated end-to-end DTW word-timestamp check (bd-rjsx, bd-dtw-word-lag-10ov).
     ///
-    /// Verified reference (whisper-cli `-m ggml-tiny.en.bin -f jfk.wav -ml 1
-    /// --no-prints` and `-dtw tiny.en`, run 2026-06-04): the JFK clip contains
-    /// the word "ask" twice — first occurrence starts at **3.29 s**, second at
-    /// **7.96 s**. The bead's sanity band [7.0, 9.5] s references the *second*
-    /// "ask"; that band is the hard requirement and our native DTW lands the
-    /// second "ask" at **≈8.66 s** (observed 2026-06-04), inside it. For the
-    /// first "ask", our native engine's DTW lands it at **≈3.88 s** — within
-    /// ~0.6 s of whisper-cli's 3.29 s reference, the expected small drift
-    /// between our pure-Rust forward pass and whisper.cpp's; we bound it with a
-    /// ±0.75 s band around the reference.
+    /// Reference: whisper.cpp 1.8.6's own DTW, `whisper-cli -m ggml-tiny.en.bin
+    /// -f jfk.wav --dtw tiny.en -nfa -ojf` (2026-10-08). Its per-token `t_dtw`
+    /// is the token's END, so a word spans the previous token's `t_dtw` to its
+    /// last token's: the first "ask" spans **2.26-3.88 s** and the second
+    /// **8.02-8.66 s**. The native engine matched every word within 0.02 s
+    /// except the clip's last end (x86_64 int8 encoder, 2026-10-08). Before
+    /// bd-dtw-word-lag-10ov the native rows started one token late and each word
+    /// carried the next token's interval (first "ask" 3.88-4.56 s), which a
+    /// ±0.2 s band rejects. (The older 3.29 s / 7.96 s figures came from
+    /// whisper-cli's non-DTW `-ml 1` timestamps, a different method.) The
+    /// bead's sanity band [7.0, 9.5] s for the second "ask" still holds.
     #[test]
     fn gated_e2e_dtw_word_timestamps_jfk_tiny_en() {
         let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
@@ -6330,34 +8079,35 @@ mod tests {
         }
 
         // Find the two "ask" occurrences (normalize punctuation/case).
-        let asks: Vec<f64> = words
+        let asks: Vec<(f64, f64)> = words
             .iter()
             .filter(|w| {
                 w.text
                     .trim_matches(|c: char| !c.is_alphanumeric())
                     .eq_ignore_ascii_case("ask")
             })
-            .map(|w| w.start_sec)
+            .map(|w| (w.start_sec, w.end_sec))
             .collect();
         assert!(
             asks.len() >= 2,
             "expected two 'ask' occurrences, got {asks:?}"
         );
 
-        // First "ask" ≈ 3.29 s whisper-cli reference (native observed ≈3.88 s);
-        // ±0.75 s band covers the cross-implementation drift.
-        assert!(
-            (asks[0] - 3.29).abs() <= 0.75,
-            "first 'ask' start {} not within 3.29 ± 0.75 s",
-            asks[0]
-        );
+        // Both "ask" intervals within ±0.2 s of whisper.cpp's DTW, at both
+        // ends: a one-token lag moves the first by 1.6 s.
+        for (index, (actual, reference)) in
+            asks.iter().zip([(2.26, 3.88), (8.02, 8.66)]).enumerate()
+        {
+            assert!(
+                (actual.0 - reference.0).abs() <= 0.2 && (actual.1 - reference.1).abs() <= 0.2,
+                "'ask' #{index} spans {actual:?}, not within ±0.2 s of whisper.cpp DTW {reference:?}"
+            );
+        }
         // Second "ask" — the bead's hard requirement: inside [7.0, 9.5] s.
-        // whisper-cli reference 7.96 s; our native DTW observed ≈8.66 s
-        // (2026-06-04), both comfortably inside the band.
         assert!(
-            (7.0..=9.5).contains(&asks[1]),
+            (7.0..=9.5).contains(&asks[1].0),
             "second 'ask' {} outside the bead's sanity band [7.0, 9.5]",
-            asks[1]
+            asks[1].0
         );
     }
 
@@ -6571,7 +8321,7 @@ mod tests {
                     "STAGE=mel diverged (iteration {it})"
                 );
                 let frames = FRAMES_PER_CHUNK.min(mel_a.n_frames);
-                let enc_a = encoder::forward_from_full_mel_window(
+                let (enc_a, _) = encoder::forward_from_full_mel_window(
                     &model.encoder,
                     &mel_a,
                     0,
@@ -6580,7 +8330,7 @@ mod tests {
                     &noop,
                 )
                 .unwrap();
-                let enc_b = encoder::forward_from_full_mel_window(
+                let (enc_b, _) = encoder::forward_from_full_mel_window(
                     &model.encoder,
                     &mel_a,
                     0,
@@ -6604,5 +8354,40 @@ mod tests {
             }
             stop.store(true, Ordering::Relaxed);
         });
+    }
+
+    /// bd-4ep1: cross-platform STAGE fingerprints on the real jfk.wav with
+    /// the real tiny.en model. Our own kernels must be platform-consistent:
+    /// identical bits on aarch64 macOS and x86_64 Linux. The first stage
+    /// whose fingerprints DIFFER localizes where the tie-flip epsilon enters
+    /// (tiled jfk flips one token at step 60 between platforms).
+    #[test]
+    fn bd_4ep1_stage_fingerprints_cross_platform() {
+        let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP bd_4ep1_stage_fingerprints: tiny.en model or jfk.wav missing");
+            return;
+        };
+        let fp = |label: &str, slice: &[f32]| {
+            let h = slice.iter().fold(0xC0FFEEu64, |acc, f| {
+                acc.rotate_left(7) ^ (f.to_bits() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            });
+            eprintln!("FP-{label} len={} {:016x}", slice.len(), h);
+        };
+
+        // STAGE 1: log-mel frontend over the full clip.
+        let full = mel::log_mel(&samples, &model.filters, 4).expect("mel");
+        eprintln!(
+            "FP-MELDIM frames={} bins={}",
+            full.n_frames,
+            full.data.len() / full.n_frames.max(1)
+        );
+        fp("MEL", &full.data);
+
+        // STAGE 2: encoder over the first 30 s chunk.
+        let frames = FRAMES_PER_CHUNK.min(full.n_frames);
+        let (enc, _) =
+            encoder::forward_from_full_mel_window(&model.encoder, &full, 0, frames, 4, &noop)
+                .expect("encoder");
+        fp("ENC", &enc.data);
     }
 }

@@ -43,16 +43,22 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::conformance::DTW_PROJECTION_SCHEMA_VERSION;
-use crate::conformance::{CANONICAL_PROJECTION_EPSILON_SEC, CANONICAL_PROJECTION_MIN_DURATION_SEC};
+#[cfg(test)]
+use crate::diarization_projection::CanonicalProjectionUnit;
+use crate::diarization_projection::{
+    CANONICAL_PROJECTION_EPSILON_SEC, CANONICAL_PROJECTION_MIN_DURATION_SEC,
+    ProjectionUnitProvenance, normalize_dtw_projection_units,
+};
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    BackendKind, DiarizationEngine, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
-    WordTimestampParams,
+    BackendKind, DiarizationEngine, TimestampLevel, TranscribeRequest, TranscriptionResult,
+    TranscriptionSegment, WordTimestampParams,
 };
 use crate::native_engine::dtw::WordTiming;
-use crate::native_engine::{self, NativeWhisperModel, WhisperHParams, decode};
+use crate::native_engine::{self, WhisperHParams, decode};
 
 use super::native_audio::analyze_wav;
+use super::{requested_audio_window, shift_decode_output, tag_audio_window, windowed_samples};
 
 /// Stable schema tag for the honest native raw-output metadata.
 const SCHEMA_VERSION: &str = "native-v2";
@@ -69,62 +75,6 @@ pub(crate) enum WordTimestampMode {
     Word,
     /// Split into words, then regroup runs of words up to `max_len` characters.
     MaxLen(u32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionUnitProvenance {
-    DecoderWordTimestamp,
-    SegmentInterpolationFallback,
-    SegmentGeometryFallback,
-}
-
-impl ProjectionUnitProvenance {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::DecoderWordTimestamp => "decoder_word_timestamp",
-            Self::SegmentInterpolationFallback => "segment_interpolation_fallback",
-            Self::SegmentGeometryFallback => "segment_geometry_fallback",
-        }
-    }
-
-    const fn supported_labels() -> [&'static str; 3] {
-        [
-            Self::DecoderWordTimestamp.as_str(),
-            Self::SegmentInterpolationFallback.as_str(),
-            Self::SegmentGeometryFallback.as_str(),
-        ]
-    }
-}
-
-/// One unambiguous transcript unit accepted by acoustic projection.
-///
-/// Times are finite seconds and describe a positive half-open interval
-/// `[start_sec, end_sec)`. Units are ordered and non-overlapping. Provenance is
-/// retained independently of the text-bearing public segment representation.
-#[derive(Debug, Clone, PartialEq)]
-struct CanonicalProjectionUnit {
-    start_sec: f64,
-    end_sec: f64,
-    text: String,
-    confidence: Option<f64>,
-    source_segment_index: usize,
-    source_word_start_index: usize,
-    source_word_end_index: usize,
-    provenance: ProjectionUnitProvenance,
-    was_clamped: bool,
-    was_expanded: bool,
-}
-
-impl CanonicalProjectionUnit {
-    fn as_segment(&self) -> TranscriptionSegment {
-        TranscriptionSegment {
-            start_sec: Some(self.start_sec),
-            end_sec: Some(self.end_sec),
-            text: self.text.clone(),
-            speaker: None,
-            confidence: self.confidence,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,57 +137,154 @@ impl DtwProjectionReport {
 #[derive(Debug, Clone)]
 struct DtwSegmentsOutcome {
     segments: Vec<TranscriptionSegment>,
+    /// Engine segment each output unit came from (1:1 with `segments` unless
+    /// a `MaxLen` grouping merged units).
+    unit_source_segments: Vec<usize>,
     #[cfg(test)]
     canonical_units: Vec<CanonicalProjectionUnit>,
     report: DtwProjectionReport,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionNormalizationErrorReason {
-    ExtraTimingSegments,
-    ParentTimestampPair,
-    ParentTimestampNonFinite,
-    ParentTimestampNegative,
-    ParentDuration,
-    ParentOverlap,
-    WordTimestampNonFinite,
-    WordTimestampNegative,
-    WordTimestampReversed,
-    WordOrderReversed,
-    WordOverlap,
-    CanonicalInvariant,
+/// `raw_output` key of the [`DiarizationWordUnitPlan`].
+pub(crate) const DIARIZATION_WORD_UNITS_KEY: &str = "diarization_word_units";
+
+/// How the per-word units emitted only so native diarization can attribute
+/// speakers word by word map back onto the engine's own segments.
+///
+/// The caller did not ask for word-level output, so once speakers are
+/// attributed the orchestrator collapses the units back with [`Self::regroup`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DiarizationWordUnitPlan {
+    /// Number of word units the backend emitted.
+    pub(crate) units: usize,
+    /// One entry per engine segment that produced units, in order.
+    pub(crate) segments: Vec<EngineSegmentUnits>,
 }
 
-impl ProjectionNormalizationErrorReason {
-    const fn code(self) -> &'static str {
-        match self {
-            Self::ExtraTimingSegments => "FW-DTW-PROJECTION-EXTRA-SEGMENTS",
-            Self::ParentTimestampPair => "FW-DTW-PROJECTION-PARENT-PAIR",
-            Self::ParentTimestampNonFinite => "FW-DTW-PROJECTION-PARENT-NONFINITE",
-            Self::ParentTimestampNegative => "FW-DTW-PROJECTION-PARENT-NEGATIVE",
-            Self::ParentDuration => "FW-DTW-PROJECTION-PARENT-DURATION",
-            Self::ParentOverlap => "FW-DTW-PROJECTION-PARENT-OVERLAP",
-            Self::WordTimestampNonFinite => "FW-DTW-PROJECTION-WORD-NONFINITE",
-            Self::WordTimestampNegative => "FW-DTW-PROJECTION-WORD-NEGATIVE",
-            Self::WordTimestampReversed => "FW-DTW-PROJECTION-WORD-REVERSED",
-            Self::WordOrderReversed => "FW-DTW-PROJECTION-WORD-ORDER",
-            Self::WordOverlap => "FW-DTW-PROJECTION-WORD-OVERLAP",
-            Self::CanonicalInvariant => "FW-DTW-PROJECTION-CANONICAL-INVARIANT",
+/// One engine segment and the contiguous word-unit range it produced.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EngineSegmentUnits {
+    pub(crate) unit_start: usize,
+    pub(crate) unit_end: usize,
+    pub(crate) start_sec: Option<f64>,
+    pub(crate) end_sec: Option<f64>,
+    pub(crate) text: String,
+}
+
+impl DiarizationWordUnitPlan {
+    /// Plan from the engine segments and each unit's source segment index;
+    /// `None` if an index does not name an engine segment.
+    fn new(
+        engine_segments: &[TranscriptionSegment],
+        unit_source_segments: &[usize],
+    ) -> Option<Self> {
+        let mut segments = Vec::new();
+        let mut unit_start = 0;
+        while let Some(&source) = unit_source_segments.get(unit_start) {
+            let run = unit_source_segments[unit_start..]
+                .iter()
+                .take_while(|&&index| index == source)
+                .count();
+            let engine = engine_segments.get(source)?;
+            segments.push(EngineSegmentUnits {
+                unit_start,
+                unit_end: unit_start + run,
+                start_sec: engine.start_sec,
+                end_sec: engine.end_sec,
+                text: engine.text.trim().to_owned(),
+            });
+            unit_start += run;
         }
+        Some(Self {
+            units: unit_source_segments.len(),
+            segments,
+        })
+    }
+
+    /// Collapse speaker-attributed word units into the engine's segments,
+    /// split only where the attributed speaker changes. A run covering a whole
+    /// engine segment keeps that segment's text and timestamps; a split keeps
+    /// the engine bounds at the segment's outer edges and the word units'
+    /// times at the speaker change.
+    ///
+    /// Returns `None` (keep the units) when `units` no longer has the shape
+    /// this plan describes.
+    pub(crate) fn regroup(
+        &self,
+        units: &[TranscriptionSegment],
+    ) -> Option<Vec<TranscriptionSegment>> {
+        let mut expected_start = 0;
+        for segment in &self.segments {
+            if segment.unit_start != expected_start || segment.unit_end <= segment.unit_start {
+                return None;
+            }
+            expected_start = segment.unit_end;
+        }
+        if expected_start != self.units || units.len() != self.units {
+            return None;
+        }
+
+        let mut regrouped = Vec::with_capacity(self.segments.len());
+        for segment in &self.segments {
+            let words = &units[segment.unit_start..segment.unit_end];
+            // Spaced scripts rejoin words with a space; unspaced ones do not.
+            let separator = if segment.text.contains(char::is_whitespace) {
+                " "
+            } else {
+                ""
+            };
+            let mut run_start = 0;
+            while run_start < words.len() {
+                let speaker = &words[run_start].speaker;
+                let run_end = run_start
+                    + words[run_start..]
+                        .iter()
+                        .take_while(|word| &word.speaker == speaker)
+                        .count();
+                let run = &words[run_start..run_end];
+                let whole = run_start == 0 && run_end == words.len();
+                let confidences: Vec<f64> = run.iter().filter_map(|word| word.confidence).collect();
+                regrouped.push(TranscriptionSegment {
+                    start_sec: if run_start == 0 {
+                        segment.start_sec
+                    } else {
+                        run[0].start_sec
+                    },
+                    end_sec: if run_end == words.len() {
+                        segment.end_sec
+                    } else {
+                        run[run.len() - 1].end_sec
+                    },
+                    text: if whole {
+                        segment.text.clone()
+                    } else {
+                        run.iter()
+                            .map(|word| word.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join(separator)
+                    },
+                    speaker: speaker.clone(),
+                    confidence: run_confidence(&confidences),
+                });
+                run_start = run_end;
+            }
+        }
+        Some(regrouped)
     }
 }
 
-fn projection_normalization_error(
-    reason: ProjectionNormalizationErrorReason,
-    segment_index: usize,
-    word_index: Option<usize>,
-    detail: impl std::fmt::Display,
-) -> FwError {
-    let word = word_index.map_or_else(String::new, |index| format!(" word={index}"));
-    FwError::InvalidRequest(format!(
-        "dtw projection normalization [{}]: segment={segment_index}{word} {detail}",
-        reason.code()
-    ))
+/// The confidence of one regrouped run: the mean of its words' values, or
+/// `None` when no word has one. Every word unit of an engine segment carries
+/// that segment's value, so a uniform run returns the value itself: summing n
+/// copies and dividing by n can drift by an ulp (`(0.1 + 0.1 + 0.1) / 3` is
+/// `0.10000000000000002`), which made `acceleration.raw_confidences` differ
+/// from the backend's own value after a diarization regroup.
+fn run_confidence(confidences: &[f64]) -> Option<f64> {
+    let (&first, rest) = confidences.split_first()?;
+    if rest.iter().all(|value| value.to_bits() == first.to_bits()) {
+        return Some(first);
+    }
+    Some(confidences.iter().sum::<f64>() / confidences.len() as f64)
 }
 
 /// Map the request's [`WordTimestampParams`] to a [`WordTimestampMode`].
@@ -262,6 +309,32 @@ pub(crate) fn word_timestamp_mode(params: Option<&WordTimestampParams>) -> WordT
         WordTimestampMode::Word
     } else {
         WordTimestampMode::None
+    }
+}
+
+/// The word-timestamp mode a request asks for: its explicit
+/// `word_timestamps` params, else whisper.cpp's `--max-segment-length`
+/// (`-ml N`: 1 = one word per segment, N > 1 = segments of at most N
+/// characters, regrouped at word boundaries like `-ml N -sow`).
+pub(crate) fn request_word_timestamp_mode(request: &TranscribeRequest) -> WordTimestampMode {
+    if let Some(params) = request.backend_params.word_timestamps.as_ref() {
+        return word_timestamp_mode(Some(params));
+    }
+    let max_segment_length = request
+        .backend_params
+        .decoding
+        .as_ref()
+        .and_then(|decoding| decoding.max_segment_length);
+    match max_segment_length {
+        Some(max_len) => word_timestamp_mode(Some(&WordTimestampParams {
+            max_len: Some(max_len),
+            ..WordTimestampParams::default()
+        })),
+        // insanely-fast-whisper's `--timestamp-level word`: one segment per word.
+        None if request.backend_params.timestamp_level == Some(TimestampLevel::Word) => {
+            WordTimestampMode::Word
+        }
+        None => WordTimestampMode::None,
     }
 }
 
@@ -460,23 +533,14 @@ pub(crate) fn capability_probe() -> NativeProbe {
     }
 }
 
-/// Resolve the effective model spec for a request, or a [`FwError`] explaining
-/// how to provision one.
-///
 /// Precedence: `request.model` (when set), then
 /// `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then the authenticated default
-/// release package. If none resolves, returns an actionable
-/// [`FwError::BackendUnavailable`].
-fn effective_model_spec(request: &TranscribeRequest) -> FwResult<String> {
+/// release-package sentinel. Authentication happens once at execution.
+fn effective_model_spec(request: &TranscribeRequest) -> String {
     if let Some(model) = request.model.clone().filter(|m| !m.is_empty()) {
-        return Ok(model);
+        return model;
     }
-    native_engine::configured_or_release_model_spec().map_err(|error| {
-        FwError::BackendUnavailable(format!(
-            "native whisper.cpp engine has no usable local model: pass --model, or set \
-             $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. {error}"
-        ))
-    })
+    native_engine::configured_or_release_model_spec()
 }
 
 /// Build the [`decode::DecodeParams`] for a request.
@@ -489,13 +553,8 @@ fn decode_params(
     want_dtw_words: bool,
     spec: &str,
 ) -> decode::DecodeParams {
-    let n_threads = request
-        .backend_params
-        .threads
-        .map_or_else(native_engine::default_threads, |t| {
-            usize::try_from(t).unwrap_or_else(|_| native_engine::default_threads())
-        });
-    decode::DecodeParams {
+    let n_threads = super::request_compute_threads(request);
+    let mut params = decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
         // Initial prompt (whisper `--prompt`): the engine tokenizes it and seeds
@@ -505,6 +564,8 @@ fn decode_params(
             .prompt
             .clone()
             .filter(|p| !p.is_empty()),
+        // whisper `--carry-initial-prompt`: the prompt prefixes every window.
+        carry_initial_prompt: request.backend_params.carry_initial_prompt,
         // Beam width (whisper `--beam-size`): the engine beam-searches temp-0
         // windows when > 1; the decoder clamps to [1, 8]. None → greedy.
         beam_size: request
@@ -533,7 +594,15 @@ fn decode_params(
         } else {
             None
         },
-    }
+        // Full encoder context unless the request passes `--audio-ctx`
+        // (applied by `apply_native_decode_controls` below).
+        audio_ctx: decode::AudioCtxPolicy::Full,
+        bypass_transcript_cache: false,
+        record_token_attn: false,
+        ..decode::DecodeParams::default()
+    };
+    super::apply_native_decode_controls(&mut params, request);
+    params
 }
 
 /// Bridge an optional orchestrator [`CancellationToken`] into the engine's
@@ -559,6 +628,20 @@ fn checkpoint_for(
 pub fn run(
     request: &TranscribeRequest,
     normalized_wav: &Path,
+    work_dir: &Path,
+    timeout: Duration,
+    token: Option<&crate::orchestrator::CancellationToken>,
+) -> FwResult<TranscriptionResult> {
+    // `--threads` bounds the model load and the decode alike
+    // (bd-threads-flag-unbounded-f4pq).
+    native_engine::with_compute_threads(super::request_compute_threads(request), || {
+        run_in_compute_pool(request, normalized_wav, work_dir, timeout, token)
+    })?
+}
+
+fn run_in_compute_pool(
+    request: &TranscribeRequest,
+    normalized_wav: &Path,
     _work_dir: &Path,
     _timeout: Duration,
     token: Option<&crate::orchestrator::CancellationToken>,
@@ -568,9 +651,9 @@ pub fn run(
         tok.checkpoint()?;
     }
 
-    // Resolve the model spec up front so an unavailability error is reported
-    // before any expensive work.
-    let spec = effective_model_spec(request)?;
+    // Select the model spec up front. Package authentication stays below the
+    // silence pre-gate so silent clips avoid hashing multi-GB weights.
+    let spec = effective_model_spec(request);
 
     // Requested audio window (bd-vgod): `--offset-ms` / `--duration-ms` slice
     // the normalized PCM before decode, so wall-clock scales with the slice.
@@ -594,49 +677,55 @@ pub fn run(
     }
 
     // Resolve + load the model (cached). A resolution miss here is unavailable.
-    let model_path = native_engine::resolve_model(&spec)
-        .map_err(|e| FwError::BackendUnavailable(e.to_string()))?;
-    let model = NativeWhisperModel::load(&model_path)?;
+    let is_cancelled = || token.is_some_and(|token| token.checkpoint().is_err());
+    let model_source = native_engine::resolve_model_source_with_cancel(&spec, &is_cancelled)
+        .map_err(|error| match error {
+            error @ FwError::Cancelled(_) => token
+                .and_then(|token| token.checkpoint().err())
+                .unwrap_or(error),
+            error @ FwError::StageTimeout { .. } => error,
+            other => FwError::BackendUnavailable(format!(
+                "{other}; select a model with --model or FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL, or provision the default with `fw pull whisper`"
+            )),
+        })?;
+    let model_path = model_source.path().to_path_buf();
+    let checkpoint = checkpoint_for(token);
+    let model = model_source.load_with_checkpoint(&checkpoint)?;
 
     // Read the normalized WAV to f32 mono samples, then apply the requested
     // window. Timestamps are shifted back into the source timebase after
     // decode so diarization/VAD/alignment stay consistent with the full clip.
-    let full_samples = read_normalized_wav(normalized_wav)?;
-    let (samples, window_offset_ms) = match audio_window {
-        Some((offset_ms, duration_ms)) => {
-            let (start, end) = window_sample_bounds(full_samples.len(), offset_ms, duration_ms);
-            if start >= end {
-                // Offset at/past EOF: an empty-but-valid result, honestly
-                // tagged with the requested (empty) window, beats a decode
-                // error for a region probe.
-                let mut result = silence_result(request, &spec, 0);
-                if let Value::Object(map) = &mut result.raw_output {
-                    map.insert(
-                        "audio_window".to_owned(),
-                        json!({
-                            "offset_ms": offset_ms,
-                            "duration_ms": duration_ms,
-                            "timebase": "source",
-                            "empty_slice": true,
-                        }),
-                    );
-                }
-                return Ok(result);
-            }
-            (full_samples[start..end].to_vec(), offset_ms)
-        }
-        None => (full_samples, 0),
+    let Some((samples, window_offset_ms)) =
+        windowed_samples(read_normalized_wav(normalized_wav)?, audio_window)
+    else {
+        // Offset at/past EOF: an empty-but-valid result, honestly tagged with
+        // the requested (empty) window, beats a decode error for a region probe.
+        let mut result = silence_result(request, &spec, 0);
+        tag_audio_window(&mut result.raw_output, audio_window, true);
+        return Ok(result);
     };
 
     if let Some(tok) = token {
         tok.checkpoint()?;
     }
 
+    // `--detect-language-only` (whisper `--detect-language`): report the
+    // detected language and its posterior without decoding any text.
+    if request.backend_params.detect_language_only {
+        let detection = model.detect_language(&samples, &checkpoint)?;
+        return Ok(super::native_language_detection_result(
+            BackendKind::WhisperCpp,
+            "whisper.cpp-native",
+            &spec,
+            &detection,
+        ));
+    }
+
     // Word-timestamp policy: decide whether to ask the engine for real
     // attention-DTW word times. DTW runs when per-word output is requested
     // (a word/maxlen split or `split_on_word`) — the engine then records
     // cross-attention and aligns each word to audio frames (bd-rjsx).
-    let word_mode = word_timestamp_mode(request.backend_params.word_timestamps.as_ref());
+    let word_mode = request_word_timestamp_mode(request);
     let native_acoustic_diarization = native_acoustic_diarization_requested(request);
     let want_words = word_mode != WordTimestampMode::None
         || request.backend_params.split_on_word
@@ -645,7 +734,6 @@ pub fn run(
     let want_dtw = want_words && !request.backend_params.no_timestamps;
 
     let params = decode_params(request, want_dtw, &spec);
-    let checkpoint = checkpoint_for(token);
     let mut output = model.transcribe(&samples, &params, &checkpoint)?;
 
     // Shift every emitted timestamp back into the source-file timebase so a
@@ -661,7 +749,7 @@ pub fn run(
         .word_timings
         .as_ref()
         .filter(|w| w.iter().any(|seg| !seg.is_empty()));
-    let (segments, dtw_projection) = if let Some(word_timings) = dtw_words {
+    let (segments, dtw_projection, word_unit_plan) = if let Some(word_timings) = dtw_words {
         let outcome = build_segments_dtw(
             &output.segments,
             word_timings,
@@ -669,7 +757,13 @@ pub fn run(
             request.backend_params.no_timestamps,
             token,
         )?;
-        (outcome.segments, Some(outcome.report))
+        // Word units the caller did not ask for exist only so diarization can
+        // attribute speakers per word; record how to collapse them afterwards.
+        let word_unit_plan = (word_mode == WordTimestampMode::None
+            && !request.backend_params.split_on_word)
+            .then(|| DiarizationWordUnitPlan::new(&output.segments, &outcome.unit_source_segments))
+            .flatten();
+        (outcome.segments, Some(outcome.report), word_unit_plan)
     } else {
         (
             build_segments(
@@ -680,13 +774,14 @@ pub fn run(
                 token,
             )?,
             None,
+            None,
         )
     };
     let transcript = super::transcript_from_segments(&segments);
     let language = output.language.clone().or_else(|| request.language.clone());
 
     let t_tag = std::time::Instant::now();
-    let version_tag = model.version_tag();
+    let version_tag = model.version_tag_with_checkpoint(&checkpoint)?;
     crate::native_engine::perf_span("version_tag", t_tag.elapsed().as_secs_f64() * 1e3, "");
     crate::native_engine::perf_span("backend_run", t_backend.elapsed().as_secs_f64() * 1e3, "");
     let mut raw_output = raw_output_json(
@@ -702,24 +797,9 @@ pub fn run(
         false,
         dtw_projection.as_ref(),
     );
-    if let (Value::Object(map), Some((offset_ms, duration_ms))) = (&mut raw_output, audio_window) {
-        map.insert(
-            "audio_window".to_owned(),
-            json!({
-                "offset_ms": offset_ms,
-                "duration_ms": duration_ms,
-                "timebase": "source",
-            }),
-        );
-    }
-    // Additive native-v2 route provenance: which encoder route actually ran
-    // (gpu_fused vs cpu:<decline reason>). A silent GPU->CPU fallback is
-    // invisible without this.
-    if let Value::Object(map) = &mut raw_output {
-        map.insert(
-            "encoder_route".to_owned(),
-            json!(native_engine::encoder::last_encoder_route()),
-        );
+    tag_audio_window(&mut raw_output, audio_window, false);
+    if let (Value::Object(map), Some(plan)) = (&mut raw_output, word_unit_plan) {
+        map.insert(DIARIZATION_WORD_UNITS_KEY.to_owned(), json!(plan));
     }
 
     Ok(TranscriptionResult {
@@ -833,91 +913,25 @@ fn build_segments_dtw(
     no_timestamps: bool,
     token: Option<&crate::orchestrator::CancellationToken>,
 ) -> FwResult<DtwSegmentsOutcome> {
-    if word_timings.len() > engine_segments.len() {
-        return Err(projection_normalization_error(
-            ProjectionNormalizationErrorReason::ExtraTimingSegments,
-            engine_segments.len(),
-            None,
-            format_args!(
-                "received {} timing vectors for {} engine segments",
-                word_timings.len(),
-                engine_segments.len()
-            ),
-        ));
-    }
-
-    let mut canonical_units = Vec::new();
+    let normalized = normalize_dtw_projection_units(engine_segments, word_timings, || {
+        token.map_or(Ok(()), crate::orchestrator::CancellationToken::checkpoint)
+    })?;
     let mut report = DtwProjectionReport {
         input_engine_segments: engine_segments.len(),
-        input_timed_segments: 0,
-        canonical_units: 0,
+        input_timed_segments: normalized.input_timed_segments,
+        canonical_units: normalized.segments.len(),
         output_segments: 0,
-        decoder_word_units: 0,
-        interpolated_fallback_units: 0,
-        segment_geometry_fallback_units: 0,
-        interpolated_fallback_segments: 0,
-        segment_geometry_fallback_segments: 0,
-        clamped_units: 0,
-        expanded_units: 0,
+        decoder_word_units: normalized.decoder_word_units,
+        interpolated_fallback_units: normalized.interpolated_fallback_units,
+        segment_geometry_fallback_units: normalized.segment_geometry_fallback_units,
+        interpolated_fallback_segments: normalized.interpolated_fallback_segments,
+        segment_geometry_fallback_segments: normalized.segment_geometry_fallback_segments,
+        clamped_units: normalized.clamped_units,
+        expanded_units: normalized.expanded_units,
         timestamps_suppressed: no_timestamps,
-        word_aligned_safe: !no_timestamps,
+        word_aligned_safe: !no_timestamps && normalized.word_aligned_safe,
     };
-    let mut previous_parent_end = None;
-
-    for (idx, segment) in engine_segments.iter().enumerate() {
-        if let Some(tok) = token {
-            tok.checkpoint()?;
-        }
-
-        let (parent_start, parent_end) =
-            canonical_parent_bounds(segment, idx, previous_parent_end)?;
-        previous_parent_end = Some(parent_end);
-        match word_timings.get(idx) {
-            Some(timed) if !timed.is_empty() => {
-                report.input_timed_segments += 1;
-                validate_raw_word_geometry(timed, idx)?;
-                normalize_timed_segment(
-                    segment,
-                    timed,
-                    idx,
-                    parent_start,
-                    parent_end,
-                    &mut canonical_units,
-                    &mut report,
-                );
-            }
-            _ => {
-                append_interpolated_fallback(
-                    segment,
-                    idx,
-                    parent_start,
-                    parent_end,
-                    &mut canonical_units,
-                    &mut report,
-                );
-            }
-        }
-    }
-
-    validate_canonical_projection_units(&canonical_units)?;
-    report.canonical_units = canonical_units.len();
-    for unit in &canonical_units {
-        match unit.provenance {
-            ProjectionUnitProvenance::DecoderWordTimestamp => report.decoder_word_units += 1,
-            ProjectionUnitProvenance::SegmentInterpolationFallback => {
-                report.interpolated_fallback_units += 1;
-            }
-            ProjectionUnitProvenance::SegmentGeometryFallback => {
-                report.segment_geometry_fallback_units += 1;
-            }
-        }
-        report.clamped_units += usize::from(unit.was_clamped);
-        report.expanded_units += usize::from(unit.was_expanded);
-    }
-    let words = canonical_units
-        .iter()
-        .map(CanonicalProjectionUnit::as_segment)
-        .collect::<Vec<_>>();
+    let words = normalized.segments;
     let segments = match word_mode {
         WordTimestampMode::MaxLen(max_len) if max_len > 1 => {
             group_word_segments_by_len(&words, max_len, token)?
@@ -929,289 +943,11 @@ fn build_segments_dtw(
 
     Ok(DtwSegmentsOutcome {
         segments,
+        unit_source_segments: normalized.unit_source_segments,
         #[cfg(test)]
-        canonical_units,
+        canonical_units: normalized.canonical_units,
         report,
     })
-}
-
-fn canonical_parent_bounds(
-    segment: &TranscriptionSegment,
-    segment_index: usize,
-    previous_parent_end: Option<f64>,
-) -> FwResult<(f64, f64)> {
-    let (mut start, end) = match (segment.start_sec, segment.end_sec) {
-        (Some(start), Some(end)) => (start, end),
-        _ => {
-            return Err(projection_normalization_error(
-                ProjectionNormalizationErrorReason::ParentTimestampPair,
-                segment_index,
-                None,
-                "parent segment requires paired timestamps",
-            ));
-        }
-    };
-    if !start.is_finite() || !end.is_finite() {
-        return Err(projection_normalization_error(
-            ProjectionNormalizationErrorReason::ParentTimestampNonFinite,
-            segment_index,
-            None,
-            "parent timestamps must be finite",
-        ));
-    }
-    if start < 0.0 || end < 0.0 {
-        return Err(projection_normalization_error(
-            ProjectionNormalizationErrorReason::ParentTimestampNegative,
-            segment_index,
-            None,
-            "parent timestamps must be non-negative",
-        ));
-    }
-    if let Some(previous_end) = previous_parent_end
-        && start < previous_end
-    {
-        if start + CANONICAL_PROJECTION_EPSILON_SEC < previous_end {
-            return Err(projection_normalization_error(
-                ProjectionNormalizationErrorReason::ParentOverlap,
-                segment_index,
-                None,
-                "parent segment materially overlaps its predecessor",
-            ));
-        }
-        start = previous_end;
-    }
-    if end <= start {
-        return Err(projection_normalization_error(
-            ProjectionNormalizationErrorReason::ParentDuration,
-            segment_index,
-            None,
-            "parent segment must retain positive duration after adjacency normalization",
-        ));
-    }
-    Ok((start, end))
-}
-
-fn validate_raw_word_geometry(words: &[WordTiming], segment_index: usize) -> FwResult<()> {
-    let mut previous_start = None;
-    let mut previous_end = None;
-    for (word_index, word) in words.iter().enumerate() {
-        if !word.start_sec.is_finite() || !word.end_sec.is_finite() {
-            return Err(projection_normalization_error(
-                ProjectionNormalizationErrorReason::WordTimestampNonFinite,
-                segment_index,
-                Some(word_index),
-                "word timestamps must be finite",
-            ));
-        }
-        if word.start_sec < 0.0 || word.end_sec < 0.0 {
-            return Err(projection_normalization_error(
-                ProjectionNormalizationErrorReason::WordTimestampNegative,
-                segment_index,
-                Some(word_index),
-                "word timestamps must be non-negative",
-            ));
-        }
-        if word.end_sec < word.start_sec {
-            return Err(projection_normalization_error(
-                ProjectionNormalizationErrorReason::WordTimestampReversed,
-                segment_index,
-                Some(word_index),
-                "word end precedes word start",
-            ));
-        }
-        if let Some(prior_start) = previous_start
-            && word.start_sec + CANONICAL_PROJECTION_EPSILON_SEC < prior_start
-        {
-            return Err(projection_normalization_error(
-                ProjectionNormalizationErrorReason::WordOrderReversed,
-                segment_index,
-                Some(word_index),
-                "word starts are not monotonic",
-            ));
-        }
-        if let Some(prior_end) = previous_end
-            && word.start_sec + CANONICAL_PROJECTION_EPSILON_SEC < prior_end
-        {
-            return Err(projection_normalization_error(
-                ProjectionNormalizationErrorReason::WordOverlap,
-                segment_index,
-                Some(word_index),
-                "word materially overlaps its predecessor",
-            ));
-        }
-        previous_start = Some(word.start_sec);
-        previous_end = Some(word.end_sec);
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn normalize_timed_segment(
-    segment: &TranscriptionSegment,
-    timed: &[WordTiming],
-    segment_index: usize,
-    parent_start: f64,
-    parent_end: f64,
-    out: &mut Vec<CanonicalProjectionUnit>,
-    report: &mut DtwProjectionReport,
-) {
-    let required_duration = timed.len() as f64 * CANONICAL_PROJECTION_MIN_DURATION_SEC;
-    if parent_end - parent_start < required_duration {
-        append_segment_geometry_fallback(
-            segment,
-            timed,
-            segment_index,
-            parent_start,
-            parent_end,
-            out,
-            report,
-        );
-        return;
-    }
-
-    let mut cursor = parent_start;
-    for (word_index, word) in timed.iter().enumerate() {
-        let remaining = timed.len() - word_index - 1;
-        let latest_end = parent_end - remaining as f64 * CANONICAL_PROJECTION_MIN_DURATION_SEC;
-        let latest_start =
-            parent_end - (remaining + 1) as f64 * CANONICAL_PROJECTION_MIN_DURATION_SEC;
-        let desired_start = word.start_sec.clamp(parent_start, parent_end);
-        let start = desired_start.max(cursor).min(latest_start);
-        let desired_end = word.end_sec.clamp(parent_start, parent_end);
-        let minimum_end = if start == latest_start {
-            latest_end
-        } else {
-            start + CANONICAL_PROJECTION_MIN_DURATION_SEC
-        };
-        let end = desired_end.max(minimum_end).min(latest_end);
-        let was_clamped = (start - word.start_sec).abs() > CANONICAL_PROJECTION_EPSILON_SEC
-            || (end - word.end_sec).abs() > CANONICAL_PROJECTION_EPSILON_SEC;
-        let was_expanded = word.end_sec - word.start_sec
-            < CANONICAL_PROJECTION_MIN_DURATION_SEC - CANONICAL_PROJECTION_EPSILON_SEC;
-        out.push(CanonicalProjectionUnit {
-            start_sec: start,
-            end_sec: end,
-            text: word.text.clone(),
-            confidence: segment.confidence,
-            source_segment_index: segment_index,
-            source_word_start_index: word_index,
-            source_word_end_index: word_index + 1,
-            provenance: ProjectionUnitProvenance::DecoderWordTimestamp,
-            was_clamped,
-            was_expanded,
-        });
-        cursor = end;
-    }
-}
-
-fn append_interpolated_fallback(
-    segment: &TranscriptionSegment,
-    segment_index: usize,
-    parent_start: f64,
-    parent_end: f64,
-    out: &mut Vec<CanonicalProjectionUnit>,
-    report: &mut DtwProjectionReport,
-) {
-    report.word_aligned_safe = false;
-    let words = segment.text.split_whitespace().collect::<Vec<_>>();
-    if words.is_empty() {
-        report.interpolated_fallback_segments += 1;
-        return;
-    }
-    let duration = parent_end - parent_start;
-    if duration < words.len() as f64 * CANONICAL_PROJECTION_MIN_DURATION_SEC {
-        append_segment_geometry_fallback(
-            segment,
-            &[],
-            segment_index,
-            parent_start,
-            parent_end,
-            out,
-            report,
-        );
-        return;
-    }
-    report.interpolated_fallback_segments += 1;
-
-    for (word_index, word) in words.iter().enumerate() {
-        let count = words.len() as f64;
-        let start = parent_start + duration * word_index as f64 / count;
-        let end = if word_index + 1 == words.len() {
-            parent_end
-        } else {
-            parent_start + duration * (word_index + 1) as f64 / count
-        };
-        out.push(CanonicalProjectionUnit {
-            start_sec: start,
-            end_sec: end,
-            text: (*word).to_owned(),
-            confidence: segment.confidence,
-            source_segment_index: segment_index,
-            source_word_start_index: word_index,
-            source_word_end_index: word_index + 1,
-            provenance: ProjectionUnitProvenance::SegmentInterpolationFallback,
-            was_clamped: false,
-            was_expanded: false,
-        });
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_segment_geometry_fallback(
-    segment: &TranscriptionSegment,
-    timed: &[WordTiming],
-    segment_index: usize,
-    parent_start: f64,
-    parent_end: f64,
-    out: &mut Vec<CanonicalProjectionUnit>,
-    report: &mut DtwProjectionReport,
-) {
-    report.segment_geometry_fallback_segments += 1;
-    report.word_aligned_safe = false;
-    let segment_text = segment.text.trim();
-    let text = if segment_text.is_empty() {
-        timed
-            .iter()
-            .map(|word| word.text.trim())
-            .collect::<Vec<_>>()
-            .join(" ")
-    } else {
-        segment_text.to_owned()
-    };
-    out.push(CanonicalProjectionUnit {
-        start_sec: parent_start,
-        end_sec: parent_end,
-        text,
-        confidence: segment.confidence,
-        source_segment_index: segment_index,
-        source_word_start_index: 0,
-        source_word_end_index: timed.len().max(1),
-        provenance: ProjectionUnitProvenance::SegmentGeometryFallback,
-        was_clamped: false,
-        was_expanded: false,
-    });
-}
-
-fn validate_canonical_projection_units(units: &[CanonicalProjectionUnit]) -> FwResult<()> {
-    let mut previous_end = None;
-    for unit in units {
-        let valid = unit.start_sec.is_finite()
-            && unit.end_sec.is_finite()
-            && unit.start_sec >= 0.0
-            && unit.end_sec > unit.start_sec
-            && unit.source_word_end_index > unit.source_word_start_index
-            && previous_end.is_none_or(|end| unit.start_sec >= end);
-        if !valid {
-            return Err(projection_normalization_error(
-                ProjectionNormalizationErrorReason::CanonicalInvariant,
-                unit.source_segment_index,
-                Some(unit.source_word_start_index),
-                "normalizer produced a non-finite, non-positive, reversed, or overlapping unit",
-            ));
-        }
-        previous_end = Some(unit.end_sec);
-    }
-    Ok(())
 }
 
 /// Split each real segment's text into words, linearly interpolating each
@@ -1394,67 +1130,6 @@ fn read_normalized_wav(path: &Path) -> FwResult<Vec<f32>> {
     decode::read_wav_16k_mono(&bytes)
 }
 
-/// The requested `--offset-ms` / `--duration-ms` audio window, if any.
-///
-/// Returns `None` when neither flag is set (or both are zero-effect), so the
-/// unwindowed path stays byte-identical to the pre-window behavior.
-fn requested_audio_window(request: &TranscribeRequest) -> Option<(u64, Option<u64>)> {
-    let offset_ms = request.backend_params.offset_ms.unwrap_or(0);
-    let duration_ms = request.backend_params.duration_ms.filter(|d| *d > 0);
-    if offset_ms == 0 && duration_ms.is_none() {
-        None
-    } else {
-        Some((offset_ms, duration_ms))
-    }
-}
-
-/// Convert a ms-domain window into clamped sample bounds over 16 kHz PCM.
-fn window_sample_bounds(len: usize, offset_ms: u64, duration_ms: Option<u64>) -> (usize, usize) {
-    const SAMPLES_PER_MS: u64 = (native_engine::mel::SAMPLE_RATE as u64) / 1000;
-    let start = usize::try_from(offset_ms.saturating_mul(SAMPLES_PER_MS))
-        .unwrap_or(usize::MAX)
-        .min(len);
-    let end = match duration_ms {
-        Some(duration_ms) => usize::try_from(
-            offset_ms
-                .saturating_add(duration_ms)
-                .saturating_mul(SAMPLES_PER_MS),
-        )
-        .unwrap_or(usize::MAX)
-        .min(len),
-        None => len,
-    };
-    (start, end.max(start))
-}
-
-/// Shift every emitted timestamp in a decode output by a uniform offset,
-/// keeping windowed runs in the source-file timebase.
-fn shift_decode_output(output: &mut decode::DecodeOutput, offset_sec: f64) {
-    for segment in &mut output.segments {
-        if let Some(start) = segment.start_sec.as_mut() {
-            *start += offset_sec;
-        }
-        if let Some(end) = segment.end_sec.as_mut() {
-            *end += offset_sec;
-        }
-    }
-    if let Some(word_timings) = output.word_timings.as_mut() {
-        for words in word_timings.iter_mut() {
-            for word in words.iter_mut() {
-                word.start_sec += offset_sec;
-                word.end_sec += offset_sec;
-            }
-        }
-    }
-    for window in &mut output.windows {
-        window.window_offset_sec += offset_sec;
-    }
-    for dropped in &mut output.dropped_windows {
-        dropped.start_sec += offset_sec;
-        dropped.end_sec += offset_sec;
-    }
-}
-
 /// The honest raw-output metadata JSON for a real-inference run.
 #[allow(clippy::too_many_arguments)]
 fn raw_output_json(
@@ -1513,16 +1188,6 @@ fn raw_output_json(
         "model": spec,
         "model_path": model_path.display().to_string(),
         "model_version_tag": version_tag,
-        "encoder_int8_policy": {
-            "action": match encoder_policy.action {
-                native_engine::EncoderInt8PolicyAction::F32Encoder => "f32",
-                native_engine::EncoderInt8PolicyAction::QualitySafeInt8Encoder => "quality_safe_int8",
-            },
-            "reason": encoder_policy.reason,
-            "calibration_id": encoder_policy.calibration_id,
-            "corpus_wer_delta_budget": encoder_policy.corpus_wer_delta_budget,
-            "quant_rel_rmse_budget": encoder_policy.quant_rel_rmse_budget,
-        },
         "windows": windows_json,
         "dropped_windows": dropped_windows_json,
         "decode_work": {
@@ -1531,10 +1196,73 @@ fn raw_output_json(
         },
         "word_timestamps": word_timestamps,
     });
-    if let (Value::Object(map), Some(report)) = (&mut output, dtw_projection) {
-        map.insert("projection_timeline".to_owned(), report.to_json());
+    if let Value::Object(map) = &mut output {
+        map.extend(encoder_provenance_fields(
+            encoder_policy,
+            &decode_work.encoder_executions,
+        ));
+        if let Some(report) = dtw_projection {
+            map.insert("projection_timeline".to_owned(), report.to_json());
+        }
     }
     output
+}
+
+/// The per-run encoder provenance every native backend reports (bd-nt0d):
+///
+/// - `encoder_int8_policy`: the policy decision for the model (the arm the
+///   calibration and `FW_ENC_ATTN_OUT_I8I32` select for the CPU encoder's
+///   weights). It is a decision, not a record of what ran.
+/// - `encoder_execution`: what this run's encoder forwards ran, as the
+///   forwards returned it: one entry per distinct route and arithmetic, with
+///   its forward count, the per-GEMM-family precision, and the gate that
+///   chose it (`precision_source`). Empty when this request ran no forward (a
+///   transcription-cache hit or an identical batch job's follower).
+/// - `encoder_route`: the route every forward of this run took. Absent when
+///   no forward ran or the forwards took different routes (`encoder_execution`
+///   then lists each).
+pub(crate) fn encoder_provenance_fields(
+    policy: native_engine::EncoderInt8PolicyDecision,
+    executions: &native_engine::encoder::EncoderExecutionTally,
+) -> serde_json::Map<String, Value> {
+    let execution_json: Vec<Value> = executions
+        .entries()
+        .iter()
+        .map(|(execution, calls)| {
+            let precision: serde_json::Map<String, Value> = execution
+                .precision
+                .families()
+                .iter()
+                .map(|(family, p)| ((*family).to_owned(), Value::from(p.as_str())))
+                .collect();
+            json!({
+                "route": execution.route,
+                "encoder_calls": calls,
+                "precision": precision,
+                "precision_source": execution.precision_source,
+            })
+        })
+        .collect();
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "encoder_int8_policy".to_owned(),
+        json!({
+            "action": match policy.action {
+                native_engine::EncoderInt8PolicyAction::F32Encoder => "f32",
+                native_engine::EncoderInt8PolicyAction::QualitySafeInt8Encoder => "quality_safe_int8",
+            },
+            "reason": policy.reason,
+            "calibration_id": policy.calibration_id,
+            "corpus_wer_delta_budget": policy.corpus_wer_delta_budget,
+            "measured_corpus_wer_delta": policy.measured_corpus_wer_delta,
+            "quant_rel_rmse_budget": policy.quant_rel_rmse_budget,
+        }),
+    );
+    fields.insert("encoder_execution".to_owned(), Value::Array(execution_json));
+    if let Some(route) = executions.single_route() {
+        fields.insert("encoder_route".to_owned(), Value::from(route));
+    }
+    fields
 }
 
 /// Build the empty-but-valid result for a pure-silence clip, taken **without
@@ -1574,7 +1302,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use crate::backend::Engine;
+    use crate::backend::{Engine, window_sample_bounds};
     use crate::model::{
         BackendKind, BackendParams, DiarizationEngine, DiarizationRequest, InputSource,
         TranscribeRequest, TranscriptionSegment, WordTimestampParams,
@@ -1582,6 +1310,38 @@ mod tests {
     use crate::orchestrator::CancellationToken;
 
     use super::*;
+
+    #[test]
+    fn language_detection_result_reports_language_without_transcript() {
+        let probabilities: Vec<(String, f32)> = (0..12)
+            .map(|rank| (format!("l{rank}"), 0.5_f32 / (rank as f32 + 1.0)))
+            .collect();
+        let detection = native_engine::decode::LanguageDetection {
+            language: "l0".to_owned(),
+            probabilities,
+            multilingual: true,
+        };
+        let result = crate::backend::native_language_detection_result(
+            BackendKind::WhisperCpp,
+            "whisper.cpp-native",
+            "large-v3-turbo",
+            &detection,
+        );
+        assert_eq!(result.backend, BackendKind::WhisperCpp);
+        assert_eq!(result.raw_output["engine"], "whisper.cpp-native");
+        assert_eq!(result.language.as_deref(), Some("l0"));
+        assert!(result.transcript.is_empty());
+        assert!(result.segments.is_empty());
+        assert_eq!(result.raw_output["detect_language_only"], true);
+        assert_eq!(result.raw_output["language"], "l0");
+        assert_eq!(result.raw_output["multilingual_model"], true);
+        let reported = result.raw_output["language_probabilities"]
+            .as_array()
+            .expect("posterior array");
+        assert_eq!(reported.len(), 10, "top-10 only");
+        assert_eq!(reported[0]["language"], "l0");
+        assert_eq!(reported[0]["probability"], 0.5);
+    }
 
     fn native_request() -> TranscribeRequest {
         TranscribeRequest {
@@ -1598,6 +1358,22 @@ mod tests {
             timeout_ms: None,
             backend_params: BackendParams::default(),
         }
+    }
+
+    #[test]
+    fn shared_projection_timing_constants_match_conformance() {
+        assert!(
+            (CANONICAL_PROJECTION_EPSILON_SEC
+                - crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC)
+                .abs()
+                == 0.0
+        );
+        assert!(
+            (CANONICAL_PROJECTION_MIN_DURATION_SEC
+                - crate::conformance::CANONICAL_PROJECTION_MIN_DURATION_SEC)
+                .abs()
+                == 0.0
+        );
     }
 
     #[test]
@@ -1671,6 +1447,7 @@ mod tests {
                 no_speech_prob: 0.01,
                 tokens: 3,
                 window_offset_sec: 0.0,
+                token_attn: Vec::new(),
             }],
             dropped_windows: vec![decode::DroppedWindow {
                 start_sec: 30.0,
@@ -2153,6 +1930,74 @@ mod tests {
     }
 
     #[test]
+    fn max_segment_length_drives_the_word_mode_when_no_word_params_are_given() {
+        use crate::model::DecodingParams;
+
+        let mut request = native_request();
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::None
+        );
+        let with_max = |max_len| {
+            Some(DecodingParams {
+                max_segment_length: Some(max_len),
+                ..DecodingParams::default()
+            })
+        };
+        request.backend_params.decoding = with_max(1);
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::Word
+        );
+        request.backend_params.decoding = with_max(42);
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::MaxLen(42)
+        );
+        request.backend_params.decoding = with_max(0);
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::None
+        );
+        // Explicit word-timestamp params win over --max-segment-length.
+        request.backend_params.decoding = with_max(42);
+        request.backend_params.word_timestamps = Some(WordTimestampParams {
+            enabled: true,
+            ..WordTimestampParams::default()
+        });
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::Word
+        );
+    }
+
+    #[test]
+    fn timestamp_level_word_requests_one_segment_per_word() {
+        use crate::model::DecodingParams;
+
+        let mut request = native_request();
+        request.backend_params.timestamp_level = Some(TimestampLevel::Chunk);
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::None
+        );
+        request.backend_params.timestamp_level = Some(TimestampLevel::Word);
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::Word
+        );
+        // An explicit --max-segment-length still decides the grouping.
+        request.backend_params.decoding = Some(DecodingParams {
+            max_segment_length: Some(30),
+            ..DecodingParams::default()
+        });
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::MaxLen(30)
+        );
+    }
+
+    #[test]
     fn word_timestamp_mode_mapping() {
         assert_eq!(word_timestamp_mode(None), WordTimestampMode::None);
         assert_eq!(
@@ -2184,6 +2029,7 @@ mod tests {
             reason: "unit_test_fixture",
             calibration_id: native_engine::ENCODER_INT8_CALIBRATION_ID,
             corpus_wer_delta_budget: 0.0,
+            measured_corpus_wer_delta: None,
             quant_rel_rmse_budget: 0.09,
         }
     }
@@ -2209,6 +2055,122 @@ mod tests {
         assert_eq!(json["in_process"].as_bool(), Some(true));
         assert_eq!(json["dropped_windows"], json!([]));
         assert_eq!(json["decode_work"]["prompt_reset_retries"], json!(0));
+    }
+
+    /// bd-nt0d: `raw_output` reports what this run's forwards returned (the
+    /// work record handed in), and keeps the policy decision separate: here
+    /// the decision says quality-safe int8 while the run's encoder was the
+    /// Metal one.
+    #[test]
+    fn raw_output_reports_the_runs_encoder_executions_not_the_policy_arm() {
+        use native_engine::encoder::{
+            EncoderExecution, METAL_PRECISION_SOURCE, metal_encoder_precision,
+        };
+        let metal = EncoderExecution {
+            route: "gpu_fused_stem",
+            precision: metal_encoder_precision(true, false, false, 64),
+            precision_source: METAL_PRECISION_SOURCE,
+        };
+        let mut work = decode::DecodeWorkStats::default();
+        work.encoder_executions.record(metal);
+        work.encoder_executions.record(metal);
+        let forced_int8 = native_engine::EncoderInt8PolicyDecision {
+            action: native_engine::EncoderInt8PolicyAction::QualitySafeInt8Encoder,
+            reason: "operator_forced_quality_safe_int8",
+            ..f32_encoder_policy_fixture()
+        };
+        let json = raw_output_json(
+            "large-v3-turbo",
+            Path::new("/models/ggml-large-v3-turbo.bin"),
+            "fw-native-v1+sha256:abc".to_owned(),
+            forced_int8,
+            &[],
+            &[],
+            &work,
+            WordTimestampMode::None,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(json["encoder_int8_policy"]["action"], "quality_safe_int8");
+        assert_eq!(
+            json["encoder_int8_policy"]["reason"],
+            "operator_forced_quality_safe_int8"
+        );
+        assert_eq!(json["encoder_route"], "gpu_fused_stem");
+        assert_eq!(
+            json["encoder_execution"],
+            json!([{
+                "route": "gpu_fused_stem",
+                "encoder_calls": 2,
+                "precision_source": "metal_encoder",
+                "precision": {
+                    "conv_stem": "f16",
+                    "attn_qkv": "f16",
+                    "attention": "f16_kv",
+                    "attn_out": "f16",
+                    "mlp_fc1": "f16",
+                    "mlp_fc2": "f16",
+                },
+            }])
+        );
+    }
+
+    /// bd-nt0d: `encoder_route` names a route only when the run's forwards
+    /// all took it; with none (a cache hit) or two, only `encoder_execution`
+    /// speaks.
+    #[test]
+    fn raw_output_encoder_route_is_absent_unless_one_route_ran() {
+        use native_engine::encoder::{EncoderExecution, EncoderPrecision, GemmPrecision};
+        let cpu = EncoderExecution {
+            route: "cpu:gpu_forward_failed",
+            precision: EncoderPrecision {
+                conv_stem: GemmPrecision::F32,
+                attn_qkv: GemmPrecision::F32,
+                attention: GemmPrecision::F32,
+                attn_out: GemmPrecision::F32,
+                mlp_fc1: GemmPrecision::F32,
+                mlp_fc2: GemmPrecision::F32,
+            },
+            precision_source: "encoder_int8_policy",
+        };
+        let metal = EncoderExecution {
+            route: "gpu_fused_stem",
+            ..cpu
+        };
+        let report = |work: &decode::DecodeWorkStats| {
+            raw_output_json(
+                "large-v3-turbo",
+                Path::new("/models/ggml-large-v3-turbo.bin"),
+                "fw-native-v1+sha256:abc".to_owned(),
+                f32_encoder_policy_fixture(),
+                &[],
+                &[],
+                work,
+                WordTimestampMode::None,
+                false,
+                false,
+                None,
+            )
+        };
+
+        let none = report(&decode::DecodeWorkStats::default());
+        assert!(none.get("encoder_route").is_none(), "{none}");
+        assert_eq!(none["encoder_execution"], json!([]));
+        assert_eq!(none["encoder_int8_policy"]["action"], "f32");
+
+        let mut mixed = decode::DecodeWorkStats::default();
+        mixed.encoder_executions.record(metal);
+        mixed.encoder_executions.record(cpu);
+        let mixed = report(&mixed);
+        assert!(mixed.get("encoder_route").is_none(), "{mixed}");
+        let routes: Vec<&str> = mixed["encoder_execution"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|entry| entry["route"].as_str())
+            .collect();
+        assert_eq!(routes, ["gpu_fused_stem", "cpu:gpu_forward_failed"]);
     }
 
     #[test]
@@ -2327,6 +2289,293 @@ mod tests {
         assert!(out[0].end_sec <= out[1].start_sec);
         assert_eq!(outcome.report.decoder_word_units, 2);
         assert!(outcome.report.word_aligned_safe);
+    }
+
+    fn timed_word(text: &str, start_sec: f64, end_sec: f64) -> WordTiming {
+        WordTiming {
+            text: text.to_owned(),
+            start_sec,
+            end_sec,
+        }
+    }
+
+    fn engine_segment(start: f64, end: f64, text: &str) -> TranscriptionSegment {
+        TranscriptionSegment {
+            start_sec: Some(start),
+            end_sec: Some(end),
+            text: text.to_owned(),
+            speaker: None,
+            confidence: Some(0.9),
+        }
+    }
+
+    /// Diarization-only DTW units for two engine segments, with the plan the
+    /// backend records for them.
+    fn diarization_units() -> (Vec<TranscriptionSegment>, DiarizationWordUnitPlan) {
+        let engine = vec![
+            engine_segment(0.0, 3.0, " ask not what your country"),
+            engine_segment(3.0, 5.0, " can do"),
+        ];
+        let timings = vec![
+            vec![
+                timed_word("ask", 0.1, 0.5),
+                timed_word("not", 0.5, 1.0),
+                timed_word("what", 1.2, 1.6),
+                timed_word("your", 1.6, 2.0),
+                timed_word("country", 2.0, 2.9),
+            ],
+            vec![timed_word("can", 3.1, 3.6), timed_word("do", 3.6, 4.8)],
+        ];
+        let outcome =
+            build_segments_dtw(&engine, &timings, WordTimestampMode::None, false, None).unwrap();
+        assert_eq!(outcome.unit_source_segments, vec![0, 0, 0, 0, 0, 1, 1]);
+        let plan =
+            DiarizationWordUnitPlan::new(&engine, &outcome.unit_source_segments).expect("plan");
+        (outcome.segments, plan)
+    }
+
+    fn label(units: &mut [TranscriptionSegment], speakers: &[Option<&str>]) {
+        for (unit, speaker) in units.iter_mut().zip(speakers) {
+            unit.speaker = speaker.map(str::to_owned);
+        }
+    }
+
+    #[test]
+    fn diarization_word_units_collapse_back_into_engine_segments() {
+        let (mut units, plan) = diarization_units();
+        assert_eq!(plan.units, 7);
+        assert_eq!(plan.segments.len(), 2);
+        assert_eq!(plan.segments[0].text, "ask not what your country");
+
+        let a = Some("SPEAKER_00");
+        label(&mut units, &[a, a, a, a, a, a, a]);
+        let regrouped = plan.regroup(&units).expect("regroup");
+        // One speaker throughout: the engine's own segments, text and times.
+        assert_eq!(regrouped.len(), 2);
+        assert_eq!(regrouped[0].text, "ask not what your country");
+        assert_eq!(
+            (regrouped[0].start_sec, regrouped[0].end_sec),
+            (Some(0.0), Some(3.0))
+        );
+        assert_eq!(regrouped[1].text, "can do");
+        assert_eq!(
+            (regrouped[1].start_sec, regrouped[1].end_sec),
+            (Some(3.0), Some(5.0))
+        );
+        assert!(regrouped.iter().all(|s| s.speaker.as_deref() == a));
+    }
+
+    #[test]
+    fn diarization_word_units_split_only_at_speaker_changes() {
+        let (mut units, plan) = diarization_units();
+        let (a, b) = (Some("SPEAKER_00"), Some("SPEAKER_01"));
+        label(&mut units, &[a, a, b, b, b, b, None]);
+        let regrouped = plan.regroup(&units).expect("regroup");
+        let shape: Vec<_> = regrouped
+            .iter()
+            .map(|s| {
+                (
+                    s.start_sec.unwrap(),
+                    s.end_sec.unwrap(),
+                    s.speaker.as_deref(),
+                    s.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                // Engine start, word-unit end at the speaker change.
+                (0.0, 1.0, a, "ask not"),
+                // Word-unit start at the change, engine end.
+                (1.2, 3.0, b, "what your country"),
+                (3.0, 3.6, b, "can"),
+                // Unattributed words stay unknown rather than inheriting.
+                (3.6, 5.0, None, "do"),
+            ]
+        );
+    }
+
+    #[test]
+    fn diarization_word_units_keep_unspaced_scripts_unspaced() {
+        let engine = vec![engine_segment(0.0, 2.0, "你好世界")];
+        let timings = vec![vec![
+            timed_word("你好", 0.1, 0.9),
+            timed_word("世界", 0.9, 1.8),
+        ]];
+        let outcome =
+            build_segments_dtw(&engine, &timings, WordTimestampMode::None, false, None).unwrap();
+        let plan =
+            DiarizationWordUnitPlan::new(&engine, &outcome.unit_source_segments).expect("plan");
+        let mut units = outcome.segments;
+        label(&mut units, &[Some("SPEAKER_00"), Some("SPEAKER_01")]);
+        let regrouped = plan.regroup(&units).expect("regroup");
+        assert_eq!(regrouped[0].text, "你好");
+        assert_eq!(regrouped[1].text, "世界");
+    }
+
+    #[test]
+    fn diarization_word_unit_plan_refuses_a_changed_unit_list() {
+        let (units, plan) = diarization_units();
+        assert!(plan.regroup(&units[..6]).is_none(), "a unit went missing");
+        let mut torn = plan.clone();
+        torn.segments[1].unit_start = 4;
+        assert!(torn.regroup(&units).is_none(), "ranges must tile the units");
+        // An index that names no engine segment cannot form a plan.
+        assert!(DiarizationWordUnitPlan::new(&[], &[0]).is_none());
+    }
+
+    #[test]
+    fn regroup_applies_the_recorded_plan_once_and_updates_provenance() {
+        let (mut units, plan) = diarization_units();
+        let a = Some("SPEAKER_00");
+        label(&mut units, &[a, a, a, a, a, a, a]);
+        let mut result = TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: "ask not what your country can do".to_owned(),
+            language: Some("en".to_owned()),
+            segments: units,
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({
+                "projection_timeline": {"output_segments": 7},
+                DIARIZATION_WORD_UNITS_KEY: plan,
+            }),
+            artifact_paths: Vec::new(),
+        };
+        assert_eq!(
+            crate::backend::regroup_diarization_word_units(&mut result),
+            Some(7)
+        );
+        assert_eq!(result.segments.len(), 2);
+        assert_eq!(
+            result.raw_output["projection_timeline"]["output_segments"],
+            2
+        );
+        // The unit list no longer matches the plan, so a second pass is a no-op.
+        assert_eq!(
+            crate::backend::regroup_diarization_word_units(&mut result),
+            None
+        );
+        assert_eq!(result.segments.len(), 2);
+    }
+
+    #[test]
+    fn regroup_keeps_raw_confidences_parallel_to_the_segments() {
+        // bd-raw-segment-confidence-isdm: the raw per-unit confidences are
+        // averaged over exactly the speaker runs the normalized ones are.
+        let (mut units, plan) = diarization_units();
+        let (a, b) = (Some("SPEAKER_00"), Some("SPEAKER_01"));
+        label(&mut units, &[a, a, b, b, b, b, None]);
+        let acceleration = |raw_confidences| crate::model::AccelerationReport {
+            backend: crate::model::AccelerationBackend::None,
+            input_values: 7,
+            normalized_confidences: true,
+            pre_mass: Some(4.0),
+            post_mass: Some(1.0),
+            notes: Vec::new(),
+            raw_confidences,
+        };
+        let result_with = |raw_confidences| TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: "ask not what your country can do".to_owned(),
+            language: Some("en".to_owned()),
+            segments: units.clone(),
+            acceleration: Some(acceleration(raw_confidences)),
+            diarization: None,
+            raw_output: json!({ DIARIZATION_WORD_UNITS_KEY: plan.clone() }),
+            artifact_paths: Vec::new(),
+        };
+
+        let mut result = result_with(vec![
+            Some(0.5),
+            Some(0.5),
+            Some(0.5),
+            Some(0.75),
+            Some(1.0),
+            Some(0.25),
+            None,
+        ]);
+        assert_eq!(
+            crate::backend::regroup_diarization_word_units(&mut result),
+            Some(7)
+        );
+        assert_eq!(result.segments.len(), 4);
+        assert_eq!(
+            result.acceleration.expect("acceleration").raw_confidences,
+            vec![Some(0.5), Some(0.75), Some(0.25), None],
+            "a run of units averages their raw values; an all-None run stays None"
+        );
+
+        // A raw vector that no longer matches the units is dropped, never
+        // misaligned.
+        let mut stale = result_with(vec![Some(0.5); 3]);
+        assert_eq!(
+            crate::backend::regroup_diarization_word_units(&mut stale),
+            Some(7)
+        );
+        assert!(
+            stale
+                .acceleration
+                .expect("acceleration")
+                .raw_confidences
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn regroup_returns_a_segments_own_confidence_exactly() {
+        // Every word unit of an engine segment carries that segment's value.
+        // Averaging n copies drifts by an ulp (five copies of 0.8123456789
+        // average to 0.8123456789000001; three of 0.1 to 0.10000000000000002),
+        // so raw_confidences stopped being the backend's own value whenever
+        // diarization regrouped the units.
+        let (mut units, plan) = diarization_units();
+        let a = Some("SPEAKER_00");
+        label(&mut units, &[a, a, a, a, a, a, a]);
+        let (first, second) = (0.8123456789, 0.1);
+        for (index, unit) in units.iter_mut().enumerate() {
+            unit.confidence = Some(if index < 5 { first } else { second });
+        }
+        let raw: Vec<Option<f64>> = units.iter().map(|unit| unit.confidence).collect();
+        let mut result = TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: "ask not what your country can do".to_owned(),
+            language: Some("en".to_owned()),
+            segments: units,
+            acceleration: Some(crate::model::AccelerationReport {
+                backend: crate::model::AccelerationBackend::None,
+                input_values: 7,
+                normalized_confidences: true,
+                pre_mass: None,
+                post_mass: None,
+                notes: Vec::new(),
+                raw_confidences: raw,
+            }),
+            diarization: None,
+            raw_output: json!({ DIARIZATION_WORD_UNITS_KEY: plan }),
+            artifact_paths: Vec::new(),
+        };
+        assert_eq!(
+            crate::backend::regroup_diarization_word_units(&mut result),
+            Some(7)
+        );
+        let confidences: Vec<Option<f64>> = result
+            .segments
+            .iter()
+            .map(|segment| segment.confidence)
+            .collect();
+        assert_eq!(confidences, vec![Some(first), Some(second)]);
+        assert_eq!(
+            result.acceleration.expect("acceleration").raw_confidences,
+            vec![Some(first), Some(second)],
+            "the regrouped raw value is the engine segment's own value, bit for bit"
+        );
+
+        // A run that mixes values still averages them.
+        assert_eq!(super::run_confidence(&[0.5, 1.0]), Some(0.75));
+        assert_eq!(super::run_confidence(&[0.1, 0.1, 0.1]), Some(0.1));
+        assert_eq!(super::run_confidence(&[]), None);
     }
 
     #[test]

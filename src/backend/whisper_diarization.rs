@@ -6,7 +6,9 @@ use serde_json::json;
 
 use crate::error::{FwError, FwResult};
 use crate::model::{BackendKind, TranscribeRequest, TranscriptionResult, TranscriptionSegment};
-use crate::process::{command_exists, run_command_cancellable, run_command_with_timeout};
+use crate::process::{
+    command_exists, run_command_cancellable, run_command_with_timeout, utf8_path_arg,
+};
 
 const DEFAULT_PYTHON_BIN: &str = "python3";
 
@@ -36,9 +38,9 @@ pub fn run(
     let bp = &request.backend_params;
 
     let mut args = vec![
-        script.display().to_string(),
+        utf8_path_arg(&script)?.to_owned(),
         "-a".to_owned(),
-        local_audio.display().to_string(),
+        utf8_path_arg(&local_audio)?.to_owned(),
     ];
 
     if let Some(language) = &request.language {
@@ -365,13 +367,9 @@ fn is_speaker_label(label: &str) -> bool {
 /// Matches compact speaker labels like "s0", "s1", "s02".
 fn matches_short_speaker_label(lowered: &str) -> bool {
     let lowered = lowered.trim();
-    if lowered.len() >= 2
+    lowered.len() >= 2
         && lowered.starts_with('s')
         && lowered[1..].chars().all(|c| c.is_ascii_digit())
-    {
-        return true;
-    }
-    false
 }
 
 #[cfg(test)]

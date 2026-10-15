@@ -2,20 +2,26 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::Parser;
+use franken_whisper::cli;
 use franken_whisper::cli::{
     Cli, Command, ControlFrameKind, DifferentialOracleCommand, PublicCorpusCommand, PullModelArg,
     RobotCommand, RobotDocsCommand, RunsOutputFormat, ShutdownController, SyncCommand,
-    TtyAudioCommand, TtyAudioControlCommand,
+    TtyAudioCommand, TtyAudioControlCommand, TuiCommand,
 };
 use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
-    backends_discovery_value, build_backends_report, build_health_report, emit_health_report,
-    emit_pretty_run_report, emit_robot_complete, emit_robot_error_from_fw, emit_robot_stage,
-    emit_robot_start, robot_schema_value, routing_decision_line,
+    BatchItem, BatchTally, backends_discovery_value, batch_complete_value, batch_error_value,
+    batch_result_value, build_backends_report, build_health_report, emit_batch_record,
+    emit_event_value, emit_health_report, emit_pretty_run_report, emit_robot_batch_complete,
+    emit_robot_batch_error, emit_robot_batch_start, emit_robot_complete, emit_robot_error_from_fw,
+    emit_robot_stage, emit_robot_start, listen_device_value, robot_schema_value,
+    routing_decision_line, routing_history_complete_value,
 };
 use franken_whisper::storage::RunStore;
 use franken_whisper::tty_audio;
-use franken_whisper::{FrankenWhisperEngine, FwError, FwResult};
+use franken_whisper::{
+    BatchTranscriber, FrankenWhisperEngine, FwError, FwResult, RunReport, TranscribeRequest,
+};
 
 pub(crate) fn main() {
     franken_whisper::logging::init();
@@ -180,13 +186,49 @@ fn sortformer_audio_duration_ms(sample_count: usize) -> FwResult<u64> {
         .map(|milliseconds| milliseconds.div_ceil(sample_rate))
 }
 
+fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
+    if args.list_devices {
+        for device in franken_whisper::capture::enumerate_input_devices()? {
+            emit_event_value(&listen_device_value(&device))?;
+        }
+        return Ok(());
+    }
+
+    let config = args.to_listen_config()?;
+
+    // NOTE: main() already installed the Ctrl-C handler; installing twice
+    // errors (ctrlc rejects a second handler).
+    let mut emit = |value: serde_json::Value| franken_whisper::robot::emit_event_value(&value);
+    match franken_whisper::listen::run_listen_session(
+        &config,
+        &mut emit,
+        &ShutdownController::is_shutting_down,
+    ) {
+        Ok(cancelled) => {
+            if cancelled {
+                std::process::exit(130);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            // Fatal terminal: run_error is ALWAYS the last event.
+            let _ = franken_whisper::robot::emit_robot_error_from_fw(&error);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn pull_models(model: PullModelArg, json_output: bool) -> FwResult<()> {
     let pull_whisper = matches!(model, PullModelArg::All | PullModelArg::Whisper);
     let pull_sortformer = matches!(model, PullModelArg::All | PullModelArg::Sortformer);
+    let pull_tiny_en = matches!(model, PullModelArg::All | PullModelArg::TinyEn);
+    let pull_tiny = matches!(model, PullModelArg::All | PullModelArg::Tiny);
     let requested_model = match model {
         PullModelArg::All => "all",
         PullModelArg::Whisper => "whisper",
         PullModelArg::Sortformer => "sortformer",
+        PullModelArg::TinyEn => "tiny-en",
+        PullModelArg::Tiny => "tiny",
     };
     let result = (|| {
         let mut pulled = Vec::new();
@@ -250,6 +292,52 @@ fn pull_models(model: PullModelArg, json_output: bool) -> FwResult<()> {
                 "model_license_notice": franken_whisper::model_distribution::SORTFORMER_REQUIRED_NOTICE,
             }));
         }
+        for (enabled, fast_lane) in [
+            (
+                pull_tiny_en,
+                franken_whisper::model_distribution::FastLaneModel::TinyEn,
+            ),
+            (
+                pull_tiny,
+                franken_whisper::model_distribution::FastLaneModel::Tiny,
+            ),
+        ] {
+            if !enabled {
+                continue;
+            }
+            let name = fast_lane.pull_name();
+            let outcome = franken_whisper::model_distribution::pull_fast_lane(
+                fast_lane,
+                ShutdownController::is_shutting_down,
+                |line| {
+                    if !json_output {
+                        eprintln!("fw pull {name}: {line}");
+                    }
+                },
+            )?;
+            if !json_output {
+                eprintln!(
+                    "fw pull {name}: ready ({})",
+                    if outcome.from_cache {
+                        "already cached"
+                    } else {
+                        "downloaded and verified"
+                    }
+                );
+            }
+            pulled.push(serde_json::json!({
+                "model": name,
+                "role": "fast_lane_streaming",
+                "status": "ready",
+                "from_cache": outcome.from_cache,
+                "artifact_version": outcome.package.artifact_version,
+                "package_sha256": outcome.package.weights_sha256,
+                "distribution_policy": franken_whisper::model_distribution::WHISPER_DISTRIBUTION_POLICY,
+                "license": "MIT",
+                "weight_bytes_identity_preserved": true,
+                "preparation_recipe": franken_whisper::model_distribution::WHISPER_PREPARATION_RECIPE,
+            }));
+        }
         Ok::<_, FwError>(pulled)
     })();
 
@@ -289,22 +377,198 @@ fn pull_models(model: PullModelArg, json_output: bool) -> FwResult<()> {
     }
 }
 
+/// `fw transcribe` batch mode (bd-batch-transcribe-rraf): one engine and one
+/// model residency serve every input. With `--json`, stdout carries exactly
+/// one compact batch record per attempted input, in input order; otherwise
+/// each transcript prints under a `==> INPUT <==` header and failures go to
+/// stderr. A failed input never stops the batch; neither does a panicking one
+/// in an unwinding build, since [`BatchTranscriber`] returns its panic as the
+/// input's error, exactly as for `fw robot run`.
+/// Tell a CLI user that `--threads` asked for more CPUs than this process may
+/// use and the run computes on fewer (bd-threads-unclamped-pools-never-retired-7kuk).
+/// Robot runs carry the same notice in-band instead (an
+/// `orchestration.threads_clamped` stage event and a `run_complete` warning).
+fn warn_if_threads_clamped(request: &TranscribeRequest) {
+    if let Some(clamp) = franken_whisper::backend::request_threads_clamp(request) {
+        eprintln!("warning: {}", clamp.warning());
+    }
+}
+
+fn run_transcribe_batch(args: cli::TranscribeArgs) -> FwResult<()> {
+    let json = args.json;
+    let batch = args.into_batch()?;
+    if let Some(first) = batch.inputs.first() {
+        warn_if_threads_clamped(&batch.request_for(first));
+    }
+    let total = batch.inputs.len();
+    let transcriber = BatchTranscriber::new()?;
+    let mut tally = BatchTally {
+        total,
+        succeeded: 0,
+        failed: 0,
+        interrupted: false,
+    };
+    for (index, path) in batch.inputs.iter().enumerate() {
+        if ShutdownController::is_shutting_down() {
+            break;
+        }
+        let item = BatchItem::new(index, total, path);
+        match transcriber.transcribe(batch.request_for(path)) {
+            Ok(report) => {
+                tally.succeeded += 1;
+                if json {
+                    emit_batch_record(&batch_result_value(&item, report)?)?;
+                } else {
+                    if tally.succeeded > 1 {
+                        println!();
+                    }
+                    println!("==> {} <==", item.input);
+                    print!(
+                        "{}",
+                        franken_whisper::export::render_console_transcript(&report.result)
+                    );
+                }
+            }
+            Err(error) => {
+                tally.failed += 1;
+                if json {
+                    emit_batch_record(&batch_error_value(&item, &error))?;
+                } else {
+                    eprintln!("error: {}: {error}", item.input);
+                }
+            }
+        }
+    }
+    // Interrupted batches exit as cancelled (130 via the shutdown
+    // controller), even when Ctrl+C hit the last input; a failed input makes
+    // the process exit 1.
+    tally.interrupted = ShutdownController::is_shutting_down();
+    tally.outcome()
+}
+
+/// `fw robot run` batch mode: each input streams its own `run_start` (tagged
+/// with `batch`), stage events and `run_complete` / `run_error`, in input
+/// order, and `batch.complete` is the final line. A batch-level failure
+/// (unreadable list, invalid shared flags) is reported like an invalid single
+/// run: an untagged `run_start`, then the terminal `run_error`.
+fn run_robot_batch(args: cli::TranscribeArgs) -> FwResult<()> {
+    let summary = args.robot_summary();
+    let prepared = args
+        .into_batch()
+        .and_then(|batch| Ok((batch, BatchTranscriber::new()?)));
+    let (batch, transcriber) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            emit_robot_start(summary)?;
+            emit_robot_error_from_fw(&error)?;
+            return Err(error);
+        }
+    };
+    let total = batch.inputs.len();
+    let mut tally = BatchTally {
+        total,
+        succeeded: 0,
+        failed: 0,
+        interrupted: false,
+    };
+    for (index, path) in batch.inputs.iter().enumerate() {
+        if ShutdownController::is_shutting_down() {
+            break;
+        }
+        let item = BatchItem::new(index, total, path);
+        emit_robot_batch_start(summary.clone(), &item)?;
+        match stream_robot_run(&transcriber, batch.request_for(path))? {
+            Ok(report) => {
+                tally.succeeded += 1;
+                emit_robot_batch_complete(&report, &item)?;
+            }
+            Err(error) => {
+                tally.failed += 1;
+                emit_robot_batch_error(&error, &item)?;
+            }
+        }
+    }
+    // Ctrl+C during the last input leaves nothing skipped, but the process
+    // still exits 130: batch.complete must say cancelled, not incomplete.
+    tally.interrupted = ShutdownController::is_shutting_down();
+    emit_event_value(&batch_complete_value(&tally))?;
+    tally.outcome()
+}
+
+/// Run one batch input on a scoped worker thread, streaming its stage events
+/// to stdout as they happen. The outer error is an stdout failure; the inner
+/// result is the run's own outcome.
+///
+/// When stdout fails (the consumer is gone, EPIPE), the batch's cancellation
+/// handle stops the input in flight before the scope joins its worker, so the
+/// process exits at the run's next checkpoint instead of transcribing (and
+/// persisting) the rest of the input for nobody
+/// (bd-robot-batch-epipe-keeps-running-elf0). The exit status stays that of
+/// the stdout error (1), not Ctrl+C's 130.
+fn stream_robot_run(
+    transcriber: &BatchTranscriber,
+    request: TranscribeRequest,
+) -> FwResult<FwResult<RunReport>> {
+    let (event_tx, event_rx) = mpsc::channel();
+    let cancel = transcriber.cancel_handle();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || transcriber.transcribe_with_stream(request, event_tx));
+        let streamed = (|| -> FwResult<()> {
+            loop {
+                match event_rx.recv_timeout(Duration::from_millis(40)) {
+                    Ok(streamed) => emit_robot_stage(&streamed.run_id, &streamed.event)?,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if worker.is_finished() {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            while let Ok(streamed) = event_rx.try_recv() {
+                emit_robot_stage(&streamed.run_id, &streamed.event)?;
+            }
+            Ok(())
+        })();
+        if let Err(stdout_error) = streamed {
+            cancel.cancel();
+            return Err(stdout_error);
+        }
+        // BatchTranscriber already returns a run's panic as its error (the
+        // same one `fw transcribe` reports); this only covers a panic outside
+        // the run itself.
+        Ok(worker.join().unwrap_or_else(|_| {
+            Err(FwError::ContractViolation(
+                "robot worker thread panicked".to_owned(),
+            ))
+        }))
+    })
+}
+
 fn run(cli: Cli) -> FwResult<()> {
     match cli.command {
         Command::Transcribe(args) => {
+            if args.is_batch() {
+                return run_transcribe_batch(*args);
+            }
             let json = args.json;
             let request = (*args).into_request()?;
+            warn_if_threads_clamped(&request);
             let engine = FrankenWhisperEngine::new()?;
             let report = engine.transcribe(request)?;
 
             if json {
                 emit_pretty_run_report(report)?;
             } else {
-                println!("{}", report.result.transcript);
+                print!(
+                    "{}",
+                    franken_whisper::export::render_console_transcript(&report.result)
+                );
             }
             Ok(())
         }
         Command::Robot { command } => match command {
+            RobotCommand::Run(args) if args.is_batch() => run_robot_batch(*args),
             RobotCommand::Run(args) => {
                 emit_robot_start(args.robot_summary())?;
                 let request = match (*args).into_request() {
@@ -351,14 +615,28 @@ fn run(cli: Cli) -> FwResult<()> {
                     }
                 }
             }
+            RobotCommand::Listen(args) => match run_robot_listen(*args) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // Fatal terminal contract: run_error is ALWAYS the
+                    // last event on a listen stream, including failures
+                    // before the session opened.
+                    let _ = franken_whisper::robot::emit_robot_error_from_fw(&error);
+                    std::process::exit(1);
+                }
+            },
             RobotCommand::Schema => {
                 println!("{}", serde_json::to_string(&robot_schema_value())?);
                 Ok(())
             }
             RobotCommand::RoutingHistory(args) => {
-                let store = RunStore::open(&args.db)?;
-                let details_list =
-                    load_routing_history_details(&store, args.run_id.as_deref(), args.limit)?;
+                // A missing store is empty history: never create one here.
+                let details_list = match open_existing_history(&args.db)? {
+                    Some(store) => {
+                        load_routing_history_details(&store, args.run_id.as_deref(), args.limit)?
+                    }
+                    None => Vec::new(),
+                };
 
                 let mut records = 0_usize;
                 for details in details_list {
@@ -380,14 +658,7 @@ fn run(cli: Cli) -> FwResult<()> {
                         }
                     }
                 }
-                println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
-                        "event": "routing_history.complete",
-                        "schema_version": franken_whisper::robot::ROBOT_SCHEMA_VERSION,
-                        "records": records,
-                    }))?
-                );
+                emit_event_value(&routing_history_complete_value(records))?;
                 Ok(())
             }
             RobotCommand::Health(args) => {
@@ -492,7 +763,25 @@ fn run(cli: Cli) -> FwResult<()> {
             }
         },
         Command::Runs(args) => {
-            let store = RunStore::open(&args.db)?;
+            // Querying history must not create a database: a mistyped or
+            // never-used `--db` path is reported, not silently initialized.
+            let Some(store) = open_existing_history(&args.db)? else {
+                if let Some(run_id) = &args.id {
+                    return Err(FwError::InvalidRequest(format!(
+                        "no run found with id `{run_id}`: no run history database at {}",
+                        args.db.display()
+                    )));
+                }
+                match args.format {
+                    RunsOutputFormat::Plain => eprintln!(
+                        "no run history at {} (runs are recorded by `fw transcribe`; select another store with --db)",
+                        args.db.display()
+                    ),
+                    RunsOutputFormat::Json => println!("[]"),
+                    RunsOutputFormat::Ndjson => {}
+                }
+                return Ok(());
+            };
 
             if let Some(run_id) = &args.id {
                 match store.load_run_details(run_id)? {
@@ -912,10 +1201,46 @@ fn run(cli: Cli) -> FwResult<()> {
         }
         Command::Sync { command } => match command {
             SyncCommand::Export(args) => {
-                let manifest =
-                    franken_whisper::sync::export(&args.db, &args.output, &args.state_root)?;
+                let compression = if args.gzip {
+                    franken_whisper::sync::CompressionMode::Gzip
+                } else {
+                    franken_whisper::sync::CompressionMode::None
+                };
+                let (mut manifest, compressed) = if args.incremental {
+                    let (manifest, compressed) =
+                        franken_whisper::sync::export_incremental_with_compression(
+                            &args.db,
+                            &args.output,
+                            &args.state_root,
+                            compression,
+                        )?;
+                    (serde_json::to_value(manifest)?, compressed)
+                } else {
+                    let (manifest, compressed) = franken_whisper::sync::export_with_compression(
+                        &args.db,
+                        &args.output,
+                        &args.state_root,
+                        compression,
+                    )?;
+                    (serde_json::to_value(manifest)?, compressed)
+                };
+                if let serde_json::Value::Object(ref mut map) = manifest {
+                    map.insert("gzip_files".to_owned(), serde_json::json!(compressed));
+                }
                 println!("{}", serde_json::to_string_pretty(&manifest)?);
                 Ok(())
+            }
+            SyncCommand::Validate(args) => {
+                let report = franken_whisper::sync::validate_sync(&args.db, &args.input)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.is_valid {
+                    Ok(())
+                } else {
+                    Err(franken_whisper::error::FwError::Storage(
+                        "database does not match the JSONL snapshot; see the printed report"
+                            .to_owned(),
+                    ))
+                }
             }
             SyncCommand::Import(args) => {
                 let result = franken_whisper::sync::import(
@@ -924,22 +1249,27 @@ fn run(cli: Cli) -> FwResult<()> {
                     &args.state_root,
                     args.conflict_policy,
                 )?;
-                let validation = franken_whisper::sync::validate_sync(&args.db, &args.input);
+                // A full-snapshot comparison is meaningless against an
+                // incremental (partial) archive: it would always report the
+                // database's other runs as missing from the archive.
+                let incremental = franken_whisper::sync::archive_is_incremental(&args.input)?;
+                let validation = (!incremental)
+                    .then(|| franken_whisper::sync::validate_sync(&args.db, &args.input));
                 let (validation_report, validation_error) = match validation {
-                    Ok(report) => (Some(report), None),
-                    Err(error) => (None, Some(error.to_string())),
+                    Some(Ok(report)) => (Some(report), None),
+                    Some(Err(error)) => (None, Some(error.to_string())),
+                    None => (None, None),
                 };
-                let validation_ok = validation_report
-                    .as_ref()
-                    .map(|report| report.is_valid)
-                    .unwrap_or(false);
+                let validation_ok = validation_report.as_ref().map(|report| report.is_valid);
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "runs_imported": result.runs_imported,
                         "segments_imported": result.segments_imported,
                         "events_imported": result.events_imported,
+                        "runs_deleted": result.runs_deleted,
                         "conflicts": result.conflicts,
+                        "archive_mode": if incremental { "incremental" } else { "full" },
                         "validation_ok": validation_ok,
                         "validation": validation_report,
                         "validation_error": validation_error,
@@ -1014,39 +1344,64 @@ fn run(cli: Cli) -> FwResult<()> {
                 tty_audio::emit_retransmit_loop_from_stdin(recovery.into(), rounds)
             }
         },
-        Command::Tui => franken_whisper::tui::run_tui(),
-        Command::Youtube(args) => {
-            let opts = args.to_options()?;
-            let summary = franken_whisper::youtube::pipeline::run(&opts)?;
-            if args.json_summary {
-                println!("{}", serde_json::to_string_pretty(&summary)?);
-            } else {
-                println!(
-                    "YouTube ingestion: {} done, {} skipped, {} failed{}",
-                    summary.done.len(),
-                    summary.skipped.len(),
-                    summary.failed.len(),
-                    if summary.cancelled {
-                        " (cancelled)"
+        Command::Tui { command: None } => franken_whisper::tui::run_tui(),
+        Command::Tui {
+            command: Some(TuiCommand::Listen(args)),
+        } => franken_whisper::tui::run_live_listen_tui(args.to_listen_config()?),
+        Command::Youtube(command) => match command {
+            cli::YoutubeCommand::Run(args) => {
+                let opts = args.to_options()?;
+                let summary = franken_whisper::youtube::pipeline::run(&opts)?;
+                if !args.robot {
+                    if args.json_summary {
+                        println!("{}", serde_json::to_string_pretty(&summary)?);
                     } else {
-                        ""
-                    },
-                );
-                for f in &summary.failed {
-                    eprintln!("  failed {}: {} — {}", f.id, f.title, f.error);
+                        println!(
+                            "YouTube ingestion: {} done, {} skipped, {} failed{}",
+                            summary.done.len(),
+                            summary.skipped.len(),
+                            summary.failed.len(),
+                            if summary.cancelled {
+                                " (cancelled)"
+                            } else {
+                                ""
+                            },
+                        );
+                        for f in &summary.failed {
+                            eprintln!("  failed {}: {} — {}", f.id, f.title, f.error);
+                        }
+                    }
                 }
+                // Robot mode (bd-27v1.1): the streamed NDJSON events ending in
+                // youtube.run_complete are the entire stdout contract; no
+                // trailing human/summary output is appended.
+                // Any failed video is a non-zero outcome; cancellation is
+                // surfaced through the global shutdown exit code in main().
+                if !summary.failed.is_empty() && !summary.cancelled {
+                    return Err(FwError::Unsupported(format!(
+                        "{} youtube video(s) failed",
+                        summary.failed.len()
+                    )));
+                }
+                Ok(())
             }
-            // Any failed video is a non-zero outcome; cancellation is surfaced
-            // through the global shutdown exit code in main().
-            if !summary.failed.is_empty() && !summary.cancelled {
-                return Err(FwError::Unsupported(format!(
-                    "{} youtube video(s) failed",
-                    summary.failed.len()
-                )));
+            cli::YoutubeCommand::Search(search_args) => {
+                franken_whisper::cli::run_youtube_search(&search_args)
             }
-            Ok(())
-        }
+            cli::YoutubeCommand::Enrich(enrich_args) => {
+                franken_whisper::cli::run_youtube_enrich(&enrich_args)
+            }
+        },
     }
+}
+
+/// Open a run-history store only if it already exists; `Ok(None)` for a
+/// missing path, so read-only history commands never create a database.
+fn open_existing_history(db: &std::path::Path) -> FwResult<Option<RunStore>> {
+    if !db.try_exists()? {
+        return Ok(None);
+    }
+    RunStore::open(db).map(Some)
 }
 
 fn load_routing_history_details(
@@ -1058,24 +1413,7 @@ fn load_routing_history_details(
         return Ok(store.load_run_details(run_id)?.into_iter().collect());
     }
 
-    let summaries = store.list_recent_runs(limit)?;
-    let run_ids: Vec<String> = summaries.iter().map(|s| s.run_id.clone()).collect();
-    // Two batched queries instead of the per-run N+1 (`load_run_details` × N).
-    let details = store.load_run_details_batch(&run_ids)?;
-    if details.len() != run_ids.len() {
-        // Preserve the per-run error for any run that vanished between the list and
-        // the batched load.
-        let found: std::collections::HashSet<&str> =
-            details.iter().map(|d| d.run_id.as_str()).collect();
-        for id in &run_ids {
-            if !found.contains(id.as_str()) {
-                return Err(FwError::Storage(format!(
-                    "run `{id}` disappeared while loading routing history"
-                )));
-            }
-        }
-    }
-    Ok(details)
+    store.load_recent_run_details(limit)
 }
 
 fn backends_command_output() -> FwResult<String> {
@@ -1196,6 +1534,33 @@ mod tests {
             super::sortformer_audio_duration_ms(16_001).expect("one second plus one sample"),
             1_001
         );
+    }
+
+    #[test]
+    fn history_queries_never_create_a_missing_database() {
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("never-created.sqlite3");
+        assert!(
+            super::open_existing_history(&missing)
+                .expect("probe")
+                .is_none()
+        );
+        let created: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(created.is_empty(), "no files may be created: {created:?}");
+
+        let existing = dir.path().join("existing.sqlite3");
+        RunStore::open(&existing)
+            .expect("create store")
+            .persist_report(&fixture_report("history-run", &existing))
+            .expect("persist");
+        let store = super::open_existing_history(&existing)
+            .expect("open")
+            .expect("existing store opens");
+        assert_eq!(store.list_recent_runs(5).expect("list").len(), 1);
     }
 
     #[test]

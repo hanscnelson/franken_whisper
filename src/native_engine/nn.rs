@@ -64,12 +64,15 @@ fn meta_2d(rows: usize, cols: usize) -> TensorMeta {
     TensorMeta::from_shape(vec![rows, cols], DType::F32, Device::Cpu)
 }
 
-/// House-style worker count: available parallelism capped at 8.
+/// House-style band count: available parallelism capped at 8.
 ///
-/// All the parallel-glue kernels below fan out across at most this many
-/// `std::thread::scope` workers, mirroring [`transpose_parallel`]. The cap
-/// keeps us from oversubscribing the (already rayon-parallel) inner sgemm and
-/// matches the empirically-tuned ceiling used elsewhere in this module.
+/// All the parallel-glue kernels below split their work into at most this
+/// many bands, mirroring [`transpose_parallel`]. The bands run as jobs on the
+/// run's compute pool (`plat::scope`), so the pool — not this count — bounds
+/// how many threads execute them; the count only fixes the partition, which
+/// keeps outputs byte-identical at every `--threads`. The cap keeps the split
+/// coarse next to the (already rayon-parallel) inner sgemm and matches the
+/// empirically-tuned ceiling used elsewhere in this module.
 /// Host parallelism, queried ONCE and cached for the process.
 ///
 /// `std::thread::available_parallelism()` is a `sched_getaffinity` syscall on
@@ -529,6 +532,14 @@ fn kernel_err(e: ft_kernel_cpu::KernelError) -> FwError {
     FwError::InvalidRequest(format!("ft-kernel-cpu: {e}"))
 }
 
+/// bd-4ep1: force the ISA-order-independent reference sgemm for every
+/// `[m,k]x[k,n]` matmul (m > 1). `FT_SGEMM_STRICT_PARITY=1`, default OFF.
+fn strict_parity_sgemm() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FT_SGEMM_STRICT_PARITY").is_some());
+    *ON
+}
+
 /// `[m,k] x [k,n] -> [m,n]`, delegating to FrankenTorch's parallel sgemm.
 ///
 /// # Errors
@@ -564,6 +575,30 @@ pub fn matmul(a: &Mat, b: &Mat) -> FwResult<Mat> {
             }
         }
         return Ok(Mat::from_vec(1, n, out));
+    }
+
+    // bd-4ep1 strict-parity reference path (`FT_SGEMM_STRICT_PARITY=1`,
+    // default OFF): the ft sgemm micro-kernels accumulate in ISA-specific
+    // orders (AVX2 vs NEON), so encoder outputs differ in low bits across
+    // platforms — invisible short-window, but it compounds through long
+    // self-conditioned decodes and flips near-ties (tiled-jfk step 60).
+    // This path accumulates each output in FIXED ascending-k order with
+    // sequential f32 adds (same proven-stable pattern as the m==1 saxpy
+    // above; no FMA contraction), making results bit-identical across
+    // x86_64 and arm64 at a measured throughput cost.
+    if strict_parity_sgemm() {
+        let mut out = vec![0.0f32; m * n];
+        for i in 0..m {
+            let orow = &mut out[i * n..(i + 1) * n];
+            for kk in 0..k {
+                let av = a.data[i * k + kk];
+                let brow = &b.data[kk * n..(kk + 1) * n];
+                for (o, &bv) in orow.iter_mut().zip(brow) {
+                    *o += av * bv;
+                }
+            }
+        }
+        return Ok(Mat::from_vec(m, n, out));
     }
 
     let lhs_meta = meta_2d(m, k);
@@ -2859,8 +2894,96 @@ fn dot_i8_4col(w: &[i8], xa: &[i8], xb: &[i8], xc: &[i8], xd: &[i8]) -> (i32, i3
     }
 }
 
-/// Scalar fallback (non-x86 / no avx2): the reference the AVX2 path reproduces exactly.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+/// AArch64 dispatch for the iOS Tiny-model logits GEMV candidate.
+///
+/// The inherited Apple-M4 evidence says LLVM's ordinary dense-int8 loop can beat a hand-SDOT
+/// kernel, so this route is deliberately **default off** until the exact A18 / Tiny logits shape
+/// wins an interleaved device A/B. Set `FW_ARM_DOTPROD=1` at process launch to enter the candidate;
+/// unset it (or set it to any other value) to retain the accepted scalar/autovectorized baseline.
+/// Both paths are integer-exact: Whisper contractions are at most 5,120 products, so their i32
+/// sums cannot overflow and reassociation cannot change the result.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
+    use std::sync::OnceLock;
+
+    static USE_DOTPROD: OnceLock<bool> = OnceLock::new();
+    let use_dotprod = *USE_DOTPROD.get_or_init(|| {
+        matches!(
+            std::env::var("FW_ARM_DOTPROD").as_deref(),
+            Ok("1" | "true" | "on" | "yes")
+        ) && std::arch::is_aarch64_feature_detected!("dotprod")
+    });
+    if use_dotprod {
+        // SAFETY: the process-sticky dispatch above proved FEAT_DotProd on this CPU. The island
+        // bounds every vector load by the common slice length and handles its tail scalarly.
+        return unsafe { dot_i8_sdot(w, x) };
+    }
+    dot_i8_scalar(w, x)
+}
+
+/// Exact AArch64 SDOT island: four independent accumulators over each 64-byte block.
+///
+/// # Safety
+///
+/// The caller must have established FEAT_DotProd. `w.len()` must equal `x.len()`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+#[allow(unsafe_code)]
+unsafe fn dot_i8_sdot(w: &[i8], x: &[i8]) -> i32 {
+    use core::arch::aarch64::{vaddq_s32, vaddvq_s32, vdotq_s32, vdupq_n_s32, vld1q_s8};
+
+    debug_assert_eq!(w.len(), x.len(), "dot_i8 length mismatch");
+    let len = w.len();
+    let (wp, xp) = (w.as_ptr(), x.as_ptr());
+    let mut a0 = vdupq_n_s32(0);
+    let mut a1 = vdupq_n_s32(0);
+    let mut a2 = vdupq_n_s32(0);
+    let mut a3 = vdupq_n_s32(0);
+    let mut i = 0;
+    while i + 64 <= len {
+        // SAFETY: `i + 64 <= len` bounds all four unaligned 16-byte loads in both equal-length
+        // slices. `vld1q_s8` requires only byte alignment.
+        unsafe {
+            a0 = vdotq_s32(a0, vld1q_s8(wp.add(i)), vld1q_s8(xp.add(i)));
+            a1 = vdotq_s32(a1, vld1q_s8(wp.add(i + 16)), vld1q_s8(xp.add(i + 16)));
+            a2 = vdotq_s32(a2, vld1q_s8(wp.add(i + 32)), vld1q_s8(xp.add(i + 32)));
+            a3 = vdotq_s32(a3, vld1q_s8(wp.add(i + 48)), vld1q_s8(xp.add(i + 48)));
+        }
+        i += 64;
+    }
+    while i + 16 <= len {
+        // SAFETY: `i + 16 <= len` bounds both unaligned vector loads.
+        unsafe {
+            a0 = vdotq_s32(a0, vld1q_s8(wp.add(i)), vld1q_s8(xp.add(i)));
+        }
+        i += 16;
+    }
+    let mut sum = vaddvq_s32(vaddq_s32(vaddq_s32(a0, a1), vaddq_s32(a2, a3)));
+    while i < len {
+        sum += i32::from(w[i]) * i32::from(x[i]);
+        i += 1;
+    }
+    sum
+}
+
+/// Scalar/autovectorized reference used by the AArch64 A/B baseline.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_i8_scalar(w: &[i8], x: &[i8]) -> i32 {
+    let mut acc: i32 = 0;
+    for (a, b) in w.iter().zip(x.iter()) {
+        acc += (*a as i32) * (*b as i32);
+    }
+    acc
+}
+
+/// Scalar fallback (non-x86, non-AArch64): the reference the SIMD paths reproduce exactly.
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "avx2")
+)))]
 #[inline]
 fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
     let mut acc: i32 = 0;
@@ -4985,17 +5108,33 @@ fn kv_f16_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FW_KV_F16").is_some())
 }
 
+/// Materialize only live KV rows instead of zero-filling the future context.
+/// Default-on after whole-job validation; `0` restores full materialization.
+fn kv_live_prefix_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FW_KV_LIVE_PREFIX") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
 /// Incremental key/value cache for autoregressive self-attention.
 ///
-/// Stores keys and values as contiguous `[capacity_tokens, n_state]` row-
-/// major buffers; [`KvCache::append`] copies new per-token rows in and
-/// advances `len`. [`KvCache::keys`] / [`KvCache::values`] expose the
-/// populated prefix as a `[len, n_state]` [`Mat`] for [`attention`].
+/// Reserves capacity for `[capacity_tokens, n_state]` keys and values, but only
+/// materializes the contiguous `[len, n_state]` populated prefix. This avoids
+/// zero-filling dead future rows and lets a beam fork clone only live rows while
+/// retaining allocation capacity for future appends. [`KvCache::append`] extends
+/// the prefix and advances `len`; [`KvCache::keys`] / [`KvCache::values`]
+/// expose that prefix as a [`Mat`] for [`attention`].
 ///
 /// When [`kv_f16_enabled`] is on the storage is f16 (`k16`/`v16`, `k`/`v`
 /// empty), halving the per-step cache-read bandwidth; otherwise f32
 /// (`k`/`v`, `k16`/`v16` empty). The mode is fixed at construction.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct KvCache {
     k: Vec<f32>,
     v: Vec<f32>,
@@ -5006,32 +5145,101 @@ pub struct KvCache {
     k16: Vec<Float16>,
     v16: Vec<Float16>,
     f16: bool,
+    live_prefix: bool,
     len: usize,
     capacity_tokens: usize,
     n_state: usize,
 }
 
+impl Clone for KvCache {
+    fn clone(&self) -> Self {
+        let capacity = self.capacity_tokens * self.n_state;
+        // A beam fork consumes one token before it is either discarded or
+        // forked again. Give the clone exactly that headroom instead of asking
+        // the allocator for a full-context buffer on every hypothesis edge.
+        // Vec still grows normally if a caller appends a wider chunk.
+        let fork_capacity = |source_len: usize| {
+            if self.live_prefix {
+                source_len.saturating_add(self.n_state).min(capacity)
+            } else {
+                capacity
+            }
+        };
+        let clone_prefix = |source: &[f32]| {
+            let mut values = Vec::with_capacity(fork_capacity(source.len()));
+            values.extend_from_slice(source);
+            values
+        };
+        let clone_prefix_f16 = |source: &[Float16]| {
+            let mut values = Vec::with_capacity(fork_capacity(source.len()));
+            values.extend_from_slice(source);
+            values
+        };
+        Self {
+            k: if self.f16 {
+                Vec::new()
+            } else {
+                clone_prefix(&self.k)
+            },
+            v: if self.f16 {
+                Vec::new()
+            } else {
+                clone_prefix(&self.v)
+            },
+            // The optional column-major mirror uses capacity as its row stride,
+            // so it remains fully materialized. Production caches leave it empty.
+            k_columns: self.k_columns.clone(),
+            k16: if self.f16 {
+                clone_prefix_f16(&self.k16)
+            } else {
+                Vec::new()
+            },
+            v16: if self.f16 {
+                clone_prefix_f16(&self.v16)
+            } else {
+                Vec::new()
+            },
+            f16: self.f16,
+            live_prefix: self.live_prefix,
+            len: self.len,
+            capacity_tokens: self.capacity_tokens,
+            n_state: self.n_state,
+        }
+    }
+}
+
 impl KvCache {
-    /// Allocate a cache for up to `capacity_tokens` tokens of width
-    /// `n_state`.
+    /// Reserve a cache for up to `capacity_tokens` tokens of width `n_state`.
+    /// No token rows are initialized until [`Self::append`].
     #[must_use]
     pub fn new(capacity_tokens: usize, n_state: usize) -> Self {
         let f16 = kv_f16_enabled();
-        Self::new_with_layout(capacity_tokens, n_state, f16, false)
+        Self::new_with_layout(
+            capacity_tokens,
+            n_state,
+            f16,
+            false,
+            kv_live_prefix_enabled(),
+        )
     }
 
     /// Construct the historical f32 token-major cache for same-binary A/B.
     #[doc(hidden)]
     #[must_use]
     pub fn new_row_major_keys_for_bench(capacity_tokens: usize, n_state: usize) -> Self {
-        Self::new_with_layout(capacity_tokens, n_state, false, false)
+        Self::new_with_layout(capacity_tokens, n_state, false, false, false)
     }
 
     /// Construct the packed-key f32 candidate for same-binary A/B.
     #[doc(hidden)]
     #[must_use]
     pub fn new_column_major_keys_for_bench(capacity_tokens: usize, n_state: usize) -> Self {
-        Self::new_with_layout(capacity_tokens, n_state, false, true)
+        Self::new_with_layout(capacity_tokens, n_state, false, true, false)
+    }
+
+    #[cfg(test)]
+    fn new_live_prefix_for_test(capacity_tokens: usize, n_state: usize) -> Self {
+        Self::new_with_layout(capacity_tokens, n_state, false, false, true)
     }
 
     fn new_with_layout(
@@ -5039,27 +5247,49 @@ impl KvCache {
         n_state: usize,
         f16: bool,
         column_keys: bool,
+        live_prefix: bool,
     ) -> Self {
         let n = capacity_tokens * n_state;
         Self {
-            k: if f16 { Vec::new() } else { vec![0.0; n] },
-            v: if f16 { Vec::new() } else { vec![0.0; n] },
+            k: if f16 {
+                Vec::new()
+            } else if live_prefix {
+                Vec::with_capacity(n)
+            } else {
+                vec![0.0; n]
+            },
+            v: if f16 {
+                Vec::new()
+            } else if live_prefix {
+                Vec::with_capacity(n)
+            } else {
+                vec![0.0; n]
+            },
             k_columns: if column_keys && !f16 {
                 vec![0.0; n]
             } else {
                 Vec::new()
             },
             k16: if f16 {
-                vec![Float16::from_f32(0.0); n]
+                if live_prefix {
+                    Vec::with_capacity(n)
+                } else {
+                    vec![Float16::from_f32(0.0); n]
+                }
             } else {
                 Vec::new()
             },
             v16: if f16 {
-                vec![Float16::from_f32(0.0); n]
+                if live_prefix {
+                    Vec::with_capacity(n)
+                } else {
+                    vec![Float16::from_f32(0.0); n]
+                }
             } else {
                 Vec::new()
             },
             f16,
+            live_prefix,
             len: 0,
             capacity_tokens,
             n_state,
@@ -5105,6 +5335,12 @@ impl KvCache {
 
     /// Clear the cache (retains the allocation).
     pub fn reset(&mut self) {
+        if self.live_prefix {
+            self.k.clear();
+            self.v.clear();
+            self.k16.clear();
+            self.v16.clear();
+        }
         self.len = 0;
     }
 
@@ -5137,15 +5373,31 @@ impl KvCache {
         let span = t * self.n_state;
         if self.f16 {
             // f16 storage: convert on append (halves the per-step cache-read DRAM).
-            for (dst, &src) in self.k16[off..off + span].iter_mut().zip(&k.data) {
-                *dst = Float16::from_f32(src);
-            }
-            for (dst, &src) in self.v16[off..off + span].iter_mut().zip(&v.data) {
-                *dst = Float16::from_f32(src);
+            if self.live_prefix {
+                self.k16.truncate(off);
+                self.v16.truncate(off);
+                self.k16
+                    .extend(k.data.iter().copied().map(Float16::from_f32));
+                self.v16
+                    .extend(v.data.iter().copied().map(Float16::from_f32));
+            } else {
+                for (dst, &src) in self.k16[off..off + span].iter_mut().zip(&k.data) {
+                    *dst = Float16::from_f32(src);
+                }
+                for (dst, &src) in self.v16[off..off + span].iter_mut().zip(&v.data) {
+                    *dst = Float16::from_f32(src);
+                }
             }
         } else {
-            self.k[off..off + span].copy_from_slice(&k.data);
-            self.v[off..off + span].copy_from_slice(&v.data);
+            if self.live_prefix {
+                self.k.truncate(off);
+                self.v.truncate(off);
+                self.k.extend_from_slice(&k.data[..span]);
+                self.v.extend_from_slice(&v.data[..span]);
+            } else {
+                self.k[off..off + span].copy_from_slice(&k.data);
+                self.v[off..off + span].copy_from_slice(&v.data);
+            }
             if !self.k_columns.is_empty() {
                 for r in 0..t {
                     let token = self.len + r; // ubs:ignore — cache position, not a secret
@@ -6361,6 +6613,181 @@ pub(crate) fn transpose_parallel(data: &[f32], rows: usize, cols: usize) -> Vec<
     out
 }
 
+// ---------------------------------------------------------------------------
+// LSTM forward kernel (bd-uuml): the reusable recurrent primitive for
+// sequence models. First consumer: DTLN-style source separation (bd-mmx3).
+//
+// GATE LAYOUT: rows of `w_ih` / `w_hh` and of both bias vectors are grouped
+// as [i, f, g, o] (PyTorch order) per hidden block. Weight converters
+// importing ONNX (i, o, f, g) or Keras/TF checkpoints MUST permute rows to
+// this layout; the kernel never reorders.
+//
+// NUMERICS: f32 accumulation in a fixed order — per timestep, pre[j] =
+// b_ih[j] + b_hh[j] + dot(x_t, w_ih row j) + dot(h_{t-1}, w_hh row j), with
+// every output row computed independently from its input row. The recurrent
+// gate activation is an explicit weight contract; the candidate gate remains
+// tanh. Splitting a sequence across calls with a carried [`LstmState`]
+// therefore reproduces the single-call result BIT-EXACTLY (asserted by test),
+// which is what makes stateful streaming safe.
+
+/// Activation applied to the input, forget, and output gates of an LSTM.
+/// The candidate gate always uses tanh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LstmRecurrentActivation {
+    /// Standard PyTorch/ONNX logistic sigmoid: `1 / (1 + exp(-x))`.
+    LogisticSigmoid,
+    /// Keras v2 hard sigmoid: `clip(0.2 * x + 0.5, 0, 1)`.
+    HardSigmoid,
+}
+
+impl LstmRecurrentActivation {
+    #[inline]
+    fn apply(self, value: f32) -> f32 {
+        match self {
+            Self::LogisticSigmoid => 1.0 / (1.0 + (-value).exp()),
+            Self::HardSigmoid => (0.2 * value + 0.5).clamp(0.0, 1.0),
+        }
+    }
+}
+
+/// Weights for one LSTM layer. Shapes follow the ONNX/PyTorch projection
+/// convention: `w_ih: [4H, input]`, `w_hh: [4H, H]`, biases `[4H]`. The
+/// recurrent-gate activation is required at construction so imported model
+/// semantics cannot silently inherit the wrong framework default.
+#[derive(Debug, Clone)]
+pub struct LstmWeights {
+    pub w_ih: Mat,
+    pub w_hh: Mat,
+    pub b_ih: Vec<f32>,
+    pub b_hh: Vec<f32>,
+    recurrent_activation: LstmRecurrentActivation,
+}
+
+/// Carried recurrent state (length = hidden size). Empty vectors mean a
+/// fresh session and are zero-initialized by [`LstmWeights::lstm_forward`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LstmState {
+    pub h: Vec<f32>,
+    pub c: Vec<f32>,
+}
+
+impl LstmState {
+    /// Fresh zero state for a hidden size.
+    #[must_use]
+    pub fn zeros(hidden: usize) -> Self {
+        Self {
+            h: vec![0.0; hidden],
+            c: vec![0.0; hidden],
+        }
+    }
+}
+
+impl LstmWeights {
+    /// Validate shape contracts once at construction.
+    pub fn new(
+        w_ih: Mat,
+        w_hh: Mat,
+        b_ih: Vec<f32>,
+        b_hh: Vec<f32>,
+        recurrent_activation: LstmRecurrentActivation,
+    ) -> FwResult<Self> {
+        let hidden = w_hh.cols;
+        if w_ih.rows != 4 * hidden || w_hh.rows != 4 * hidden {
+            return Err(FwError::InvalidRequest(format!(
+                "lstm: weight rows must be 4*hidden ({hidden}); got w_ih {} x {}, w_hh {} x {}",
+                w_ih.rows, w_ih.cols, w_hh.rows, w_hh.cols
+            )));
+        }
+        if b_ih.len() != 4 * hidden || b_hh.len() != 4 * hidden {
+            return Err(FwError::InvalidRequest(format!(
+                "lstm: bias lengths must be 4*hidden ({hidden}); got {} and {}",
+                b_ih.len(),
+                b_hh.len()
+            )));
+        }
+        Ok(Self {
+            w_ih,
+            w_hh,
+            b_ih,
+            b_hh,
+            recurrent_activation,
+        })
+    }
+
+    /// Hidden size H.
+    #[must_use]
+    pub fn hidden_size(&self) -> usize {
+        self.w_hh.cols
+    }
+
+    /// Activation bound to the input, forget, and output gates.
+    #[must_use]
+    pub fn recurrent_activation(&self) -> LstmRecurrentActivation {
+        self.recurrent_activation
+    }
+
+    /// Run the recurrence over `x: [T, input]`, writing one output row per
+    /// timestep, updating `state` in place. An empty `state` starts fresh;
+    /// otherwise its length must equal the hidden size.
+    pub fn lstm_forward(&self, x: &Mat, state: &mut LstmState) -> FwResult<Mat> {
+        let hidden = self.hidden_size();
+        if x.cols != self.w_ih.cols {
+            return Err(FwError::InvalidRequest(format!(
+                "lstm: input width {} != weight input width {}",
+                x.cols, self.w_ih.cols
+            )));
+        }
+        match (state.h.is_empty(), state.c.is_empty()) {
+            (true, true) => *state = LstmState::zeros(hidden),
+            (false, false) => {
+                if state.h.len() != hidden || state.c.len() != hidden {
+                    return Err(FwError::InvalidRequest(format!(
+                        "lstm: carried state length ({}, {}) != hidden size {hidden}",
+                        state.h.len(),
+                        state.c.len()
+                    )));
+                }
+            }
+            _ => {
+                return Err(FwError::InvalidRequest(
+                    "lstm: h and c states must be jointly empty or jointly sized".into(),
+                ));
+            }
+        }
+        let mut out = Mat::zeros(x.rows, hidden);
+        // Gate scratch reused across timesteps: allocation-stable after warmup.
+        let mut pre = vec![0.0f32; 4 * hidden];
+        for t in 0..x.rows {
+            let x_row = &x.data[t * x.cols..(t + 1) * x.cols];
+            for (j, pre_j) in pre.iter_mut().enumerate() {
+                let mut acc = self.b_ih[j] + self.b_hh[j];
+                let w_ih_row = &self.w_ih.data[j * x.cols..(j + 1) * x.cols];
+                for (i, &xi) in x_row.iter().enumerate() {
+                    acc += xi * w_ih_row[i];
+                }
+                let w_hh_row = &self.w_hh.data[j * hidden..(j + 1) * hidden];
+                for (k, &hk) in state.h.iter().enumerate() {
+                    acc += hk * w_hh_row[k];
+                }
+                *pre_j = acc;
+            }
+            let out_row = &mut out.data[t * hidden..(t + 1) * hidden];
+            for k in 0..hidden {
+                let i_gate = self.recurrent_activation.apply(pre[k]);
+                let f_gate = self.recurrent_activation.apply(pre[hidden + k]);
+                let g_gate = (pre[2 * hidden + k]).tanh();
+                let o_gate = self.recurrent_activation.apply(pre[3 * hidden + k]);
+                let c_new = f_gate * state.c[k] + i_gate * g_gate;
+                state.c[k] = c_new;
+                let h_new = o_gate * c_new.tanh();
+                state.h[k] = h_new;
+                out_row[k] = h_new;
+            }
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6385,6 +6812,259 @@ mod tests {
             let data = (0..rows * cols).map(|_| self.next_f32()).collect();
             Mat::from_vec(rows, cols, data)
         }
+    }
+
+    // -- bd-uuml: LSTM forward kernel ---------------------------------------
+
+    /// Independent naive LSTM reference (mirrors the documented [i, f, g, o]
+    /// gate layout and the kernel's accumulation order so parity is tight).
+    fn lstm_naive_reference(
+        w_ih: &Mat,
+        w_hh: &Mat,
+        b_ih: &[f32],
+        b_hh: &[f32],
+        x: &Mat,
+    ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
+        let hidden = w_hh.cols;
+        let mut h = vec![0.0f32; hidden];
+        let mut c = vec![0.0f32; hidden];
+        let mut rows_out = Vec::with_capacity(x.rows);
+        for t in 0..x.rows {
+            let mut next_h = vec![0.0f32; hidden];
+            let mut next_c = vec![0.0f32; hidden];
+            for k in 0..hidden {
+                let mut i_pre = b_ih[k] + b_hh[k];
+                for (i, &xi) in x.row(t).iter().enumerate() {
+                    i_pre += xi * w_ih.data[k * w_ih.cols + i];
+                }
+                for (s, &hv) in h.iter().enumerate() {
+                    i_pre += hv * w_hh.data[k * hidden + s];
+                }
+                let mut f_pre = b_ih[hidden + k] + b_hh[hidden + k];
+                for (i, &xi) in x.row(t).iter().enumerate() {
+                    f_pre += xi * w_ih.data[(hidden + k) * w_ih.cols + i];
+                }
+                for (s, &hv) in h.iter().enumerate() {
+                    f_pre += hv * w_hh.data[(hidden + k) * hidden + s];
+                }
+                let mut g_pre = b_ih[2 * hidden + k] + b_hh[2 * hidden + k];
+                for (i, &xi) in x.row(t).iter().enumerate() {
+                    g_pre += xi * w_ih.data[(2 * hidden + k) * w_ih.cols + i];
+                }
+                for (s, &hv) in h.iter().enumerate() {
+                    g_pre += hv * w_hh.data[(2 * hidden + k) * hidden + s];
+                }
+                let mut o_pre = b_ih[3 * hidden + k] + b_hh[3 * hidden + k];
+                for (i, &xi) in x.row(t).iter().enumerate() {
+                    o_pre += xi * w_ih.data[(3 * hidden + k) * w_ih.cols + i];
+                }
+                for (s, &hv) in h.iter().enumerate() {
+                    o_pre += hv * w_hh.data[(3 * hidden + k) * hidden + s];
+                }
+                let sig = |v: f32| 1.0 / (1.0 + (-v).exp());
+                let c_new = sig(f_pre) * c[k] + sig(i_pre) * g_pre.tanh();
+                next_c[k] = c_new;
+                next_h[k] = sig(o_pre) * c_new.tanh();
+            }
+            rows_out.push(next_h.clone());
+            h = next_h;
+            c = next_c;
+        }
+        (rows_out, h, c)
+    }
+
+    fn lstm_fixture(hidden: usize, input: usize, seed: u64) -> (LstmWeights, Mat) {
+        let mut rng = Lcg::new(seed);
+        let mut w_ih = rng.mat(4 * hidden, input);
+        // Keep activations bounded: scale weights so gates live in a sane range.
+        for v in &mut w_ih.data {
+            *v *= 0.4;
+        }
+        let mut w_hh = rng.mat(4 * hidden, hidden);
+        for v in &mut w_hh.data {
+            *v *= 0.4;
+        }
+        let b_ih = (0..4 * hidden)
+            .map(|i| (i % 5) as f32 * 0.05 - 0.1)
+            .collect();
+        let b_hh = (0..4 * hidden)
+            .map(|i| (i % 3) as f32 * 0.02 - 0.02)
+            .collect();
+        let weights = LstmWeights::new(
+            w_ih,
+            w_hh,
+            b_ih,
+            b_hh,
+            LstmRecurrentActivation::LogisticSigmoid,
+        )
+        .expect("fixture weights");
+        let x = rng.mat(7, input);
+        (weights, x)
+    }
+
+    #[test]
+    fn lstm_forward_matches_naive_reference_on_seeded_inputs() {
+        let (weights, x) = lstm_fixture(8, 5, 0x00_0B_D5);
+        assert_eq!(
+            weights.recurrent_activation(),
+            LstmRecurrentActivation::LogisticSigmoid
+        );
+        let mut state = LstmState::default();
+        let out = weights.lstm_forward(&x, &mut state).expect("forward");
+        let (rows_ref, h_ref, c_ref) = lstm_naive_reference(
+            &weights.w_ih,
+            &weights.w_hh,
+            &weights.b_ih,
+            &weights.b_hh,
+            &x,
+        );
+        for (t, row_ref) in rows_ref.iter().enumerate() {
+            for (k, (a, b)) in out.row(t).iter().zip(row_ref.iter()).enumerate() {
+                assert!((a - b).abs() <= 1e-6, "row {t} gate {k}: {a} vs {b}");
+            }
+        }
+        for k in 0..state.h.len() {
+            assert!((state.h[k] - h_ref[k]).abs() <= 1e-6);
+            assert!((state.c[k] - c_ref[k]).abs() <= 1e-6);
+        }
+    }
+
+    #[test]
+    fn lstm_hard_sigmoid_matches_asymmetric_multiframe_reference() {
+        let w_ih = Mat::from_vec(4, 1, vec![1.2, -0.8, 0.7, 1.5]);
+        let w_hh = Mat::from_vec(4, 1, vec![0.4, -0.3, 0.2, 0.6]);
+        let b_ih = vec![-2.7, 1.4, -0.5, 2.8];
+        let b_hh = vec![0.0; 4];
+        let x = Mat::from_vec(3, 1, vec![1.0, -0.6, 1.8]);
+
+        let hard_weights = LstmWeights::new(
+            w_ih.clone(),
+            w_hh.clone(),
+            b_ih.clone(),
+            b_hh.clone(),
+            LstmRecurrentActivation::HardSigmoid,
+        )
+        .expect("hard-sigmoid weights");
+        let logistic_weights = LstmWeights::new(
+            w_ih,
+            w_hh,
+            b_ih,
+            b_hh,
+            LstmRecurrentActivation::LogisticSigmoid,
+        )
+        .expect("logistic weights");
+
+        let hard_sigmoid = |value: f32| (0.2 * value + 0.5).clamp(0.0, 1.0);
+        let mut expected_h = 0.0f32;
+        let mut expected_c = 0.0f32;
+        let mut expected_rows = Vec::with_capacity(x.rows);
+        for &input in &x.data {
+            let i_pre = -2.7 + input * 1.2 + expected_h * 0.4;
+            let f_pre = 1.4 + input * -0.8 + expected_h * -0.3;
+            let g_pre = -0.5 + input * 0.7 + expected_h * 0.2;
+            let o_pre = 2.8 + input * 1.5 + expected_h * 0.6;
+            expected_c = hard_sigmoid(f_pre) * expected_c + hard_sigmoid(i_pre) * g_pre.tanh();
+            expected_h = hard_sigmoid(o_pre) * expected_c.tanh();
+            expected_rows.push(expected_h);
+        }
+
+        let mut hard_state = LstmState::default();
+        let hard = hard_weights
+            .lstm_forward(&x, &mut hard_state)
+            .expect("hard-sigmoid forward");
+        for (t, (&observed, &expected)) in hard.data.iter().zip(expected_rows.iter()).enumerate() {
+            assert!(
+                (observed - expected).abs() <= 1e-6,
+                "hard-sigmoid row {t}: {observed} vs {expected}"
+            );
+        }
+        assert!((hard_state.h[0] - expected_h).abs() <= 1e-6);
+        assert!((hard_state.c[0] - expected_c).abs() <= 1e-6);
+
+        let mut logistic_state = LstmState::default();
+        let logistic = logistic_weights
+            .lstm_forward(&x, &mut logistic_state)
+            .expect("logistic forward");
+        assert!(
+            hard.data
+                .iter()
+                .zip(&logistic.data)
+                .any(|(hard_value, logistic_value)| { (hard_value - logistic_value).abs() > 1e-3 }),
+            "the fixture must distinguish hard sigmoid from logistic sigmoid"
+        );
+    }
+
+    #[test]
+    fn lstm_split_with_carried_state_is_bit_exact_vs_single_call() {
+        let (weights, x) = lstm_fixture(6, 9, 0xBEEF_CAFE);
+        let mut whole_state = LstmState::default();
+        let whole = weights.lstm_forward(&x, &mut whole_state).expect("whole");
+        let mut split_state = LstmState::default();
+        let head = weights
+            .lstm_forward(
+                &Mat::from_vec(3, x.cols, x.data[..3 * x.cols].to_vec()),
+                &mut split_state,
+            )
+            .expect("head");
+        let tail = weights
+            .lstm_forward(
+                &Mat::from_vec(x.rows - 3, x.cols, x.data[3 * x.cols..].to_vec()),
+                &mut split_state,
+            )
+            .expect("tail");
+        for t in 0..3 {
+            assert_eq!(whole.row(t), head.row(t));
+        }
+        for t in 3..x.rows {
+            assert_eq!(whole.row(t), tail.row(t - 3));
+        }
+        assert_eq!(whole_state.h, split_state.h);
+        assert_eq!(whole_state.c, split_state.c);
+    }
+
+    #[test]
+    fn lstm_rejects_mismatched_dims_and_partial_state() {
+        let (weights, x) = lstm_fixture(4, 6, 0xD1_0001);
+        let wrong_width = Mat::from_vec(2, 5, vec![0.0; 10]);
+        let mut state = LstmState::default();
+        assert!(matches!(
+            weights.lstm_forward(&wrong_width, &mut state),
+            Err(FwError::InvalidRequest(_))
+        ));
+        let mut bad_len = LstmState {
+            h: vec![0.0; 3],
+            c: vec![0.0; 4],
+        };
+        assert!(matches!(
+            weights.lstm_forward(&x, &mut bad_len),
+            Err(FwError::InvalidRequest(_))
+        ));
+        let mut half = LstmState {
+            h: vec![0.0; 4],
+            c: Vec::new(),
+        };
+        assert!(matches!(
+            weights.lstm_forward(&x, &mut half),
+            Err(FwError::InvalidRequest(_))
+        ));
+        let bad_weights = LstmWeights::new(
+            Mat::from_vec(15, 6, vec![0.0; 90]),
+            Mat::from_vec(16, 4, vec![0.0; 64]),
+            vec![0.0; 16],
+            vec![0.0; 16],
+            LstmRecurrentActivation::LogisticSigmoid,
+        );
+        assert!(matches!(bad_weights, Err(FwError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn lstm_default_state_matches_explicit_zero_state() {
+        let (weights, x) = lstm_fixture(5, 7, 0x5EED_0002);
+        let mut implicit = LstmState::default();
+        let a = weights.lstm_forward(&x, &mut implicit).expect("implicit");
+        let mut explicit = LstmState::zeros(weights.hidden_size());
+        let b = weights.lstm_forward(&x, &mut explicit).expect("explicit");
+        assert_eq!(a.data, b.data);
     }
 
     /// The f16-direct encoder quant (`quantize_f16_bytes_to_i7`, `c701b45`) MUST
@@ -7282,6 +7962,31 @@ mod tests {
         assert_eq!(dot_i8(&w, &x), -82_580_480); // 5120 · 127 · (−127)
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn dot_i8_sdot_matches_scalar_reference() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let mut s = 0xA18A_18A1_7D07_0001u64;
+        let mut ni8 = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 24) as i32 % 255 - 127) as i8
+        };
+        for &n in &[
+            0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 384, 1280, 5120,
+        ] {
+            let w: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            let x: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            // SAFETY: runtime detection above proved FEAT_DotProd; both slices have length `n`.
+            let got = unsafe { dot_i8_sdot(&w, &x) };
+            assert_eq!(got, dot_i8_scalar(&w, &x), "SDOT mismatch at n={n}");
+        }
+    }
+
     #[test]
     fn dot_i8_4col_matches_four_dot_i8() {
         // The 4-token column tile must be BIT-IDENTICAL to four independent `dot_i8`
@@ -7895,6 +8600,35 @@ mod tests {
         assert!(cache.is_empty());
         cache.append(&row, &row).unwrap();
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn kv_cache_clone_copies_only_the_live_prefix() {
+        let mut cache = KvCache::new_live_prefix_for_test(8, 4);
+        assert!(cache.k.is_empty());
+        assert!(cache.v.is_empty());
+        assert!(cache.k.capacity() >= 32);
+        assert!(cache.v.capacity() >= 32);
+
+        let first = Mat::from_vec(1, 4, vec![1.0, 2.0, 3.0, 4.0]);
+        cache.append(&first, &first).unwrap();
+        let mut fork = cache.clone();
+        assert_eq!(fork.k, first.data);
+        assert_eq!(fork.v, first.data);
+        assert!(fork.k.capacity() >= 8);
+        assert!(fork.v.capacity() >= 8);
+        assert!(fork.k.capacity() < 32);
+        assert!(fork.v.capacity() < 32);
+
+        let second = Mat::from_vec(1, 4, vec![5.0, 6.0, 7.0, 8.0]);
+        fork.append(&second, &second).unwrap();
+        assert_eq!(cache.len(), 1, "fork append must not mutate the parent");
+        assert_eq!(fork.len(), 2);
+        assert_eq!(fork.key_slice(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+
+        fork.truncate_for_bench(1);
+        fork.append(&first, &first).unwrap();
+        assert_eq!(fork.key_slice(), &[1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]

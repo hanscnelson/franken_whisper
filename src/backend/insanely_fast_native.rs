@@ -82,7 +82,9 @@ use crate::native_engine::mel::N_SAMPLES_30S;
 use crate::native_engine::{self, NativeWhisperModel, decode};
 
 use super::native_audio::analyze_wav;
-use super::whisper_cpp_native::{WordTimestampMode, build_segments, word_timestamp_mode};
+use super::whisper_cpp_native::{
+    WordTimestampMode, build_segments, encoder_provenance_fields, request_word_timestamp_mode,
+};
 
 /// Stable schema tag for the honest native raw-output metadata (shared with the
 /// whisper.cpp native engine so the evidence ledger has one schema).
@@ -160,21 +162,15 @@ pub fn is_available() -> bool {
     super::whisper_cpp_native::is_available()
 }
 
-/// Resolve the effective model spec for a request, or a [`FwError`] explaining
-/// how to provision one. Identical precedence to the whisper.cpp native engine:
+/// Resolve the effective model spec for a request. Identical precedence to the
+/// whisper.cpp native engine:
 /// `request.model`, then `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then the
-/// authenticated default release package, else an actionable
-/// [`FwError::BackendUnavailable`].
-fn effective_model_spec(request: &TranscribeRequest) -> FwResult<String> {
+/// authenticated default release-package sentinel.
+fn effective_model_spec(request: &TranscribeRequest) -> String {
     if let Some(model) = request.model.clone().filter(|m| !m.is_empty()) {
-        return Ok(model);
+        return model;
     }
-    native_engine::configured_or_release_model_spec().map_err(|error| {
-        FwError::BackendUnavailable(format!(
-            "native insanely-fast engine has no usable local model: pass --model, or set \
-             $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. {error}"
-        ))
-    })
+    native_engine::configured_or_release_model_spec()
 }
 
 /// The number of 30 s windows `samples` spans (`ceil(len / N_SAMPLES_30S)`),
@@ -269,29 +265,31 @@ pub(crate) fn plan_ranges(n_windows: usize, n_workers: usize) -> Vec<(usize, usi
 }
 
 /// Resolve the total intra-op thread budget for a request (request override,
-/// else the engine default), mirroring the whisper.cpp native engine.
+/// else the engine default), mirroring the whisper.cpp native engine. The
+/// whole run computes on a pool of exactly this many workers; the parallel
+/// ranges share it (bd-threads-flag-unbounded-f4pq).
 fn total_threads_for(request: &TranscribeRequest) -> usize {
-    request
-        .backend_params
-        .threads
-        .map_or_else(native_engine::default_threads, |t| {
-            usize::try_from(t).unwrap_or_else(|_| native_engine::default_threads())
-        })
+    super::request_compute_threads(request)
 }
 
 /// Build the per-worker [`decode::DecodeParams`] for a request, with the
 /// caller-chosen `threads_per_worker` (the rest of the params are window-shape
 /// independent).
 fn decode_params(request: &TranscribeRequest, threads_per_worker: usize) -> decode::DecodeParams {
-    decode::DecodeParams {
+    let mut params = decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
         // Beam width (`--beam-size`) is a per-window decode param, so it applies
-        // correctly within every range. NOTE: `initial_prompt` is deliberately NOT
-        // wired here — this backend shares one `params` across all ranges, so a
-        // prompt would re-seed EVERY range's first window (per-range bd-r0qd risk +
-        // divergence from whisper.cpp's once-at-start prompt). Faithful streaming
-        // prompt = first-range-only, which needs per-range params (follow-up).
+        // correctly within every range. These params are shared by every range,
+        // so they carry the prompt only when it prefixes every window
+        // (`--carry-initial-prompt`); otherwise it seeds only the clip's first
+        // window (see [`first_range_params`]).
+        initial_prompt: request
+            .backend_params
+            .prompt
+            .clone()
+            .filter(|prompt| !prompt.is_empty() && request.backend_params.carry_initial_prompt),
+        carry_initial_prompt: request.backend_params.carry_initial_prompt,
         beam_size: request
             .backend_params
             .decoding
@@ -310,7 +308,26 @@ fn decode_params(request: &TranscribeRequest, threads_per_worker: usize) -> deco
         n_threads: threads_per_worker,
         max_text_ctx: None,
         ..decode::DecodeParams::default()
-    }
+    };
+    super::apply_native_decode_controls(&mut params, request);
+    params
+}
+
+/// Params for the range that starts at window 0: the shared params plus the
+/// user prompt (whisper `--prompt`). Like the sequential engine, the prompt
+/// seeds only the clip's first window and then ages out of the carried
+/// context; later ranges start from an empty context, as before.
+fn first_range_params(
+    params: &decode::DecodeParams,
+    request: &TranscribeRequest,
+) -> decode::DecodeParams {
+    let mut first = params.clone();
+    first.initial_prompt = request
+        .backend_params
+        .prompt
+        .clone()
+        .filter(|prompt| !prompt.is_empty());
+    first
 }
 
 /// One contiguous range's decode result, tagged with its starting window index
@@ -341,6 +358,18 @@ struct RangeResult {
 pub fn run(
     request: &TranscribeRequest,
     normalized_wav: &Path,
+    work_dir: &Path,
+    timeout: Duration,
+    token: Option<&crate::orchestrator::CancellationToken>,
+) -> FwResult<TranscriptionResult> {
+    native_engine::with_compute_threads(total_threads_for(request), || {
+        run_in_compute_pool(request, normalized_wav, work_dir, timeout, token)
+    })?
+}
+
+fn run_in_compute_pool(
+    request: &TranscribeRequest,
+    normalized_wav: &Path,
     _work_dir: &Path,
     _timeout: Duration,
     token: Option<&crate::orchestrator::CancellationToken>,
@@ -353,17 +382,25 @@ pub fn run(
         tok.checkpoint()?;
     }
 
-    // Resolve the model spec up front so an unavailability error is reported
-    // before any expensive work.
-    let spec = effective_model_spec(request)?;
+    // Select the model spec up front. Package authentication stays below the
+    // silence pre-gate so silent clips avoid hashing multi-GB weights.
+    let spec = effective_model_spec(request);
+
+    // Requested audio window (`--offset-ms` / `--duration-ms`): the normalized
+    // PCM is sliced before decode and timestamps are shifted back into the
+    // source timebase, exactly as on whisper.cpp native.
+    let audio_window = super::requested_audio_window(request);
 
     // Silence pre-gate: cheap energy analysis avoids a multi-GB model load on a
-    // pure-silence clip (shared policy with whisper.cpp native).
-    let analysis = analyze_wav(normalized_wav, request.backend_params.duration_ms).ok();
-    if let Some(analysis) = analysis.as_ref()
-        && analysis.active_regions.is_empty()
-    {
-        return Ok(silence_result(request, &spec, analysis.duration_ms));
+    // pure-silence clip (shared policy with whisper.cpp native). The analyzer
+    // scans the whole clip, so a windowed request skips it.
+    if audio_window.is_none() {
+        let analysis = analyze_wav(normalized_wav, None).ok();
+        if let Some(analysis) = analysis.as_ref()
+            && analysis.active_regions.is_empty()
+        {
+            return Ok(silence_result(request, &spec, analysis.duration_ms));
+        }
     }
 
     if let Some(tok) = token {
@@ -371,14 +408,42 @@ pub fn run(
     }
 
     // Resolve + load the model (cached, reference-counted, read-only weights).
-    let model_path = native_engine::resolve_model(&spec)
-        .map_err(|e| FwError::BackendUnavailable(e.to_string()))?;
-    let model = NativeWhisperModel::load(&model_path)?;
+    let is_cancelled = || token.is_some_and(|token| token.checkpoint().is_err());
+    let model_source = native_engine::resolve_model_source_with_cancel(&spec, &is_cancelled)
+        .map_err(|error| match error {
+            error @ FwError::Cancelled(_) => token
+                .and_then(|token| token.checkpoint().err())
+                .unwrap_or(error),
+            error @ FwError::StageTimeout { .. } => error,
+            other => FwError::BackendUnavailable(format!(
+                "{other}; select a model with --model or FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL, or provision the default with `fw pull whisper`"
+            )),
+        })?;
+    let model_path = model_source.path().to_path_buf();
+    let checkpoint = || token.map_or(Ok(()), crate::orchestrator::CancellationToken::checkpoint);
+    let model = model_source.load_with_checkpoint(&checkpoint)?;
 
-    let samples = read_normalized_wav(normalized_wav)?;
+    let Some((samples, window_offset_ms)) =
+        super::windowed_samples(read_normalized_wav(normalized_wav)?, audio_window)
+    else {
+        let mut result = silence_result(request, &spec, 0);
+        super::tag_audio_window(&mut result.raw_output, audio_window, true);
+        return Ok(result);
+    };
 
     if let Some(tok) = token {
         tok.checkpoint()?;
+    }
+
+    // `--detect-language-only`: report the language without decoding text.
+    if request.backend_params.detect_language_only {
+        let detection = model.detect_language(&samples, &checkpoint)?;
+        return Ok(super::native_language_detection_result(
+            BackendKind::InsanelyFast,
+            "insanely-fast-native",
+            &spec,
+            &detection,
+        ));
     }
 
     // Size the worker pool from the 30 s-window count, then partition the clip
@@ -393,18 +458,23 @@ pub fn run(
     let ranges = plan_ranges(win_count, n_workers);
 
     let params = decode_params(request, threads_per_worker);
+    let first_params = first_range_params(&params, request);
 
     // Decode each contiguous range with the real sequential decode (parallel
     // across workers); merge in range order, offsetting timestamps by each
     // range's base start time.
-    let range_results = decode_ranges_parallel(&model, &samples, &ranges, &params, token)?;
+    let range_results =
+        decode_ranges_parallel(&model, &samples, &ranges, &params, &first_params, token)?;
 
-    let merged = merge_ranges(&range_results);
+    let mut merged = merge_ranges(&range_results);
+    if window_offset_ms > 0 {
+        shift_merged_output(&mut merged, window_offset_ms as f64 / 1000.0);
+    }
     // Seams are the hard cuts BETWEEN ranges: one fewer than the number of
     // (non-empty) ranges actually decoded.
     let seams = ranges.len().saturating_sub(1);
 
-    let word_mode = word_timestamp_mode(request.backend_params.word_timestamps.as_ref());
+    let word_mode = request_word_timestamp_mode(request);
     let segments = build_segments(
         &merged.segments,
         word_mode,
@@ -414,11 +484,12 @@ pub fn run(
     )?;
     let transcript = super::transcript_from_segments(&segments);
     let language = merged.language.or_else(|| request.language.clone());
+    let version_tag = model.version_tag_with_checkpoint(&checkpoint)?;
 
-    let raw_output = raw_output_json(
+    let mut raw_output = raw_output_json(
         &spec,
         &model_path,
-        model.version_tag(),
+        version_tag,
         win_count,
         n_workers,
         threads_per_worker,
@@ -429,6 +500,13 @@ pub fn run(
         request.backend_params.split_on_word,
         false,
     );
+    if let Value::Object(map) = &mut raw_output {
+        map.extend(encoder_provenance_fields(
+            native_engine::encoder_int8_effective_policy_decision(&model.loaded().hparams),
+            &merged.encoder_executions,
+        ));
+    }
+    super::tag_audio_window(&mut raw_output, audio_window, false);
 
     Ok(TranscriptionResult {
         backend: BackendKind::InsanelyFast,
@@ -442,8 +520,10 @@ pub fn run(
     })
 }
 
-/// Decode each contiguous `range` (one per worker) on its own scoped thread,
-/// running the **real sequential** [`NativeWhisperModel::transcribe`]
+/// Decode each contiguous `range` (one per worker) as one job on the run's
+/// compute pool (`plat::scope`; no thread of its own — the ranges and their
+/// nested kernels share the `--threads` pool), running the **real
+/// sequential** [`NativeWhisperModel::transcribe`]
 /// ([`decode::transcribe_samples`]) over the range's contiguous audio span on
 /// the **shared** `Arc<NativeWhisperModel>` (weights are read-only). Returns the
 /// per-range outputs in arbitrary completion order (the caller sorts by start
@@ -455,6 +535,9 @@ pub fn run(
 /// ranges. With a single range (1 worker) this is byte-identical to the
 /// sequential [`whisper_cpp_native`](super::whisper_cpp_native) path.
 ///
+/// The range starting at window 0 decodes with `first_params` (which may carry
+/// the user prompt); every other range decodes with `params`.
+///
 /// Cancellation + first-error: a shared [`AtomicBool`] short-circuits remaining
 /// ranges the moment any range errors (or the token expires); the first error
 /// observed is returned. For a **fixed** range partition the merged result is
@@ -464,13 +547,14 @@ fn decode_ranges_parallel(
     samples: &[f32],
     ranges: &[(usize, usize)],
     params: &decode::DecodeParams,
+    first_params: &decode::DecodeParams,
     token: Option<&crate::orchestrator::CancellationToken>,
 ) -> FwResult<Vec<RangeResult>> {
     let stop = AtomicBool::new(false);
     let first_error: Mutex<Option<FwError>> = Mutex::new(None);
     let results: Mutex<Vec<RangeResult>> = Mutex::new(Vec::with_capacity(ranges.len()));
 
-    std::thread::scope(|scope| {
+    native_engine::plat::scope(|scope| {
         for &(start_window, end_window) in ranges {
             let stop = &stop;
             let first_error = &first_error;
@@ -479,6 +563,11 @@ fn decode_ranges_parallel(
             if span.is_empty() {
                 continue;
             }
+            let params = if start_window == 0 {
+                first_params
+            } else {
+                params
+            };
             scope.spawn(move || {
                 // A worker's checkpoint: honor the orchestrator token AND the
                 // shared stop flag so a sibling's error/cancellation halts every
@@ -543,6 +632,8 @@ struct MergedOutput {
     segments: Vec<TranscriptionSegment>,
     windows: Vec<decode::WindowStats>,
     language: Option<String>,
+    /// Every range's encoder forwards: this run's, and no other run's.
+    encoder_executions: native_engine::encoder::EncoderExecutionTally,
 }
 
 /// Merge per-range decode outputs in range order. Each range decodes its
@@ -564,12 +655,14 @@ fn merge_ranges(results: &[RangeResult]) -> MergedOutput {
     let mut segments = Vec::new();
     let mut windows = Vec::new();
     let mut language = None;
+    let mut encoder_executions = native_engine::encoder::EncoderExecutionTally::default();
 
     for result in results {
         let offset = result.start_window as f64 * WINDOW_SECONDS;
         if language.is_none() {
             language = result.output.language.clone();
         }
+        encoder_executions.merge(&result.output.work.encoder_executions);
         for seg in &result.output.segments {
             segments.push(TranscriptionSegment {
                 start_sec: seg.start_sec.map(|s| s + offset),
@@ -585,6 +678,7 @@ fn merge_ranges(results: &[RangeResult]) -> MergedOutput {
                 no_speech_prob: win.no_speech_prob,
                 tokens: win.tokens,
                 window_offset_sec: win.window_offset_sec + offset,
+                token_attn: win.token_attn.clone(),
             });
         }
     }
@@ -593,6 +687,23 @@ fn merge_ranges(results: &[RangeResult]) -> MergedOutput {
         segments,
         windows,
         language,
+        encoder_executions,
+    }
+}
+
+/// Shift a merged whole-window result into the source timebase of a windowed
+/// (`--offset-ms`) run.
+fn shift_merged_output(merged: &mut MergedOutput, offset_sec: f64) {
+    for segment in &mut merged.segments {
+        if let Some(start) = segment.start_sec.as_mut() {
+            *start += offset_sec;
+        }
+        if let Some(end) = segment.end_sec.as_mut() {
+            *end += offset_sec;
+        }
+    }
+    for window in &mut merged.windows {
+        window.window_offset_sec += offset_sec;
     }
 }
 
@@ -739,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_params_maps_beam_size_but_not_prompt() {
+    fn decode_params_seed_the_prompt_into_the_first_range_only() {
         use crate::model::DecodingParams;
         let mut req = request();
         assert_eq!(decode_params(&req, 4).beam_size, None);
@@ -749,10 +860,29 @@ mod tests {
             ..DecodingParams::default()
         });
         assert_eq!(decode_params(&req, 4).beam_size, Some(3));
-        // initial_prompt is deliberately NOT wired here (shared params re-seed
-        // every range); it stays None even when the request carries a prompt.
+        // The prompt seeds only the clip's first window: the shared params
+        // never carry it, the window-0 range's params do.
         req.backend_params.prompt = Some("domain terms".to_owned());
-        assert_eq!(decode_params(&req, 4).initial_prompt, None);
+        let shared = decode_params(&req, 4);
+        assert_eq!(shared.initial_prompt, None);
+        let first = first_range_params(&shared, &req);
+        let mut expected = shared.clone();
+        expected.initial_prompt = Some("domain terms".to_owned());
+        assert_eq!(
+            first, expected,
+            "only the prompt differs from the shared params"
+        );
+        // An empty prompt is no prompt.
+        req.backend_params.prompt = Some(String::new());
+        assert_eq!(first_range_params(&shared, &req), shared);
+
+        // A carried prompt prefixes every window of every range.
+        req.backend_params.prompt = Some("domain terms".to_owned());
+        req.backend_params.carry_initial_prompt = true;
+        let carried = decode_params(&req, 4);
+        assert!(carried.carry_initial_prompt);
+        assert_eq!(carried.initial_prompt.as_deref(), Some("domain terms"));
+        assert_eq!(first_range_params(&carried, &req), carried);
     }
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
@@ -963,6 +1093,7 @@ mod tests {
                 no_speech_prob: 0.01,
                 tokens: 3,
                 window_offset_sec: offset_sec,
+                token_attn: Vec::new(),
             }],
             dropped_windows: Vec::new(),
             work: decode::DecodeWorkStats::default(),
@@ -996,6 +1127,77 @@ mod tests {
         // Window stats offset too.
         assert_eq!(merged.windows[1].window_offset_sec, 60.0);
         assert_eq!(merged.language, Some("en".to_owned()));
+    }
+
+    /// bd-nt0d: the run's encoder record is every range's forwards, merged;
+    /// a range whose GPU forward fell back keeps its own route.
+    #[test]
+    fn merge_ranges_merges_every_ranges_encoder_executions() {
+        use native_engine::encoder::{
+            EncoderExecution, EncoderPrecision, GemmPrecision, METAL_PRECISION_SOURCE,
+            metal_encoder_precision,
+        };
+        let metal = EncoderExecution {
+            route: "gpu_fused_stem",
+            precision: metal_encoder_precision(true, false, false, 64),
+            precision_source: METAL_PRECISION_SOURCE,
+        };
+        // A CPU fallback runs the CPU weights (f32 here) and reports them.
+        let fallback = EncoderExecution {
+            route: "cpu:gpu_forward_failed",
+            precision: EncoderPrecision {
+                conv_stem: GemmPrecision::F32,
+                attn_qkv: GemmPrecision::F32,
+                attention: GemmPrecision::F32,
+                attn_out: GemmPrecision::F32,
+                mlp_fc1: GemmPrecision::F32,
+                mlp_fc2: GemmPrecision::F32,
+            },
+            precision_source: "encoder_int8_policy",
+        };
+        let mut first = out_with_segment(0.0, 5.0, "first", 0.0);
+        first.work.encoder_executions.record(metal);
+        first.work.encoder_executions.record(metal);
+        let mut second = out_with_segment(1.0, 4.0, "second", 0.0);
+        second.work.encoder_executions.record(fallback);
+        second.work.encoder_executions.record(metal);
+        let merged = merge_ranges(&[
+            RangeResult {
+                start_window: 0,
+                output: first,
+            },
+            RangeResult {
+                start_window: 2,
+                output: second,
+            },
+        ]);
+        assert_eq!(
+            merged.encoder_executions.entries(),
+            [(metal, 3), (fallback, 1)]
+        );
+        assert_eq!(merged.encoder_executions.single_route(), None);
+    }
+
+    #[test]
+    fn windowed_merge_moves_segments_and_windows_into_source_time() {
+        let results = vec![
+            RangeResult {
+                start_window: 0,
+                output: out_with_segment(0.5, 2.0, "first", 0.0),
+            },
+            RangeResult {
+                start_window: 1,
+                output: out_with_segment(1.0, 4.0, "second", 0.0),
+            },
+        ];
+        let mut merged = merge_ranges(&results);
+        shift_merged_output(&mut merged, 60.0);
+        assert_eq!(merged.segments[0].start_sec, Some(60.5));
+        assert_eq!(merged.segments[0].end_sec, Some(62.0));
+        assert_eq!(merged.segments[1].start_sec, Some(91.0));
+        assert_eq!(merged.segments[1].end_sec, Some(94.0));
+        assert_eq!(merged.windows[0].window_offset_sec, 60.0);
+        assert_eq!(merged.windows[1].window_offset_sec, 90.0);
     }
 
     // ── Model resolution / availability ───────────────────────────────────
@@ -1250,8 +1452,8 @@ mod tests {
         let (n_workers, tpw) = plan_workers(win_count, batch_size, total_threads);
         let ranges = plan_ranges(win_count, n_workers);
         let params = det_params(tpw);
-        let results =
-            decode_ranges_parallel(model, samples, &ranges, &params, None).expect("decode");
+        let results = decode_ranges_parallel(model, samples, &ranges, &params, &params, None)
+            .expect("decode");
         let merged = merge_ranges(&results);
         let text: String = merged
             .segments

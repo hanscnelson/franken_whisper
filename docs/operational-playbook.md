@@ -64,8 +64,7 @@ Exit criteria:
    - `cargo test`
 5. Run feature checks relevant to this repo:
    - `cargo check --all-targets --features tui`
-   - `cargo check --all-targets --features gpu-frankentorch`
-   - `cargo check --all-targets --features gpu-frankenjax`
+   - `cargo test --features fj-oracle --test conformance_oracle_tests`
 6. Reconcile tracker and document residual risks explicitly.
 
 ## Escalation Rules
@@ -76,6 +75,29 @@ Escalate before merge when any of the following occurs:
 - Stage budget policy causes non-deterministic behavior.
 - Required external backend prerequisites are unclear to operators.
 
+## Live Session Operations (`fw robot listen`)
+
+- **RAM:** the confirm lane keeps a second model resident beside the fast
+  lane (tiny + large-v3-turbo). Size the host for both, or run
+  `--quality-model none`.
+- **Headless capture:** macOS TCC microphone prompts never render over SSH.
+  Pre-authorize the terminal app before deployment, prove enumeration with
+  `fw robot listen --list-devices` (metadata-only; never prompts), and use
+  `--source stdin-pcm` when no mic is trustworthy. `silent_input` warnings
+  are the TCC-denial signature (zeros, not errors).
+- **Thread sizing:** each live lane (fast, confirm) decodes on its own
+  compute pool (`native_engine::with_compute_threads`); with a confirm lane
+  the two split the default width N (`RAYON_NUM_THREADS`, else the engine
+  default): the fast lane gets ceil(N/2), the confirm lane floor(N/2), at
+  least 1 each, so both busy at once stay within N. Set `RAYON_NUM_THREADS`
+  explicitly for latency-oriented sizing on dedicated boxes. For file
+  transcription, `--threads N` sizes the run's pool directly, clamped to the
+  CPUs the process may use.
+- **Durability:** sessions persist at utterance granularity
+  (backend `native-listen`, savepoint per closed utterance); a crashed
+  session is a listen run without its session-end marker. `--no-persist`
+  opts out entirely.
+
 ## Primary References
 
 - `AGENTS.md`
@@ -84,4 +106,5 @@ Escalate before merge when any of the following occurs:
 - `FEATURE_PARITY.md`
 - `SYNC_STRATEGY.md`
 - `RECOVERY_RUNBOOK.md`
+- `docs/realtime-streaming.md`
 - `TODO_IMPLEMENTATION_TRACKER.md`

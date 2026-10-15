@@ -81,88 +81,38 @@ final class EngineHooks: @unchecked Sendable {
     }()
 }
 
-// ── Result models (the fw_run_prepared JSON, fw_ios.h §The run) ────────────
-
-struct TranscriptSegment: Codable, Identifiable, Hashable {
-    var startSec: Double?
-    var endSec: Double?
-    var text: String
-    var speaker: String?
-    var confidence: Double?
-    var id: String { "\(startSec ?? -1)-\(endSec ?? -1)-\(text)" }
-}
-
-struct SpeakerRun: Codable, Identifiable, Hashable {
-    var startSec: Double?
-    var endSec: Double?
-    var speaker: String?
-    var text: String
-    var segmentCount: Int
-    var speakerConfidence: Double?
-    var id: String { "\(startSec ?? -1)-\(speaker ?? "?")-\(segmentCount)" }
-}
-
-struct WordTiming: Codable, Hashable {
-    var text: String
-    var startSec: Double
-    var endSec: Double
-}
-
-struct Transcription: Codable {
-    var language: String?
-    var segments: [TranscriptSegment]
-    var turns: [Turn]
-    var speakerSegments: [SpeakerRun]
-    var words: [[WordTiming]]?
-    var droppedWindows: Int
-    var audioSec: Double
-    var skippedLeadingSec: Double
-    /// Set when diarization was requested but failed after a successful
-    /// decode (fw_ios.h: the transcript survives, speakerless, with the
-    /// reason here).
-    var diarizationError: String?
-
-    struct Turn: Codable, Hashable {
-        var startMs: UInt64
-        var endMs: UInt64
-        var speakerRef: String?
-    }
-
-    var transcript: String {
-        segments.map { $0.text.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-    }
-}
-
 struct StageInfo: Decodable {
     var audioSec: Double
     var skippedLeadingSec: Double
     var denoised: Bool
 }
 
-struct RunOptions {
+struct LiveDecodeOptions: Encodable {
     var language: String?
     var initialPrompt: String?
-    var translate = false
-    var diarize = false
-    var wordTimestamps = false
+    var endOfUtterance: Bool
+    var alignattHoldbackMs: UInt64 = 200
+    var nThreads: Int = 4
 
-    fileprivate var json: String {
-        var object: [String: Any] = [
-            "translate": translate,
-            "diarize": diarize,
-            "word_timestamps": wordTimestamps,
-        ]
-        if let language, !language.isEmpty, language != "auto" {
-            object["language"] = language
-        }
-        if let initialPrompt, !initialPrompt.trimmingCharacters(in: .whitespaces).isEmpty {
-            object["initial_prompt"] = initialPrompt
-        }
-        let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
-        return String(decoding: data, as: UTF8.self)
+    var json: String {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        guard let data = try? encoder.encode(self),
+              let value = String(data: data, encoding: .utf8)
+        else { return "{}" }
+        return value
     }
+}
+
+struct LiveDecodeResult: Decodable, Equatable {
+    var language: String?
+    var commitText: String
+    var commitThroughSec: Double?
+    var partialTail: String?
+    var commitTokens: UInt64
+    var commitConfidence: Double?
+    var holdback: Bool
+    var endOfUtterance: Bool
 }
 
 // ── The actor ──────────────────────────────────────────────────────────────
@@ -173,6 +123,8 @@ struct RunOptions {
 /// cooperative-pool thread — the same accepted tradeoff as FrankenTTS.
 actor Engine {
     private var handle: OpaquePointer?
+    private var loadedModel: URL?
+    private var lifecycleFence = EngineLifecycleFence()
 
     static func decoder() -> JSONDecoder {
         let decoder = JSONDecoder()
@@ -186,13 +138,23 @@ actor Engine {
 
     /// Hydrates the whisper model from its ggml file. Multi-second on a
     /// phone; the caller watches EngineHooks for "whisper:*" stage markers.
-    func load(modelPath: URL) throws {
-        guard handle == nil else { return }
+    func load(modelPath: URL, lifecycleToken: UInt64) throws {
+        guard lifecycleFence.accept(lifecycleToken) else {
+            throw EngineError.invalid("engine lifecycle operation was superseded")
+        }
+        let requestedModel = modelPath.standardizedFileURL
+        if handle != nil, loadedModel == requestedModel { return }
+        // The physical-device profiler and realtime lane can request different
+        // model files. A non-nil handle is idempotent only for the same file.
+        if let handle { fw_engine_close(handle) }
+        handle = nil
+        loadedModel = nil
         _ = EngineHooks.install
         guard let opened = fw_engine_open(modelPath.path) else {
             throw EngineError.lastFromNative(code: 3)
         }
         handle = opened
+        loadedModel = requestedModel
     }
 
     /// Authenticate + load the Sortformer diarizer (receipt + package paths).
@@ -210,11 +172,15 @@ actor Engine {
 
     /// Drops everything (model, diarizer, denoiser, staged PCM), freeing
     /// ~1.5 GB. Safe to call at any idle moment; the next run reloads.
-    func unload() {
+    func unload(lifecycleToken: UInt64) {
+        // A delayed memory-pressure task must not close a model claimed by a
+        // newer foreground assembly that happened to reach this actor first.
+        guard lifecycleFence.accept(lifecycleToken) else { return }
         if let handle {
             fw_engine_close(handle)
         }
         handle = nil
+        loadedModel = nil
     }
 
     /// Stage microphone PCM (16 kHz mono, [-1, 1]) for the next run.
@@ -247,6 +213,19 @@ actor Engine {
         var out: UnsafeMutablePointer<CChar>?
         let code = fw_run_prepared(handle, options.json, &out)
         return try Self.takeJSON(Transcription.self, code: code, out: out)
+    }
+
+    /// One true-live step over the host's currently uncommitted utterance
+    /// slice. Rust owns dynamic-context decode and the shared AlignAtt policy;
+    /// Swift owns capture, VAD, and the exact sample cursor.
+    func liveDecode(pcm samples: [Float], options: LiveDecodeOptions) throws -> LiveDecodeResult {
+        guard let handle else { throw EngineError.invalid("engine not loaded") }
+        var out: UnsafeMutablePointer<CChar>?
+        let code = samples.withUnsafeBufferPointer { buffer in
+            fw_live_decode_pcm(
+                handle, buffer.baseAddress, buffer.count, options.json, &out)
+        }
+        return try Self.takeJSON(LiveDecodeResult.self, code: code, out: out)
     }
 
     /// Cooperative cancel of the in-flight run: process-wide flag, checked at

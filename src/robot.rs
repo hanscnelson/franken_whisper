@@ -9,7 +9,14 @@ use crate::model::{
     RunEvent, RunReport, TranscriptionResult, TranscriptionSegment,
 };
 
-pub const ROBOT_SCHEMA_VERSION: &str = "1.0.0";
+// 1.0.0 -> 1.1.0 (bd-rt-events-ghdx): additive minor bump introducing the
+// real-time listen session event family (listen.session_start,
+// speech_started, transcript.delta, utterance_end, listen.warning,
+// listen.session_stats). Later 1.1.0 additions include the default-off
+// listen.controller evidence event, the youtube.* ingestion family, device
+// discovery, and the routing-history terminal. No existing field was renamed
+// or removed; 1.0.0 consumers that ignore unknown fields/events are unaffected.
+pub const ROBOT_SCHEMA_VERSION: &str = "1.1.0";
 
 pub const STAGE_REQUIRED_FIELDS: &[&str] = &[
     "event",
@@ -43,6 +50,105 @@ pub const RUN_COMPLETE_REQUIRED_FIELDS: &[&str] = &[
 pub const BACKENDS_DISCOVERY_REQUIRED_FIELDS: &[&str] = &["event", "schema_version", "backends"];
 pub const ROUTING_DECISION_REQUIRED_FIELDS: &[&str] =
     &["event", "schema_version", "run_id", "ts", "code"];
+pub const ROUTING_HISTORY_COMPLETE_REQUIRED_FIELDS: &[&str] =
+    &["event", "schema_version", "records"];
+pub const LISTEN_DEVICE_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "name",
+    "default",
+    "default_sample_rate_hz",
+    "default_channels",
+    "backend",
+];
+
+pub const YOUTUBE_RUN_START_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "output_dir",
+    "n_urls",
+    "batch_file",
+    "concurrency",
+    "batch_size",
+    "backend",
+    "model",
+    "language",
+    "diarize",
+    "keep_audio",
+    "retry_failed",
+    "abort_on_error",
+];
+pub const YOUTUBE_DISCOVERED_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "id",
+    "title",
+    "url",
+];
+pub const YOUTUBE_DOWNLOADING_REQUIRED_FIELDS: &[&str] =
+    &["event", "schema_version", "run_id", "seq", "ts", "id"];
+pub const YOUTUBE_DOWNLOADED_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "id",
+    "audio_path",
+    "bytes",
+    "reused",
+];
+pub const YOUTUBE_TRANSCRIBING_REQUIRED_FIELDS: &[&str] =
+    &["event", "schema_version", "run_id", "seq", "ts", "id"];
+pub const YOUTUBE_DONE_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "id",
+    "md_path",
+    "json_path",
+    "wall_ms",
+    "rtf",
+];
+pub const YOUTUBE_SKIPPED_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "id",
+    "reason",
+];
+pub const YOUTUBE_FAILED_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "id",
+    "title",
+    "error",
+    "attempts",
+];
+pub const YOUTUBE_RUN_COMPLETE_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "done",
+    "skipped",
+    "failed",
+    "cancelled",
+];
 
 pub const TRANSCRIPT_PARTIAL_REQUIRED_FIELDS: &[&str] = &[
     "event",
@@ -77,6 +183,7 @@ pub const HEALTH_REPORT_REQUIRED_FIELDS: &[&str] = &[
     "ffmpeg",
     "database",
     "resources",
+    "audio_input",
     "overall_status",
 ];
 
@@ -104,6 +211,38 @@ pub const TRANSCRIPT_CORRECT_REQUIRED_FIELDS: &[&str] = &[
     "ts",
 ];
 
+/// Required fields of the live confirm lane's `transcript.confirm`
+/// ([`listen_transcript_confirm_value`], `fw robot listen`): keyed by
+/// `utterance_id` where the speculative-window form carries `window_id`.
+pub const LISTEN_TRANSCRIPT_CONFIRM_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "utterance_id",
+    "quality_model_id",
+    "drift",
+    "latency_ms",
+];
+
+/// Required fields of the live confirm lane's `transcript.correct`
+/// ([`listen_transcript_correct_value`], `fw robot listen`): keyed by
+/// `utterance_id`, with no `window_id` and no `replaces_seq`.
+pub const LISTEN_TRANSCRIPT_CORRECT_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "utterance_id",
+    "correction_id",
+    "segments",
+    "quality_model_id",
+    "drift",
+    "latency_ms",
+];
+
 pub const SPECULATION_STATS_REQUIRED_FIELDS: &[&str] = &[
     "event",
     "schema_version",
@@ -125,6 +264,30 @@ pub fn emit_robot_start(request_summary: serde_json::Value) -> FwResult<()> {
 
 pub fn emit_robot_error(message: &str, code: &str) -> FwResult<()> {
     emit_line(&run_error_value(message, code))
+}
+
+/// Build the stable robot envelope for one enumerated input device.
+#[must_use]
+pub fn listen_device_value(device: &crate::capture::InputDeviceInfo) -> serde_json::Value {
+    json!({
+        "event": "listen.device",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "name": device.name,
+        "default": device.is_default,
+        "default_sample_rate_hz": device.default_sample_rate_hz,
+        "default_channels": device.default_channels,
+        "backend": "cpal",
+    })
+}
+
+/// Build the terminal summary for `fw robot routing-history`.
+#[must_use]
+pub fn routing_history_complete_value(records: usize) -> serde_json::Value {
+    json!({
+        "event": "routing_history.complete",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "records": records,
+    })
 }
 
 /// Emit a `run_error` event directly from an [`FwError`], using its
@@ -159,6 +322,191 @@ pub fn emit_pretty_run_report(report: RunReport) -> FwResult<()> {
     let value = owned_run_report_value(report)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Batch mode (bd-batch-transcribe-rraf)
+// ---------------------------------------------------------------------------
+
+/// Schema id of each `fw transcribe --json` batch record.
+pub const BATCH_RESULT_SCHEMA_VERSION: &str = "franken-whisper-batch-result-v1";
+pub const BATCH_RESULT_REQUIRED_FIELDS: &[&str] =
+    &["schema_version", "index", "total", "input", "status"];
+pub const BATCH_COMPLETE_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "total",
+    "succeeded",
+    "failed",
+    "skipped",
+    "status",
+];
+
+/// One input's position in a batch. Robot `run_start`, `run_complete` and
+/// `run_error` events carry it as `batch`; `fw transcribe --json` batch
+/// records carry its fields at top level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BatchItem {
+    /// Zero-based position in input order.
+    pub index: usize,
+    /// Number of inputs in the batch.
+    pub total: usize,
+    /// The input path as given; a non-UTF-8 path is converted lossily (bytes
+    /// that are not UTF-8 become U+FFFD), so match records by `index`.
+    pub input: String,
+}
+
+impl BatchItem {
+    #[must_use]
+    pub fn new(index: usize, total: usize, input: &Path) -> Self {
+        Self {
+            index,
+            total,
+            input: input.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+/// How a batch ended, as reported by `batch.complete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchTally {
+    pub total: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    /// Ctrl+C interrupted the batch, so the process exits 130. The input it
+    /// interrupted is counted in `failed` (its own error is `FW-CANCELLED`);
+    /// the inputs it kept from starting are `skipped`. Set even when the
+    /// interrupted input was the last one and nothing was skipped.
+    pub interrupted: bool,
+}
+
+impl BatchTally {
+    /// Inputs never attempted (an interrupted batch stops early).
+    #[must_use]
+    pub const fn skipped(&self) -> usize {
+        self.total
+            .saturating_sub(self.succeeded)
+            .saturating_sub(self.failed)
+    }
+
+    /// Whether the batch was interrupted: flagged, or stopped before
+    /// attempting every input.
+    const fn cancelled(&self) -> bool {
+        self.interrupted || self.skipped() > 0
+    }
+
+    /// `ok` when every input succeeded, `cancelled` when Ctrl+C interrupted
+    /// the batch (whether or not inputs were left unattempted),
+    /// `incomplete` when an input failed.
+    #[must_use]
+    pub const fn status(&self) -> &'static str {
+        if self.cancelled() {
+            "cancelled"
+        } else if self.failed > 0 {
+            "incomplete"
+        } else {
+            "ok"
+        }
+    }
+
+    /// The batch's process outcome: [`FwError::Cancelled`] when it was
+    /// interrupted (exit 130), [`FwError::BatchIncomplete`] when an input
+    /// failed (exit 1). `batch.complete` reports the same error's code, so
+    /// its `status` and `code` always agree with the exit status.
+    ///
+    /// # Errors
+    ///
+    /// As described above; `Ok(())` only when every input succeeded.
+    pub fn outcome(&self) -> FwResult<()> {
+        if self.cancelled() {
+            return Err(FwError::Cancelled(
+                "batch interrupted before every input finished".to_owned(),
+            ));
+        }
+        if self.failed > 0 {
+            return Err(FwError::BatchIncomplete {
+                failed: self.failed,
+                total: self.total,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The `fw transcribe --json` batch record for a successful input. `report`
+/// is the exact object a single-input `fw transcribe --json` prints.
+pub fn batch_result_value(item: &BatchItem, report: RunReport) -> FwResult<Value> {
+    Ok(json!({
+        "schema_version": BATCH_RESULT_SCHEMA_VERSION,
+        "index": item.index,
+        "total": item.total,
+        "input": item.input,
+        "status": "ok",
+        "report": owned_run_report_value(report)?,
+    }))
+}
+
+/// The `fw transcribe --json` batch record for a failed input.
+#[must_use]
+pub fn batch_error_value(item: &BatchItem, error: &FwError) -> Value {
+    json!({
+        "schema_version": BATCH_RESULT_SCHEMA_VERSION,
+        "index": item.index,
+        "total": item.total,
+        "input": item.input,
+        "status": "error",
+        "error": {
+            "code": error.error_code(),
+            "message": error.to_string(),
+        },
+    })
+}
+
+/// Emit one compact `fw transcribe --json` batch record line.
+pub fn emit_batch_record(value: &Value) -> FwResult<()> {
+    emit_line(value)
+}
+
+/// The robot `batch.complete` terminal event. A batch that did not fully
+/// succeed also carries `code`, the FW-* code of its process outcome
+/// ([`BatchTally::outcome`]), so `FW-BATCH-INCOMPLETE` is observable on the
+/// stream instead of only through the exit status.
+#[must_use]
+pub fn batch_complete_value(tally: &BatchTally) -> Value {
+    let mut value = json!({
+        "event": "batch.complete",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "total": tally.total,
+        "succeeded": tally.succeeded,
+        "failed": tally.failed,
+        "skipped": tally.skipped(),
+        "status": tally.status(),
+    });
+    if let Err(error) = tally.outcome() {
+        value["code"] = Value::from(error.error_code());
+    }
+    value
+}
+
+/// Emit `run_start` for one batch input.
+pub fn emit_robot_batch_start(request_summary: Value, item: &BatchItem) -> FwResult<()> {
+    let mut value = run_start_value(request_summary);
+    value["batch"] = serde_json::to_value(item)?;
+    emit_line(&value)
+}
+
+/// Emit `run_complete` for one batch input.
+pub fn emit_robot_batch_complete(report: &RunReport, item: &BatchItem) -> FwResult<()> {
+    let mut complete = BorrowedComplete::new(report);
+    complete.batch = Some(item);
+    emit_line(&complete)
+}
+
+/// Emit `run_error` for one batch input.
+pub fn emit_robot_batch_error(error: &FwError, item: &BatchItem) -> FwResult<()> {
+    let mut value = run_error_value(&error.to_string(), error.error_code());
+    value["batch"] = serde_json::to_value(item)?;
+    emit_line(&value)
 }
 
 fn owned_run_report_value(report: RunReport) -> serde_json::Result<Value> {
@@ -275,6 +623,12 @@ fn owned_acceleration_value(report: AccelerationReport) -> serde_json::Result<Va
         serde_json::to_value(report.post_mass)?,
     );
     object.insert("notes".to_owned(), owned_string_array(report.notes));
+    if !report.raw_confidences.is_empty() {
+        object.insert(
+            "raw_confidences".to_owned(),
+            serde_json::to_value(report.raw_confidences)?,
+        );
+    }
     Ok(Value::Object(object))
 }
 
@@ -569,6 +923,88 @@ pub fn emit_transcript_correct(
     emit_line(&transcript_correct_value(run_id, correction))
 }
 
+/// Construct an utterance-keyed `transcript.confirm` NDJSON event value for
+/// the live confirm lane (bd-rt-confirm-lane-3okr): the background quality
+/// model re-transcribed a CLOSED utterance and agreed with the fast lane
+/// within tolerance. The append-only contract is untouched — committed
+/// deltas are never rewritten; this verdict is advisory metadata for agents
+/// that want to know the fast text was verified (and how closely a second
+/// engine agreed). Distinct from the speculative-window `transcript.confirm`
+/// (which carries `window_id`/`seq` bookkeeping): the listen variant keys on
+/// `utterance_id` and always follows its `utterance_end`.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn listen_transcript_confirm_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    utterance_id: u32,
+    quality_model_id: &str,
+    drift_wer: f64,
+    drift_confidence_delta: f64,
+    drift_edit_distance: usize,
+    latency_ms: u64,
+) -> serde_json::Value {
+    json!({
+        "event": "transcript.confirm",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "utterance_id": utterance_id,
+        "quality_model_id": quality_model_id,
+        "drift": {
+            "wer_approx": drift_wer,
+            "confidence_delta": drift_confidence_delta,
+            "text_edit_distance": drift_edit_distance,
+        },
+        "latency_ms": latency_ms,
+    })
+}
+
+/// Construct an utterance-keyed `transcript.correct` NDJSON event value for
+/// the live confirm lane (bd-rt-confirm-lane-3okr): the quality model's
+/// re-transcription drifted beyond tolerance, so `segments` carries the
+/// batch-grade version of the utterance. There is deliberately NO
+/// `replaces_seq`/retraction here: the fast lane's committed deltas are
+/// already published history under the append-only contract, and agents
+/// choose whether the corrected text supersedes what they acted on.
+/// Persistence note (bd-rt-persist-a66y interplay): stored segments prefer
+/// the corrected version when one arrives before the run finalizes.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn listen_transcript_correct_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    utterance_id: u32,
+    correction_id: u64,
+    segments: &[crate::model::TranscriptionSegment],
+    quality_model_id: &str,
+    drift_wer: f64,
+    drift_confidence_delta: f64,
+    drift_edit_distance: usize,
+    latency_ms: u64,
+) -> serde_json::Value {
+    json!({
+        "event": "transcript.correct",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "utterance_id": utterance_id,
+        "correction_id": correction_id,
+        "segments": segments,
+        "quality_model_id": quality_model_id,
+        "drift": {
+            "wer_approx": drift_wer,
+            "confidence_delta": drift_confidence_delta,
+            "text_edit_distance": drift_edit_distance,
+        },
+        "latency_ms": latency_ms,
+    })
+}
+
 /// Construct a `transcript.speculation_stats` NDJSON event value.
 #[must_use]
 pub fn speculation_stats_value(
@@ -597,6 +1033,716 @@ pub fn emit_speculation_stats(
     stats: &crate::speculation::SpeculationStats,
 ) -> FwResult<()> {
     emit_line(&speculation_stats_value(run_id, stats))
+}
+
+// ---------------------------------------------------------------------------
+// bd-rt-events-ghdx: Real-time listen session robot events (schema 1.1.0)
+//
+// Contract summary (docs/realtime-streaming.md will carry the prose):
+// - One id: `run_id` — a live session IS a run; `utterance_id` (monotonic u32
+//   from 1) is the sub-grouping key. There is no separate session id.
+// - Listen streams NEVER emit run_start or run_complete. `listen.session_start`
+//   is the acceptance signal; a SUCCESS stream terminates with a final
+//   `listen.session_stats` (`final: true`) and exit 0; a FATAL stream
+//   terminates with `run_error` (final stats best-effort before it).
+// - `transcript.delta` is append-only committed text: concatenating an
+//   utterance's deltas yields its committed transcript, never rewritten by
+//   later deltas. `transcript.partial` remains the mutable tail preview.
+// - `transcript.confirm` / `transcript.correct` may arrive AFTER their
+//   utterance's `utterance_end` (async quality lane) and carry `utterance_id`.
+// ---------------------------------------------------------------------------
+
+pub const LISTEN_SESSION_START_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "source",
+    "capture_backend",
+    "device",
+    "sample_rate_hz",
+    "fast_model",
+    "quality_model",
+    "policy",
+    "step_ms",
+    "partials",
+    "vad",
+];
+
+pub const SPEECH_STARTED_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "utterance_id",
+    "t_session_sec",
+];
+
+pub const TRANSCRIPT_DELTA_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "utterance_id",
+    "text",
+    "t0_sec",
+    "t1_sec",
+    "tokens",
+    "confidence",
+    "stability",
+];
+
+pub const UTTERANCE_END_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "utterance_id",
+    "reason",
+    "t0_sec",
+    "t1_sec",
+    "text",
+    "text_truncated",
+    "delta_count",
+];
+
+pub const LISTEN_WARNING_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "reason",
+    "detail",
+];
+
+pub const LISTEN_SESSION_STATS_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "final",
+    "audio_sec",
+    "wall_sec",
+    "deltas",
+    "utterances",
+    "capture_overruns",
+    "mean_step_latency_ms",
+    "p95_step_latency_ms",
+    "ttft_ms",
+    "policy_holdbacks",
+];
+
+pub const LISTEN_CONTROLLER_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "controller",
+    "from",
+    "to",
+    "reason",
+    "brier",
+    "observations",
+    "fallback_active",
+];
+
+/// `utterance_end.text` cap: beyond this the field is truncated (on a UTF-8
+/// boundary) with `text_truncated: true`; the full text remains
+/// reconstructable from the utterance's deltas, which are never truncated.
+pub const UTTERANCE_END_TEXT_CAP_BYTES: usize = 32 * 1024;
+
+/// Why an utterance closed (`utterance_end.reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtteranceEndReason {
+    /// VAD detected end of speech (the normal, actionable case).
+    Endpoint,
+    /// `--max-utterance-sec` exceeded mid-speech; the next utterance opens
+    /// immediately in the Speech state.
+    Timeout,
+    /// Session buffer forced-trim cascade under pathological continuous
+    /// speech (degraded; see SessionBuffer cap notes).
+    MaxLen,
+    /// Source EOF / Ctrl-C / `--max-seconds` while speech was open.
+    SessionEnd,
+}
+
+impl UtteranceEndReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Endpoint => "endpoint",
+            Self::Timeout => "timeout",
+            Self::MaxLen => "max_len",
+            Self::SessionEnd => "session_end",
+        }
+    }
+}
+
+/// Self-describing header for a live session (`listen.session_start`
+/// payload). The event marks "model loaded, capture running, ready" —
+/// agents key on it before feeding audio expectations.
+#[derive(Debug, Clone)]
+pub struct ListenSessionInfo {
+    /// `mic` | `stdin-pcm` | `file-replay`.
+    pub source: String,
+    /// `cpal` | `ffmpeg` (or `none` for non-device sources).
+    pub capture_backend: String,
+    pub device: String,
+    pub sample_rate_hz: u32,
+    pub fast_model: String,
+    /// `None` when the confirm lane is disabled.
+    pub quality_model: Option<String>,
+    /// `alignatt` | `local-agreement` | `endpoint-commit`.
+    pub policy: String,
+    pub step_ms: u64,
+    /// Whether mutable `transcript.partial` previews are emitted
+    /// (`--no-partials` sets this false).
+    pub partials: bool,
+    /// VAD parameter snapshot (opaque object; agents display, not parse).
+    pub vad: serde_json::Value,
+}
+
+/// Session counters for `listen.session_stats` (periodic heartbeat and the
+/// success-terminal final event).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ListenSessionStats {
+    pub audio_sec: f64,
+    pub wall_sec: f64,
+    pub deltas: u64,
+    pub utterances: u64,
+    pub capture_overruns: u64,
+    pub mean_step_latency_ms: f64,
+    pub p95_step_latency_ms: f64,
+    /// Wall time from session start to the first `transcript.delta`;
+    /// `None` until one is emitted.
+    pub ttft_ms: Option<f64>,
+    pub policy_holdbacks: u64,
+    /// Confirm-lane verdicts that agreed with the fast lane
+    /// (bd-rt-confirm-lane-3okr). Zero when the lane is disabled.
+    pub confirmations_emitted: u64,
+    /// Confirm-lane verdicts that corrected the fast lane. Zero when the
+    /// lane is disabled.
+    pub corrections_emitted: u64,
+    /// Utterance_end -> verdict lag summary in ms (`None` mean = no verdicts
+    /// observed yet). Additive optional contract surface: agents must treat
+    /// absence/null as "lane disabled or nothing confirmed yet".
+    pub confirm_lag_p50_ms: Option<f64>,
+    pub confirm_lag_p95_ms: Option<f64>,
+    pub confirm_lag_max_ms: Option<f64>,
+    /// bd-rt-adaptive-contract-yw68: live controller state snapshots
+    /// (`step_ms` / `holdback_frames` objects, or `{"enabled": false}`).
+    /// Additive optional contract surface: `None` serializes as null and
+    /// agents must treat that as "controllers off".
+    pub controllers: Option<serde_json::Value>,
+}
+
+/// Construct a `listen.session_start` NDJSON event value.
+#[must_use]
+pub fn listen_session_start_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    info: &ListenSessionInfo,
+) -> serde_json::Value {
+    json!({
+        "event": "listen.session_start",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "source": info.source,
+        "capture_backend": info.capture_backend,
+        "device": info.device,
+        "sample_rate_hz": info.sample_rate_hz,
+        "fast_model": info.fast_model,
+        "quality_model": info.quality_model,
+        "policy": info.policy,
+        "step_ms": info.step_ms,
+        "partials": info.partials,
+        "vad": info.vad,
+    })
+}
+
+/// Construct a `speech_started` NDJSON event value (VAD onset; barge-in
+/// trigger for downstream voice loops).
+#[must_use]
+pub fn speech_started_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    utterance_id: u32,
+    t_session_sec: f64,
+) -> serde_json::Value {
+    json!({
+        "event": "speech_started",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "utterance_id": utterance_id,
+        "t_session_sec": t_session_sec,
+    })
+}
+
+/// Construct a `transcript.delta` NDJSON event value — the append-only
+/// committed-text stream agents act on.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn transcript_delta_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    utterance_id: u32,
+    text: &str,
+    t0_sec: f64,
+    t1_sec: f64,
+    tokens: u64,
+    confidence: Option<f64>,
+) -> serde_json::Value {
+    json!({
+        "event": "transcript.delta",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "utterance_id": utterance_id,
+        "text": text,
+        "t0_sec": t0_sec,
+        "t1_sec": t1_sec,
+        "tokens": tokens,
+        "confidence": confidence,
+        "stability": "committed",
+    })
+}
+
+/// Truncate to at most `cap` bytes on a UTF-8 character boundary.
+fn truncate_utf8(text: &str, cap: usize) -> (&str, bool) {
+    if text.len() <= cap {
+        return (text, false);
+    }
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
+/// Construct an `utterance_end` NDJSON event value — the "act now" signal.
+///
+/// `text` is the full committed utterance (concatenated deltas); beyond
+/// [`UTTERANCE_END_TEXT_CAP_BYTES`] it is truncated with
+/// `text_truncated: true` (deltas are never truncated, so the full text
+/// remains reconstructable).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn utterance_end_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    utterance_id: u32,
+    reason: UtteranceEndReason,
+    t0_sec: f64,
+    t1_sec: f64,
+    text: &str,
+    delta_count: u64,
+) -> serde_json::Value {
+    let (emitted, truncated) = truncate_utf8(text, UTTERANCE_END_TEXT_CAP_BYTES);
+    json!({
+        "event": "utterance_end",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "utterance_id": utterance_id,
+        "reason": reason.as_str(),
+        "t0_sec": t0_sec,
+        "t1_sec": t1_sec,
+        "text": emitted,
+        "text_truncated": truncated,
+        "delta_count": delta_count,
+    })
+}
+
+/// Construct a `listen.warning` NDJSON event value (structured non-fatal
+/// degradation: silent_input, capture_overrun, fallback_capture_backend,
+/// fast_model_fallback, quality_model_unavailable, confirm_lag, forced_trim,
+/// decode_behind, persist_degraded, endpoint_flush_timeout, ...).
+#[must_use]
+pub fn listen_warning_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    reason: &str,
+    detail: serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "event": "listen.warning",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "reason": reason,
+        "detail": detail,
+    })
+}
+
+/// Construct a `listen.session_stats` NDJSON event value. Periodic emissions
+/// (`final: false`) double as a liveness heartbeat during long silence; the
+/// success terminal is the final emission (`final: true`).
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn listen_session_stats_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    stats: &ListenSessionStats,
+    is_final: bool,
+) -> serde_json::Value {
+    json!({
+        "event": "listen.session_stats",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "final": is_final,
+        "audio_sec": stats.audio_sec,
+        "wall_sec": stats.wall_sec,
+        "deltas": stats.deltas,
+        "utterances": stats.utterances,
+        "capture_overruns": stats.capture_overruns,
+        "controllers": stats.controllers,
+        "mean_step_latency_ms": stats.mean_step_latency_ms,
+        "p95_step_latency_ms": stats.p95_step_latency_ms,
+        "ttft_ms": stats.ttft_ms,
+        "policy_holdbacks": stats.policy_holdbacks,
+        "confirmations_emitted": stats.confirmations_emitted,
+        "corrections_emitted": stats.corrections_emitted,
+        "confirm_lag_p50_ms": stats.confirm_lag_p50_ms,
+        "confirm_lag_p95_ms": stats.confirm_lag_p95_ms,
+        "confirm_lag_max_ms": stats.confirm_lag_max_ms,
+    })
+}
+
+/// Construct a `listen.controller` NDJSON event value (bd-rt-adaptive-
+/// contract-yw68): one auditable adaptive-controller decision.
+#[must_use]
+pub fn listen_controller_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    entry: &crate::listen::AdaptiveControllerEntry,
+) -> serde_json::Value {
+    let mut value = json!({
+        "event": "listen.controller",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+    });
+    if let (Some(obj), Ok(payload)) = (value.as_object_mut(), serde_json::to_value(entry))
+        && let Some(fields) = payload.as_object()
+    {
+        for (key, item) in fields {
+            obj.insert(key.clone(), item.clone());
+        }
+    }
+    value
+}
+
+// ---------------------------------------------------------------------------
+// bd-rt-events-ghdx: shared listen-stream invariant validator
+// ---------------------------------------------------------------------------
+
+/// Expected terminal shape of a listen stream (derived from the process exit
+/// code by callers: 0 => Success, nonzero => Fatal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamOutcome {
+    /// Terminates with a final `listen.session_stats` (`final: true`).
+    Success,
+    /// Terminates with `run_error` (final stats best-effort before it).
+    Fatal,
+}
+
+/// The single shared invariant engine for listen NDJSON streams
+/// (bd-rt-events-ghdx polish item 5). Reused by the e2e suite, the TTY
+/// relay round-trip test, and the TUI sink-ordering test — one set of teeth.
+///
+/// On violation, the error message names the invariant, the offending event
+/// index and JSON, and up to three events of context on either side.
+pub struct NdjsonStreamValidator {
+    pub outcome: StreamOutcome,
+}
+
+impl NdjsonStreamValidator {
+    #[must_use]
+    pub fn new(outcome: StreamOutcome) -> Self {
+        Self { outcome }
+    }
+
+    /// Validate a parsed listen event stream against the full 1.1.0 listen
+    /// contract. Returns the first violation as a detailed message.
+    pub fn validate(&self, events: &[serde_json::Value]) -> Result<(), String> {
+        if events.is_empty() {
+            return Err("empty stream: expected at least listen.session_start".into());
+        }
+        let name = |e: &serde_json::Value| -> String {
+            e.get("event")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<missing>")
+                .to_owned()
+        };
+
+        // Per-event structural checks.
+        let mut last_seq: Option<u64> = None;
+        for (idx, event) in events.iter().enumerate() {
+            let kind = name(event);
+            if kind == "<missing>" {
+                return Err(violation(
+                    events,
+                    idx,
+                    "every event carries a string `event` field",
+                ));
+            }
+            match event.get("schema_version").and_then(|v| v.as_str()) {
+                Some(ROBOT_SCHEMA_VERSION) => {}
+                _ => {
+                    return Err(violation(
+                        events,
+                        idx,
+                        "every event carries schema_version == ROBOT_SCHEMA_VERSION",
+                    ));
+                }
+            }
+            if kind == "run_start" || kind == "run_complete" {
+                return Err(violation(
+                    events,
+                    idx,
+                    "listen streams never emit run_start/run_complete",
+                ));
+            }
+            if let Some(required) = listen_required_fields(&kind) {
+                for field in required {
+                    if event.get(*field).is_none() {
+                        return Err(violation(
+                            events,
+                            idx,
+                            &format!("`{kind}` is missing required field `{field}`"),
+                        ));
+                    }
+                }
+            }
+            if let Some(seq) = event.get("seq").and_then(serde_json::Value::as_u64) {
+                if let Some(prev) = last_seq
+                    && seq <= prev
+                {
+                    return Err(violation(
+                        events,
+                        idx,
+                        &format!("seq must be strictly increasing (prev {prev}, got {seq})"),
+                    ));
+                }
+                last_seq = Some(seq);
+            }
+        }
+
+        // Stream shape: first and terminal events.
+        if name(&events[0]) != "listen.session_start" {
+            return Err(violation(
+                events,
+                0,
+                "first event must be listen.session_start",
+            ));
+        }
+        let last_idx = events.len() - 1;
+        match self.outcome {
+            StreamOutcome::Success => {
+                let last = &events[last_idx];
+                let is_final_stats = name(last) == "listen.session_stats"
+                    && last.get("final").and_then(serde_json::Value::as_bool) == Some(true);
+                if !is_final_stats {
+                    return Err(violation(
+                        events,
+                        last_idx,
+                        "success streams terminate with listen.session_stats {final: true}",
+                    ));
+                }
+            }
+            StreamOutcome::Fatal => {
+                if name(&events[last_idx]) != "run_error" {
+                    return Err(violation(
+                        events,
+                        last_idx,
+                        "fatal streams terminate with run_error as the last event",
+                    ));
+                }
+            }
+        }
+
+        // Utterance lifecycle + append-only reconstruction.
+        let mut open: Option<(u32, String, u64)> = None; // (id, committed_text, delta_count)
+        let mut next_expected_id: u32 = 1;
+        let mut closed_ids: Vec<u32> = Vec::new();
+        for (idx, event) in events.iter().enumerate() {
+            let uid = event
+                .get("utterance_id")
+                .and_then(serde_json::Value::as_u64);
+            match name(event).as_str() {
+                "speech_started" => {
+                    if open.is_some() {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "speech_started while an utterance is already open (at most one open utterance)",
+                        ));
+                    }
+                    let id = uid.unwrap_or(0) as u32;
+                    if id != next_expected_id {
+                        return Err(violation(
+                            events,
+                            idx,
+                            &format!(
+                                "utterance ids are monotonic from 1 (expected {next_expected_id}, got {id})"
+                            ),
+                        ));
+                    }
+                    open = Some((id, String::new(), 0));
+                }
+                "transcript.delta" => {
+                    let Some((open_id, committed, count)) = open.as_mut() else {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "transcript.delta outside an open utterance",
+                        ));
+                    };
+                    if uid != Some(u64::from(*open_id)) {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "transcript.delta utterance_id must match the open utterance",
+                        ));
+                    }
+                    committed.push_str(event.get("text").and_then(|v| v.as_str()).unwrap_or(""));
+                    *count += 1;
+                }
+                "transcript.partial" => {
+                    if let (Some(partial_uid), Some((open_id, _, _))) = (uid, open.as_ref()) {
+                        if partial_uid != u64::from(*open_id) {
+                            return Err(violation(
+                                events,
+                                idx,
+                                "transcript.partial utterance_id must match the open utterance",
+                            ));
+                        }
+                    } else if uid.is_some() && open.is_none() {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "transcript.partial with utterance_id outside an open utterance",
+                        ));
+                    }
+                }
+                "utterance_end" => {
+                    let Some((open_id, committed, count)) = open.take() else {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "utterance_end without a matching speech_started",
+                        ));
+                    };
+                    if uid != Some(u64::from(open_id)) {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "utterance_end utterance_id must match the open utterance",
+                        ));
+                    }
+                    let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    let truncated = event
+                        .get("text_truncated")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let append_only_ok = if truncated {
+                        committed.starts_with(text)
+                    } else {
+                        committed == text
+                    };
+                    if !append_only_ok {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "append-only violation: utterance_end.text must equal the concatenated deltas",
+                        ));
+                    }
+                    if event.get("delta_count").and_then(serde_json::Value::as_u64) != Some(count) {
+                        return Err(violation(
+                            events,
+                            idx,
+                            &format!("delta_count must equal the observed delta events ({count})"),
+                        ));
+                    }
+                    closed_ids.push(open_id);
+                    next_expected_id += 1;
+                }
+                "transcript.confirm" | "transcript.correct" => {
+                    if let Some(confirm_uid) = uid {
+                        let confirm_id = confirm_uid as u32;
+                        if !closed_ids.contains(&confirm_id) {
+                            return Err(violation(
+                                events,
+                                idx,
+                                "confirm/correct must reference an already-closed utterance",
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some((open_id, _, _)) = open {
+            return Err(format!(
+                "utterance {open_id} was opened by speech_started but never closed by utterance_end \
+                 (every speech_started pairs 1:1 with an utterance_end)"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Required-field table for the listen event family (validator lookup).
+fn listen_required_fields(event: &str) -> Option<&'static [&'static str]> {
+    match event {
+        "listen.session_start" => Some(LISTEN_SESSION_START_REQUIRED_FIELDS),
+        "speech_started" => Some(SPEECH_STARTED_REQUIRED_FIELDS),
+        "transcript.delta" => Some(TRANSCRIPT_DELTA_REQUIRED_FIELDS),
+        "utterance_end" => Some(UTTERANCE_END_REQUIRED_FIELDS),
+        "listen.warning" => Some(LISTEN_WARNING_REQUIRED_FIELDS),
+        "listen.session_stats" => Some(LISTEN_SESSION_STATS_REQUIRED_FIELDS),
+        "listen.controller" => Some(LISTEN_CONTROLLER_REQUIRED_FIELDS),
+        "run_error" => Some(RUN_ERROR_REQUIRED_FIELDS),
+        _ => None,
+    }
+}
+
+/// Format a validator violation with the offending event and ±3 events of
+/// context so streaming-contract failures are debuggable from the message.
+fn violation(events: &[serde_json::Value], idx: usize, invariant: &str) -> String {
+    use std::fmt::Write as _;
+    let mut msg = format!("listen stream invariant violated at event #{idx}: {invariant}\n");
+    let start = idx.saturating_sub(3);
+    let end = (idx + 4).min(events.len());
+    for (i, event) in events.iter().enumerate().take(end).skip(start) {
+        let marker = if i == idx { ">>>" } else { "   " };
+        let _ = writeln!(msg, "{marker} [{i}] {event}");
+    }
+    msg
 }
 
 // ---------------------------------------------------------------------------
@@ -649,7 +1795,27 @@ pub struct HealthReport {
     pub ffmpeg: DependencyCheck,
     pub database: DependencyCheck,
     pub resources: ResourceSnapshot,
+    /// Audio input availability (bd-rt-device-probe-wh02). Machine diagnostics
+    /// defer hardware enumeration: native audio drivers can emit diagnostics
+    /// outside Rust logging. `fw robot listen --list-devices` is the explicit probe.
+    /// Additive to the 1.x schema (never in the required-field constants);
+    /// does not participate in `overall_status` (a headless box without a
+    /// mic is healthy for every batch workload).
+    pub audio_input: AudioInputCheck,
     pub overall_status: CheckStatus,
+}
+
+/// Enumeration-only audio input snapshot for `health.report.audio_input`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioInputCheck {
+    /// False means availability and device count have not been measured.
+    pub probed: bool,
+    pub available: bool,
+    pub default_device: Option<String>,
+    pub device_count: usize,
+    /// Capture backend the driver would try first.
+    pub backend: &'static str,
+    pub issues: Vec<String>,
 }
 
 /// Check if ffmpeg is available via env override, PATH, or provisioned bundle.
@@ -747,19 +1913,57 @@ pub fn check_database(db_path: &Path) -> DependencyCheck {
     }
 }
 
-/// Gather system resource information (disk and memory).
+/// Gather system resource information: memory, and disk space on the
+/// filesystem that holds (or will hold) `storage_path`.
 #[must_use]
-pub fn snapshot_resources() -> ResourceSnapshot {
-    // We intentionally provide a best-effort snapshot without unsafe code.
-    // On Linux we parse /proc/meminfo; on other platforms we return None.
+pub fn snapshot_resources(storage_path: &Path) -> ResourceSnapshot {
+    // Best-effort and without unsafe code: /proc/meminfo for memory, statvfs
+    // for disk; anything unavailable on this platform stays None.
     let (memory_available_bytes, memory_total_bytes) = read_meminfo();
+    let (disk_free_bytes, disk_total_bytes) = disk_space_for(storage_path);
 
     ResourceSnapshot {
-        disk_free_bytes: None,
-        disk_total_bytes: None,
+        disk_free_bytes,
+        disk_total_bytes,
         memory_available_bytes,
         memory_total_bytes,
     }
+}
+
+/// `(available-to-unprivileged, total)` bytes of the filesystem containing
+/// the nearest existing ancestor of `path` (the store may not exist yet).
+#[cfg(unix)]
+fn disk_space_for(path: &Path) -> (Option<u64>, Option<u64>) {
+    let Some(existing) = path.ancestors().find(|ancestor| {
+        let probe = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        probe.exists()
+    }) else {
+        return (None, None);
+    };
+    let probe = if existing.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        existing
+    };
+    match rustix::fs::statvfs(probe) {
+        Ok(stats) => {
+            let fragment = stats.f_frsize;
+            (
+                stats.f_bavail.checked_mul(fragment),
+                stats.f_blocks.checked_mul(fragment),
+            )
+        }
+        Err(_) => (None, None),
+    }
+}
+
+#[cfg(not(unix))]
+fn disk_space_for(_path: &Path) -> (Option<u64>, Option<u64>) {
+    (None, None)
 }
 
 /// Parse `/proc/meminfo` for MemTotal and MemAvailable (Linux only).
@@ -789,7 +1993,7 @@ fn parse_meminfo_kb(s: &str) -> Option<u64> {
     numeric_part.parse::<u64>().ok().map(|kb| kb * 1024)
 }
 
-/// Build a comprehensive health report by probing all subsystems.
+/// Build a health report without probing optional audio hardware.
 #[must_use]
 pub fn build_health_report(db_path: &Path) -> HealthReport {
     let ts = chrono::Utc::now().to_rfc3339();
@@ -816,7 +2020,7 @@ pub fn build_health_report(db_path: &Path) -> HealthReport {
 
     let ffmpeg = check_ffmpeg();
     let database = check_database(db_path);
-    let resources = snapshot_resources();
+    let resources = snapshot_resources(db_path);
 
     // Determine overall status.
     let any_backend_available = backends.iter().any(|b| b.available);
@@ -828,12 +2032,25 @@ pub fn build_health_report(db_path: &Path) -> HealthReport {
         CheckStatus::Unavailable
     };
 
+    let audio_input = AudioInputCheck {
+        probed: false,
+        available: false,
+        default_device: None,
+        device_count: 0,
+        backend: "cpal",
+        issues: vec![
+            "audio input not probed; use `fw robot listen --list-devices` to enumerate hardware"
+                .to_owned(),
+        ],
+    };
+
     HealthReport {
         ts,
         backends,
         ffmpeg,
         database,
         resources,
+        audio_input,
         overall_status,
     }
 }
@@ -856,6 +2073,14 @@ pub fn health_report_value(report: &HealthReport) -> serde_json::Value {
             "disk_total_bytes": report.resources.disk_total_bytes,
             "memory_available_bytes": report.resources.memory_available_bytes,
             "memory_total_bytes": report.resources.memory_total_bytes,
+        },
+        "audio_input": {
+            "probed": report.audio_input.probed,
+            "available": report.audio_input.available,
+            "default_device": report.audio_input.default_device,
+            "device_count": report.audio_input.device_count,
+            "backend": report.audio_input.backend,
+            "issues": report.audio_input.issues,
         },
         "overall_status": report.overall_status.as_str(),
     })
@@ -892,6 +2117,14 @@ pub fn capabilities_value() -> serde_json::Value {
             "cpu_backend": "frankentorch",
             "metal_target_compiled": cfg!(target_os = "macos"),
             "metal_runtime_policy": "automatic_for_eligible_large_operations",
+            "encoder_precision": encoder_precision_capability_value(),
+        },
+        "ios_surface": {
+            "artifact": "fw-ios staticlib (C ABI) + SwiftUI app",
+            "header": "fw-ios/include/fw_ios.h",
+            "contract_doc": "docs/fw_ios_contract.md",
+            "abi_parity_guard": "tests/fw_ios_header_parity.rs",
+            "note": "separate build product; not part of this CLI binary",
         },
         "agent_orientation": {
             "command": "fw robot triage",
@@ -911,7 +2144,13 @@ pub fn capabilities_value() -> serde_json::Value {
             {"command": "fw robot schema", "output": "json"},
             {"command": "fw robot backends", "output": "json"},
             {"command": "fw robot run --input AUDIO", "output": "ndjson"},
+            {"command": "fw robot run --inputs-from LIST", "output": "ndjson"},
+            {"command": "fw transcribe --inputs-from LIST --json", "output": "ndjson"},
+            {"command": "fw youtube run --url URL --json-summary", "output": "json"},
+            {"command": "fw youtube search QUERY [--limit N] [--flat]", "output": "json"},
+            {"command": "fw youtube enrich URL_OR_ID...", "output": "json"},
         ],
+        "batch": batch_capability_value(),
         "privacy": {
             "agent_discovery_network_access": false,
             "inference_model_downloads_automatic": false,
@@ -923,6 +2162,101 @@ pub fn capabilities_value() -> serde_json::Value {
         "process_exit_codes": process_exit_codes,
         "error_codes": error_codes,
         "robot_schema_version": ROBOT_SCHEMA_VERSION,
+    })
+}
+
+/// The native Whisper encoder precision policy (bd-int8-encoder-mishears-m1q9):
+/// which encoder arithmetic each calibrated model gets by default on this
+/// build, why, and the process override. Every native backend's run records
+/// the decision in `raw_output.encoder_int8_policy` and what its encoder
+/// forwards actually ran in `raw_output.encoder_execution` (bd-nt0d).
+fn encoder_precision_capability_value() -> Value {
+    use crate::native_engine::EncoderInt8PolicyAction;
+    let action = |action| match action {
+        EncoderInt8PolicyAction::F32Encoder => "f32",
+        EncoderInt8PolicyAction::QualitySafeInt8Encoder => "quality_safe_int8",
+    };
+    let calibrated: Vec<Value> = crate::native_engine::encoder_int8_calibrated_defaults()
+        .iter()
+        .map(|(model, decision)| {
+            json!({
+                "model": model,
+                "default": action(decision.action),
+                "reason": decision.reason,
+                "measured_corpus_wer_delta": decision.measured_corpus_wer_delta,
+            })
+        })
+        .collect();
+    let process_override = match crate::native_engine::enc_attn_out_i8i32_override() {
+        Some(true) => Value::from("quality_safe_int8"),
+        Some(false) => Value::from("f32"),
+        None => Value::Null,
+    };
+    // The Metal encoder's shipped kernels (whisper head width 64, conv stem
+    // on the GPU), from the same function that fills a Metal run's record.
+    let metal: serde_json::Map<String, Value> =
+        crate::native_engine::encoder::metal_encoder_precision(true, false, false, 64)
+            .families()
+            .iter()
+            .map(|(family, p)| ((*family).to_owned(), Value::from(p.as_str())))
+            .collect();
+    json!({
+        "int8_kernels_compiled": crate::native_engine::encoder_i8_kernel_supported(),
+        "calibration_id": crate::native_engine::ENCODER_INT8_CALIBRATION_ID,
+        "corpus_wer_delta_budget": crate::native_engine::ENCODER_INT8_WER_DELTA_BUDGET,
+        "calibrated_models": calibrated,
+        "uncalibrated_models": "f32",
+        "override_env": "FW_ENC_ATTN_OUT_I8I32",
+        "override_values": {
+            "1": "quality_safe_int8 for every model on the CPU encoder (faster, different word errors); the macOS Metal encoder (models of width >= 1024) never runs the int8 kernels: f16 weights and f16-rounded GEMM operands with f32 accumulation, see metal_encoder_precision",
+            "0": "f32 for every model on the CPU encoder; the macOS Metal encoder is unchanged",
+        },
+        "metal_encoder_precision": metal,
+        "process_override": process_override,
+        "policy_record": "result.raw_output.encoder_int8_policy",
+        "per_run_record": "result.raw_output.encoder_execution",
+    })
+}
+
+/// The batch-mode contract advertised by `fw capabilities --json` so agents
+/// can feature-detect it (bd-batch-transcribe-rraf).
+fn batch_capability_value() -> Value {
+    let transcribe_json = json!({
+        "format": "ndjson",
+        "schema_version": BATCH_RESULT_SCHEMA_VERSION,
+        "required": BATCH_RESULT_REQUIRED_FIELDS,
+        "status": ["ok", "error"],
+        "ok": "`report` is the object single-input `fw transcribe --json` prints",
+        "error": "`error` is {code, message} with a stable FW-* code",
+        "order": "one line per attempted input, in input order",
+        "outcome": "no summary line: the exit status is the batch outcome (0 every input ok; 1 an input failed, or the whole batch was invalid and printed no records, with the reason on stderr; 130 interrupted); FW-BATCH-INCOMPLETE itself appears only on the robot stream",
+    });
+    let robot_run = json!({
+        "per_input": ["run_start", "stage*", "run_complete | run_error"],
+        "batch_field": "run_start, run_complete and run_error carry batch {index, total, input}",
+        "terminal": "batch.complete",
+        "terminal_required": BATCH_COMPLETE_REQUIRED_FIELDS,
+        "terminal_code": "present unless status is ok: FW-BATCH-INCOMPLETE (an input failed, exit 1) or FW-CANCELLED (interrupted by Ctrl+C, exit 130)",
+        "batch_level_failure": "invalid shared flags or an unreadable --inputs-from list fail the whole batch before any input runs: run_start then run_error, both without `batch`, and no batch.complete (as for an invalid single run)",
+    });
+    json!({
+        "supported": true,
+        "commands": ["fw transcribe", "fw robot run"],
+        "flags": {
+            "--input PATH": "repeatable; two or more select batch mode",
+            "--inputs-from FILE": "one path per line, `-` reads stdin; always batch mode",
+        },
+        "input_order": "every --input, then each --inputs-from line; blank lines skipped",
+        "model_loads": "once per process; every input reuses the authenticated, parsed models",
+        "per_input_result": "identical to a single-input run with the same flags",
+        "transcribe_json": transcribe_json,
+        "robot_run": robot_run,
+        "failure_isolation": "a failed input does not stop the batch; a panicking input fails alone with FW-CONTRACT-VIOLATION in unwinding builds (the shipped release binary aborts on any panic)",
+        "timeout": "--timeout SEC bounds each input separately: an input that exceeds it fails alone and the batch goes on; there is no whole-batch deadline",
+        "exit_code_when_any_input_fails": 1,
+        "error_code_when_any_input_fails": "FW-BATCH-INCOMPLETE",
+        "unsupported_with": ["--stdin", "--mic", "--speaker-hints", "--transcript-path"],
+        "output_files": "--output-* files go to ./<input stem>.<ext>; a batch naming two different files whose stems are equal ignoring case (one file on case-insensitive file systems) is rejected before any work",
     })
 }
 
@@ -950,21 +2284,21 @@ where
     let whisper_package_available =
         crate::model_distribution::cached_whisper_readiness_with_cancel(&is_cancelled)?;
     let whisper_available = if let Some(spec) = configured_whisper.as_deref() {
-        crate::native_engine::resolve_model(spec).is_ok()
-    } else if whisper_package_available {
-        // The release-package readiness check immediately above already
-        // hashed all 1.6 GB and validated the compiled trust root. Avoid a
-        // redundant second hash through `resolve_model("default")`.
-        true
+        if crate::native_engine::is_release_package_spec(spec) {
+            // The readiness check immediately above already hashed all 1.6 GB
+            // and validated the compiled trust root. A configured sentinel is
+            // still the release package, not a path or short-name override.
+            whisper_package_available
+        } else {
+            crate::native_engine::resolve_model(spec).is_ok()
+        }
     } else {
-        crate::native_engine::resolve_model("default").is_ok()
+        whisper_package_available
     };
     let whisper_selection = if configured_whisper.is_some() {
         "configured"
     } else if whisper_package_available {
         "verified_release_package"
-    } else if whisper_available {
-        "auto_discovered"
     } else {
         "missing"
     };
@@ -975,6 +2309,14 @@ where
     .is_ok();
     let sortformer_available =
         crate::model_distribution::cached_sortformer_readiness_with_cancel(&is_cancelled)?;
+    let tiny_en_available = crate::model_distribution::cached_fast_lane_readiness_with_cancel(
+        crate::model_distribution::FastLaneModel::TinyEn,
+        &is_cancelled,
+    )?;
+    let tiny_available = crate::model_distribution::cached_fast_lane_readiness_with_cancel(
+        crate::model_distribution::FastLaneModel::Tiny,
+        &is_cancelled,
+    )?;
 
     Ok(json!({
         "schema_version": "franken-whisper-model-registry-v2",
@@ -1016,6 +2358,60 @@ where
                     "fw robot run --input AUDIO"
                 } else {
                     "fw pull whisper --json"
+                },
+            },
+            {
+                "id": "native-whisper-tiny-en-fast-lane",
+                "kind": "whisper_asr",
+                "role": "fast_lane_streaming",
+                "tasks": ["streaming_transcription"],
+                "runtime_status": if tiny_en_available { "ready" } else { "missing_artifact" },
+                "installed": tiny_en_available,
+                "artifact": {
+                    "format": "ggml",
+                    "filename": crate::model_distribution::TINY_EN_WEIGHTS_FILENAME,
+                    "bytes": crate::model_distribution::TINY_EN_WEIGHTS_BYTES,
+                    "sha256": crate::model_distribution::TINY_EN_WEIGHTS_SHA256,
+                    "artifact_version": crate::model_distribution::TINY_EN_ARTIFACT_VERSION,
+                    "precision": "f16",
+                    "preparation_recipe": crate::model_distribution::WHISPER_PREPARATION_RECIPE,
+                    "weight_bytes_identity_preserved": true,
+                    "validation": "compiled_size_and_sha256_then_header_and_tensor_contract_at_load",
+                    "redistribution": crate::model_distribution::WHISPER_DISTRIBUTION_POLICY,
+                    "license": "MIT",
+                    "license_url": crate::model_distribution::WHISPER_LICENSE_URL,
+                },
+                "next_command": if tiny_en_available {
+                    "fw robot listen --language en"
+                } else {
+                    "fw pull tiny-en --json"
+                },
+            },
+            {
+                "id": "native-whisper-tiny-fast-lane",
+                "kind": "whisper_asr",
+                "role": "fast_lane_streaming",
+                "tasks": ["streaming_transcription", "language_detection"],
+                "runtime_status": if tiny_available { "ready" } else { "missing_artifact" },
+                "installed": tiny_available,
+                "artifact": {
+                    "format": "ggml",
+                    "filename": crate::model_distribution::TINY_WEIGHTS_FILENAME,
+                    "bytes": crate::model_distribution::TINY_WEIGHTS_BYTES,
+                    "sha256": crate::model_distribution::TINY_WEIGHTS_SHA256,
+                    "artifact_version": crate::model_distribution::TINY_ARTIFACT_VERSION,
+                    "precision": "f16",
+                    "preparation_recipe": crate::model_distribution::WHISPER_PREPARATION_RECIPE,
+                    "weight_bytes_identity_preserved": true,
+                    "validation": "compiled_size_and_sha256_then_header_and_tensor_contract_at_load",
+                    "redistribution": crate::model_distribution::WHISPER_DISTRIBUTION_POLICY,
+                    "license": "MIT",
+                    "license_url": crate::model_distribution::WHISPER_LICENSE_URL,
+                },
+                "next_command": if tiny_available {
+                    "fw robot listen"
+                } else {
+                    "fw pull tiny --json"
                 },
             },
             {
@@ -1105,6 +2501,17 @@ where
         .and_then(|entry| entry["installed"].as_bool())
         .unwrap_or(false);
     let default_pipeline_ready = whisper_ready && sortformer_ready;
+    let fast_lane_installed = |id: &str| -> bool {
+        models["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| entry["id"] == id)
+            .and_then(|entry| entry["installed"].as_bool())
+            .unwrap_or(false)
+    };
+    let tiny_en_ready = fast_lane_installed("native-whisper-tiny-en-fast-lane");
+    let tiny_ready = fast_lane_installed("native-whisper-tiny-fast-lane");
 
     let mut recommendations = Vec::new();
     if default_pipeline_ready {
@@ -1136,6 +2543,12 @@ where
             "command": "fw pull sortformer --json",
         }));
     }
+    if !tiny_ready {
+        recommendations.push(json!({
+            "reason": "the multilingual fast-lane package for `fw robot listen` is not cached (sessions fall back to the turbo model with the confirm lane disabled)",
+            "command": "fw pull tiny --json",
+        }));
+    }
 
     Ok(json!({
         "schema_version": "franken-whisper-doctor-v1",
@@ -1154,6 +2567,18 @@ where
                 "native_default_ready_accuracy_certification_pending"
             } else {
                 "not_cached_run_fw_pull_sortformer"
+            },
+        },
+        "listen_ready": {
+            "fast_lane_tiny_en": tiny_en_ready,
+            "fast_lane_tiny": tiny_ready,
+            "quality_model": whisper_ready,
+            "status": if tiny_en_ready && tiny_ready && whisper_ready {
+                "preflight_ready_unverified"
+            } else if whisper_ready {
+                "degraded_fast_model_fallback_available"
+            } else {
+                "action_required"
             },
         },
         "health": health_value,
@@ -1216,7 +2641,19 @@ pub const fn robot_docs_guide() -> &'static str {
 4. Parse stdout only as JSON/NDJSON; diagnostics and tracing belong on stderr.\n\
 5. On failure, branch on the stable `FW-*` code from `fw capabilities --json`.\n\
 6. Run `fw pull all --json` to provision both hash-pinned native default packages.\n\
-7. The installer does this automatically; inference itself never accesses the network.\n"
+7. The installer does this automatically; inference itself never accesses the network.\n\
+8. Curate the YouTube catalog with `fw youtube search QUERY` (deduped JSON hits;\n\
+   `--flat` for cheap sweeps) and `fw youtube enrich URL_OR_ID...`; ingestion is\n\
+   `fw youtube run --url URL` (`--robot` streams per-video NDJSON events;\n\
+   `--json-summary` prints one final JSON blob).\n\
+9. Batch many files in one process (the model loads once): repeat `--input` or\n\
+   pass `--inputs-from LIST` (one path per line, `-` = stdin). `fw transcribe\n\
+   --inputs-from LIST --json` prints one NDJSON record per input in input order\n\
+   ({index, total, input, status: ok|error, report|error}); `fw robot run` tags\n\
+   each input's run_start/run_complete/run_error with `batch` and ends with\n\
+   `batch.complete`. A failed input never stops the batch; exit 1 if any failed.\n\
+   A single `--input` is a plain run (no batch records), so use `--inputs-from`\n\
+   when a list may hold one path. `--timeout` bounds each input, not the batch.\n"
 }
 
 /// Emit a single `health.report` NDJSON line to stdout.
@@ -1253,9 +2690,62 @@ fn dependency_check_json(check: &DependencyCheck) -> serde_json::Value {
     })
 }
 
+fn health_report_schema_example() -> serde_json::Value {
+    json!({
+        "event": "health.report",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "ts": "2026-02-22T00:00:00Z",
+        "backends": [
+            {
+                "name": "whisper.cpp",
+                "available": true,
+                "path": "/usr/local/bin/whisper-cli",
+                "version": null,
+                "issues": [],
+            }
+        ],
+        "ffmpeg": {
+            "name": "ffmpeg",
+            "available": true,
+            "path": "/usr/bin/ffmpeg",
+            "version": null,
+            "issues": [],
+        },
+        "database": {
+            "name": "database",
+            "available": true,
+            "path": "db.sqlite3",
+            "version": null,
+            "issues": [],
+        },
+        "resources": {
+            "disk_free_bytes": null,
+            "disk_total_bytes": null,
+            "memory_available_bytes": 8_000_000_000_u64,
+            "memory_total_bytes": 16_000_000_000_u64,
+        },
+        "audio_input": {
+            "probed": true,
+            "available": true,
+            "default_device": "Built-in Microphone",
+            "device_count": 1,
+            "backend": "cpal",
+            "issues": [],
+        },
+        "overall_status": "ok",
+    })
+}
+
 #[must_use]
 pub fn robot_schema_value() -> serde_json::Value {
-    json!({
+    let live_correct_segments = [TranscriptionSegment {
+        start_sec: Some(0.0),
+        end_sec: Some(1.5),
+        text: "hello world".to_owned(),
+        speaker: None,
+        confidence: Some(0.97),
+    }];
+    let mut schema = json!({
         "version": ROBOT_SCHEMA_VERSION,
         "schema_version": ROBOT_SCHEMA_VERSION,
         "line_oriented": "ndjson",
@@ -1371,6 +2861,11 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "mode": "adaptive",
                 }),
             },
+            "routing_history.complete": {
+                "required": ROUTING_HISTORY_COMPLETE_REQUIRED_FIELDS,
+                "terminal": true,
+                "example": routing_history_complete_value(12),
+            },
             "transcript.partial": {
                 "required": TRANSCRIPT_PARTIAL_REQUIRED_FIELDS,
                 "example": json!({
@@ -1404,6 +2899,14 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "latency_ms": 210,
                     "ts": "2026-02-22T00:00:01Z",
                 }),
+                "live_variant": {
+                    "emitted_by": "fw robot listen confirm lane, after the utterance's utterance_end",
+                    "keyed_by": "utterance_id",
+                    "required": LISTEN_TRANSCRIPT_CONFIRM_REQUIRED_FIELDS,
+                    "example": listen_transcript_confirm_value(
+                        "run-123", 7, "2026-02-22T00:00:04Z", 1, "large-v3-turbo", 0.0, 0.03, 0, 812,
+                    ),
+                },
             },
             "transcript.retract": {
                 "required": TRANSCRIPT_RETRACT_REQUIRED_FIELDS,
@@ -1444,6 +2947,24 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "latency_ms": 210,
                     "ts": "2026-02-22T00:00:01Z",
                 }),
+                "live_variant": {
+                    "emitted_by": "fw robot listen confirm lane, after the utterance's utterance_end",
+                    "keyed_by": "utterance_id",
+                    "required": LISTEN_TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
+                    "example": listen_transcript_correct_value(
+                        "run-123",
+                        8,
+                        "2026-02-22T00:00:05Z",
+                        1,
+                        0,
+                        &live_correct_segments,
+                        "large-v3-turbo",
+                        0.25,
+                        0.12,
+                        2,
+                        1930,
+                    ),
+                },
             },
             "transcript.speculation_stats": {
                 "required": SPECULATION_STATS_REQUIRED_FIELDS,
@@ -1462,46 +2983,526 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "ts": "2026-02-22T00:00:02Z",
                 }),
             },
-            "health.report": {
-                "required": HEALTH_REPORT_REQUIRED_FIELDS,
-                "example": json!({
-                    "event": "health.report",
-                    "schema_version": ROBOT_SCHEMA_VERSION,
-                    "ts": "2026-02-22T00:00:00Z",
-                    "backends": [
-                        {
-                            "name": "whisper.cpp",
-                            "available": true,
-                            "path": "/usr/local/bin/whisper-cli",
-                            "version": null,
-                            "issues": [],
-                        }
-                    ],
-                    "ffmpeg": {
-                        "name": "ffmpeg",
-                        "available": true,
-                        "path": "/usr/bin/ffmpeg",
-                        "version": null,
-                        "issues": [],
-                    },
-                    "database": {
-                        "name": "database",
-                        "available": true,
-                        "path": "db.sqlite3",
-                        "version": null,
-                        "issues": [],
-                    },
-                    "resources": {
-                        "disk_free_bytes": null,
-                        "disk_total_bytes": null,
-                        "memory_available_bytes": 8_000_000_000_u64,
-                        "memory_total_bytes": 16_000_000_000_u64,
-                    },
-                    "overall_status": "ok",
+            "listen.device": {
+                "required": LISTEN_DEVICE_REQUIRED_FIELDS,
+                "example": listen_device_value(&crate::capture::InputDeviceInfo {
+                    name: "Built-in Microphone".to_owned(),
+                    is_default: true,
+                    default_sample_rate_hz: Some(48_000),
+                    default_channels: Some(2),
                 }),
             },
+            "listen.session_start": {
+                "required": LISTEN_SESSION_START_REQUIRED_FIELDS,
+                "lifecycle_contract": {
+                    "identifier": "run_id is the only id; a live session IS a run; utterance_id (u32 from 1) is the sub-grouping key",
+                    "terminals": "success streams end with listen.session_stats {final:true}; fatal streams end with run_error (final stats best-effort before it)",
+                    "never_emitted": ["run_start", "run_complete"],
+                },
+                "example": listen_session_start_value("run-123", 0, "2026-02-22T00:00:00Z", &ListenSessionInfo {
+                    source: "mic".into(),
+                    capture_backend: "cpal".into(),
+                    device: "<default>".into(),
+                    sample_rate_hz: 48_000,
+                    fast_model: "tiny.en".into(),
+                    quality_model: Some("large-v3-turbo".into()),
+                    policy: "alignatt".into(),
+                    step_ms: 300,
+                    partials: true,
+                    vad: json!({"min_speech_ms": 250, "endpoint_ms": 600, "gate_db": 9}),
+                }),
+            },
+            "speech_started": {
+                "required": SPEECH_STARTED_REQUIRED_FIELDS,
+                "example": speech_started_value("run-123", 3, "2026-02-22T00:00:01Z", 1, 1.24),
+            },
+            "transcript.delta": {
+                "required": TRANSCRIPT_DELTA_REQUIRED_FIELDS,
+                "append_only_contract": "concatenating an utterance's deltas yields its committed transcript; committed text is never rewritten by later deltas (mutable previews live in transcript.partial)",
+                "example": transcript_delta_value("run-123", 4, "2026-02-22T00:00:02Z", 1, "hello world", 1.24, 2.06, 3, Some(0.91)),
+            },
+            "utterance_end": {
+                "required": UTTERANCE_END_REQUIRED_FIELDS,
+                "reasons": ["endpoint", "timeout", "max_len", "session_end"],
+                "text_cap_bytes": UTTERANCE_END_TEXT_CAP_BYTES,
+                "example": utterance_end_value("run-123", 6, "2026-02-22T00:00:03Z", 1, UtteranceEndReason::Endpoint, 1.24, 2.80, "hello world again", 2),
+            },
+            "listen.warning": {
+                "required": LISTEN_WARNING_REQUIRED_FIELDS,
+                "example": listen_warning_value("run-123", 7, "2026-02-22T00:00:04Z", "capture_overrun", json!({"cumulative_frames_dropped": 4800})),
+            },
+            "listen.session_stats": {
+                "required": LISTEN_SESSION_STATS_REQUIRED_FIELDS,
+                "heartbeat_contract": "periodic emissions (final:false) double as a liveness heartbeat during silence; the success terminal is the final:true emission",
+                "example": listen_session_stats_value("run-123", 9, "2026-02-22T00:00:30Z", &ListenSessionStats {
+                    audio_sec: 28.7,
+                    wall_sec: 30.0,
+                    deltas: 14,
+                    utterances: 3,
+                    capture_overruns: 0,
+                    mean_step_latency_ms: 62.0,
+                    p95_step_latency_ms: 118.0,
+                    ttft_ms: Some(410.0),
+                    policy_holdbacks: 9,
+                    confirmations_emitted: 2,
+                    corrections_emitted: 1,
+                    confirm_lag_p50_ms: Some(812.0),
+                    confirm_lag_p95_ms: Some(1930.0),
+                    confirm_lag_max_ms: Some(2100.0),
+                    controllers: Some(serde_json::json!({
+                        "step_ms": { "enabled": true, "current": 300 },
+                        "holdback_frames": { "enabled": true, "current": 10 },
+                    })),
+                }, false),
+            },
+            "listen.controller": {
+                "required": LISTEN_CONTROLLER_REQUIRED_FIELDS,
+                "default_on": false,
+                "contract": "bounded adaptive cadence/holdback decision with Brier-gated deterministic fallback",
+                "example": listen_controller_value("run-123", 8, "2026-02-22T00:00:12Z", &crate::listen::AdaptiveControllerEntry {
+                    controller: "step_ms",
+                    from: 300,
+                    to: 350,
+                    reason: "overrun_pressure".to_owned(),
+                    brier: 0.12,
+                    observations: 12,
+                    fallback_active: false,
+                }),
+            },
+            "health.report": {
+                "required": HEALTH_REPORT_REQUIRED_FIELDS,
+                "example": health_report_schema_example(),
+            },
         }
+    });
+    insert_batch_schema(&mut schema);
+    let serde_json::Value::Object(youtube_events) = youtube_event_schema_value() else {
+        unreachable!("youtube schema events are constructed as an object")
+    };
+    let events = schema["events"]
+        .as_object_mut()
+        .expect("robot schema events must be an object");
+    let health_report = events
+        .remove("health.report")
+        .expect("robot schema includes the health report event");
+    events.extend(youtube_events);
+    events.insert("health.report".to_owned(), health_report);
+    schema
+}
+
+/// Batch-mode schema additions (bd-batch-transcribe-rraf): the optional
+/// `batch` object on a batch input's run_start / run_complete / run_error,
+/// and the `batch.complete` terminal.
+fn insert_batch_schema(schema: &mut Value) {
+    let batch_field = json!({
+        "batch": {
+            "present": "only when the run is one input of a batch (`--inputs-from` or repeated `--input`)",
+            "fields": {
+                "index": "zero-based input position",
+                "total": "number of inputs in the batch",
+                "input": "the input path as given (a non-UTF-8 path is converted lossily; match by index)",
+            },
+        },
+    });
+    let events = schema["events"]
+        .as_object_mut()
+        .expect("robot schema events must be an object");
+    for event in ["run_start", "run_complete", "run_error"] {
+        if let Some(entry) = events.get_mut(event).and_then(Value::as_object_mut) {
+            entry.insert("optional".to_owned(), batch_field.clone());
+        }
+    }
+    events.insert(
+        "batch.complete".to_owned(),
+        json!({
+            "required": BATCH_COMPLETE_REQUIRED_FIELDS,
+            "terminal": true,
+            "statuses": {
+                "ok": "every input succeeded",
+                "incomplete": "at least one input failed (process exit 1)",
+                "cancelled": "interrupted by Ctrl+C (process exit 130), whether or not inputs were left unattempted",
+            },
+            "optional": {
+                "code": "present unless status is ok: FW-BATCH-INCOMPLETE (incomplete) or FW-CANCELLED (cancelled)",
+            },
+            "not_emitted_when": "the whole batch is invalid before any input runs (shared flags, unreadable list): the stream is run_start then run_error",
+            "example": batch_complete_value(&BatchTally {
+                total: 3,
+                succeeded: 2,
+                failed: 1,
+                interrupted: false,
+            }),
+        }),
+    );
+}
+
+fn youtube_event_schema_value() -> serde_json::Value {
+    json!({
+        "youtube.run_start": {
+            "required": YOUTUBE_RUN_START_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.run_start",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 1,
+                "ts": "2026-06-07T00:00:00Z",
+                "output_dir": "youtube_transcripts",
+                "n_urls": 1,
+                "batch_file": null,
+                "concurrency": 3,
+                "batch_size": 0,
+                "backend": "auto",
+                "model": "tiny.en",
+                "language": null,
+                "diarize": true,
+                "keep_audio": true,
+                "retry_failed": true,
+                "abort_on_error": false,
+            },
+        },
+        "youtube.discovered": {
+            "required": YOUTUBE_DISCOVERED_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.discovered",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 2,
+                "ts": "2026-06-07T00:00:01Z",
+                "id": "jNQXAC9IVRw",
+                "title": "Me at the zoo",
+                "url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+            },
+        },
+        "youtube.downloading": {
+            "required": YOUTUBE_DOWNLOADING_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.downloading",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 3,
+                "ts": "2026-06-07T00:00:02Z",
+                "id": "jNQXAC9IVRw",
+            },
+        },
+        "youtube.downloaded": {
+            "required": YOUTUBE_DOWNLOADED_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.downloaded",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 4,
+                "ts": "2026-06-07T00:00:03Z",
+                "id": "jNQXAC9IVRw",
+                "audio_path": "youtube_transcripts/audio/jNQXAC9IVRw.webm",
+                "bytes": 123456,
+                "reused": false,
+            },
+        },
+        "youtube.transcribing": {
+            "required": YOUTUBE_TRANSCRIBING_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.transcribing",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 5,
+                "ts": "2026-06-07T00:00:04Z",
+                "id": "jNQXAC9IVRw",
+            },
+        },
+        "youtube.done": {
+            "required": YOUTUBE_DONE_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.done",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 6,
+                "ts": "2026-06-07T00:00:05Z",
+                "id": "jNQXAC9IVRw",
+                "md_path": "youtube_transcripts/20050424_me_at_the_zoo_jNQXAC9IVRw.md",
+                "json_path": "youtube_transcripts/20050424_me_at_the_zoo_jNQXAC9IVRw.json",
+                "wall_ms": 480,
+                "rtf": 0.025,
+            },
+        },
+        "youtube.skipped": {
+            "required": YOUTUBE_SKIPPED_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.skipped",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 7,
+                "ts": "2026-06-07T00:00:06Z",
+                "id": "jNQXAC9IVRw",
+                "reason": "already_done",
+            },
+        },
+        "youtube.failed": {
+            "required": YOUTUBE_FAILED_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.failed",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 8,
+                "ts": "2026-06-07T00:00:07Z",
+                "id": "jNQXAC9IVRw",
+                "title": "Me at the zoo",
+                "error": "download failed",
+                "attempts": 1,
+            },
+        },
+        "youtube.run_complete": {
+            "required": YOUTUBE_RUN_COMPLETE_REQUIRED_FIELDS,
+            "terminal": true,
+            "example": {
+                "event": "youtube.run_complete",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 9,
+                "ts": "2026-06-07T00:00:08Z",
+                "done": ["jNQXAC9IVRw"],
+                "skipped": [],
+                "failed": [],
+                "cancelled": false,
+            },
+        },
     })
+}
+
+/// Draft 2020-12 JSON Schema for the robot NDJSON stream, generated from the
+/// event catalog in [`robot_schema_value`] (bd-robot-event-schema-fixture-stale-t8la).
+///
+/// `tests/fixtures/schemas/robot_event_schema.json` is this value,
+/// pretty-printed; `tests/cli_integration.rs` checks the file against it and
+/// validates real `fw robot run` streams (single input, batch, error) with it.
+///
+/// Every catalog event gets a definition carrying its `*_REQUIRED_FIELDS`, its
+/// `event` constant and `schema_version`. The `fw robot run` events
+/// (`run_start`, `stage`, `run_complete`, `run_error`, `batch.complete`) are
+/// closed: every field their emitters write is typed here, so a field added to
+/// an emitter fails validation until it is described. `run_error.code` is the
+/// [`crate::error::ERROR_CODE_CATALOG`] family ([`FwError::error_code`]).
+/// The other events (listen, youtube, routing, health, discovery) are checked
+/// for their required fields and stay open beyond them. An event whose catalog
+/// entry has a `live_variant` (`transcript.confirm`, `transcript.correct`)
+/// accepts either shape: the speculative-window one or the live confirm lane's
+/// utterance-keyed one.
+///
+/// Only these keywords are used, so a small validator can check all of them:
+/// `$schema`, `title`, `description`, `version` (annotations), `oneOf`,
+/// `$ref`, `$defs`, `type`, `const`, `enum`, `required`, `properties`,
+/// `additionalProperties`, `items`, `minimum`.
+#[must_use]
+pub fn robot_event_json_schema() -> Value {
+    let catalog = robot_schema_value();
+    let events = catalog["events"]
+        .as_object()
+        .expect("robot schema events must be an object");
+    let error_codes: Vec<&str> = crate::error::ERROR_CODE_CATALOG
+        .iter()
+        .map(|(code, _)| *code)
+        .collect();
+    let mut defs = Map::new();
+    let mut one_of = Vec::new();
+    for (name, entry) in events {
+        let mut properties = Map::new();
+        properties.insert("event".to_owned(), json!({ "const": name }));
+        properties.insert(
+            "schema_version".to_owned(),
+            json!({ "const": ROBOT_SCHEMA_VERSION }),
+        );
+        let closed = match run_event_properties(name, &error_codes) {
+            Some(fields) => {
+                properties.extend(fields);
+                true
+            }
+            None => false,
+        };
+        let definition = json!({
+            "type": "object",
+            "required": entry["required"],
+            "properties": properties,
+            "additionalProperties": !closed,
+        });
+        // `transcript.confirm` / `transcript.correct` have two shapes: the
+        // speculative-window one above and the live confirm lane's
+        // utterance-keyed one (`fw robot listen`).
+        let definition = match entry.get("live_variant") {
+            Some(live) => json!({
+                "description": format!(
+                    "{name}: the speculative-window form, or the live form ({})",
+                    live["emitted_by"].as_str().unwrap_or_default()
+                ),
+                "oneOf": [
+                    definition,
+                    {
+                        "type": "object",
+                        "required": live["required"],
+                        "properties": properties,
+                        "additionalProperties": !closed,
+                    },
+                ],
+            }),
+            None => definition,
+        };
+        defs.insert(name.clone(), definition);
+        one_of.push(json!({ "$ref": format!("#/$defs/{name}") }));
+    }
+    defs.insert(
+        "batch".to_owned(),
+        json!({
+            "description": "present only on run_start / run_complete / run_error of one batch input",
+            "type": "object",
+            "required": ["index", "total", "input"],
+            "properties": {
+                "index": { "type": "integer", "minimum": 0 },
+                "total": { "type": "integer", "minimum": 0 },
+                "input": { "type": "string" },
+            },
+            "additionalProperties": false,
+        }),
+    );
+    defs.insert(
+        "segment".to_owned(),
+        json!({
+            "type": "object",
+            "required": ["start_sec", "end_sec", "text", "speaker", "confidence"],
+            "properties": {
+                "start_sec": { "type": ["number", "null"] },
+                "end_sec": { "type": ["number", "null"] },
+                "text": { "type": "string" },
+                "speaker": { "type": ["string", "null"] },
+                "confidence": { "type": ["number", "null"] },
+            },
+            "additionalProperties": false,
+        }),
+    );
+    defs.insert(
+        "acceleration_report".to_owned(),
+        json!({
+            "type": ["object", "null"],
+            "required": [
+                "backend",
+                "input_values",
+                "normalized_confidences",
+                "pre_mass",
+                "post_mass",
+                "notes",
+            ],
+            "properties": {
+                "backend": { "type": "string" },
+                "input_values": { "type": "integer", "minimum": 0 },
+                "normalized_confidences": { "type": "boolean" },
+                "pre_mass": { "type": ["number", "null"] },
+                "post_mass": { "type": ["number", "null"] },
+                "notes": { "type": "array", "items": { "type": "string" } },
+                "raw_confidences": {
+                    "description": "the backend's own per-segment confidence before normalization, parallel to segments; omitted when empty",
+                    "type": "array",
+                    "items": { "type": ["number", "null"] },
+                },
+            },
+            "additionalProperties": false,
+        }),
+    );
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "franken_whisper robot NDJSON events",
+        "description": "Each stdout line of a robot command is one of these events. Generated from `fw robot schema` (src/robot.rs robot_event_json_schema); do not edit by hand.",
+        "version": ROBOT_SCHEMA_VERSION,
+        "oneOf": one_of,
+        "$defs": defs,
+    })
+}
+
+/// Typed fields of the closed `fw robot run` events, beyond `event` and
+/// `schema_version`; `None` for every other event.
+fn run_event_properties(name: &str, error_codes: &[&str]) -> Option<Map<String, Value>> {
+    let batch = json!({ "$ref": "#/$defs/batch" });
+    let string = json!({ "type": "string" });
+    let fields = match name {
+        "run_start" => json!({
+            "request": { "type": "object" },
+            "batch": batch,
+        }),
+        "stage" => json!({
+            "run_id": string,
+            "seq": { "type": "integer", "minimum": 0 },
+            "ts": string,
+            "stage": string,
+            "code": string,
+            "message": string,
+            "payload": {},
+        }),
+        "run_complete" => json!({
+            "run_id": string,
+            "trace_id": string,
+            "started_at": string,
+            "finished_at": string,
+            "backend": string,
+            "language": { "type": ["string", "null"] },
+            "transcript": string,
+            "segments": { "type": "array", "items": { "$ref": "#/$defs/segment" } },
+            "acceleration": { "$ref": "#/$defs/acceleration_report" },
+            "diarization": { "type": ["object", "null"] },
+            "acceleration_context": { "type": "object" },
+            "warnings": { "type": "array", "items": string },
+            "evidence": { "type": "array" },
+            "batch": batch,
+        }),
+        "run_error" => json!({
+            "code": { "enum": error_codes },
+            "message": string,
+            "clap_error_kind": string,
+            "batch": batch,
+        }),
+        "batch.complete" => {
+            let tallies = [
+                BatchTally {
+                    total: 1,
+                    succeeded: 1,
+                    failed: 0,
+                    interrupted: false,
+                },
+                BatchTally {
+                    total: 1,
+                    succeeded: 0,
+                    failed: 1,
+                    interrupted: false,
+                },
+                BatchTally {
+                    total: 1,
+                    succeeded: 0,
+                    failed: 1,
+                    interrupted: true,
+                },
+            ];
+            let statuses: Vec<&str> = tallies.iter().map(BatchTally::status).collect();
+            let codes: Vec<&str> = tallies
+                .iter()
+                .filter_map(|tally| tally.outcome().err().map(|error| error.error_code()))
+                .collect();
+            let count = json!({ "type": "integer", "minimum": 0 });
+            json!({
+                "total": count,
+                "succeeded": count,
+                "failed": count,
+                "skipped": count,
+                "status": { "enum": statuses },
+                "code": { "enum": codes },
+            })
+        }
+        _ => return None,
+    };
+    match fields {
+        Value::Object(fields) => Some(fields),
+        _ => unreachable!("run event fields are built as an object"),
+    }
+}
+
+/// Emit one arbitrary NDJSON event value (the live listen driver's sink;
+/// same locked-stdout + explicit-flush path every robot event uses).
+pub fn emit_event_value(value: &serde_json::Value) -> FwResult<()> {
+    emit_line(value)
 }
 
 fn emit_line<T: Serialize>(value: &T) -> FwResult<()> {
@@ -1514,6 +3515,11 @@ fn emit_line<T: Serialize>(value: &T) -> FwResult<()> {
     let mut out = std::io::stdout().lock();
     serde_json::to_writer(&mut out, value)?;
     out.write_all(b"\n")?;
+    // Explicit flush: real-time consumers (fw robot listen pipes into agents)
+    // must never sit behind a buffer regardless of how stdout is wrapped.
+    // LineWriter already flushes on '\n' today; this makes the guarantee
+    // independent of that implementation detail (bd-rt-events-ghdx).
+    out.flush()?;
     Ok(())
 }
 
@@ -1616,6 +3622,9 @@ struct BorrowedComplete<'a> {
     evidence: &'a [Value],
     #[serde(skip_serializing_if = "Option::is_none")]
     acceleration_context: Option<&'a Value>,
+    /// Present only on a batch input's `run_complete`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch: Option<&'a BatchItem>,
 }
 
 impl<'a> BorrowedComplete<'a> {
@@ -1636,6 +3645,7 @@ impl<'a> BorrowedComplete<'a> {
             warnings: &report.warnings,
             evidence: &report.evidence,
             acceleration_context: acceleration_context_ref_from_evidence(&report.evidence),
+            batch: None,
         }
     }
 }
@@ -1683,9 +3693,24 @@ fn run_complete_value(report: &RunReport) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use serde_json::json;
 
-    use crate::model::RunEvent;
+    use crate::model::{RunEvent, TranscriptionSegment};
+
+    #[allow(clippy::wildcard_imports)]
+    use super::{
+        LISTEN_CONTROLLER_REQUIRED_FIELDS, LISTEN_DEVICE_REQUIRED_FIELDS,
+        LISTEN_SESSION_START_REQUIRED_FIELDS, LISTEN_SESSION_STATS_REQUIRED_FIELDS,
+        LISTEN_WARNING_REQUIRED_FIELDS, ListenSessionInfo, ListenSessionStats,
+        NdjsonStreamValidator, ROBOT_SCHEMA_VERSION, ROUTING_HISTORY_COMPLETE_REQUIRED_FIELDS,
+        SPEECH_STARTED_REQUIRED_FIELDS, StreamOutcome, TRANSCRIPT_DELTA_REQUIRED_FIELDS,
+        UTTERANCE_END_REQUIRED_FIELDS, UTTERANCE_END_TEXT_CAP_BYTES, UtteranceEndReason,
+        listen_controller_value, listen_device_value, listen_session_start_value,
+        listen_session_stats_value, listen_warning_value, routing_history_complete_value,
+        speech_started_value, transcript_delta_value, utterance_end_value,
+    };
 
     use super::{
         BorrowedComplete, BorrowedRoutingDecision, BorrowedStage, HEALTH_REPORT_REQUIRED_FIELDS,
@@ -1697,6 +3722,44 @@ mod tests {
         run_complete_value, run_error_value, run_stage_value, run_start_value,
         transcript_partial_value,
     };
+
+    fn ultra_stress_enabled() -> bool {
+        std::env::var("FRANKEN_WHISPER_ULTRA_STRESS").is_ok_and(|value| value == "1")
+    }
+
+    const ROBOT_SCHEMA_EVENT_TYPES: [&str; 31] = [
+        "run_start",
+        "stage",
+        "run_complete",
+        "run_error",
+        "batch.complete",
+        "backends.discovery",
+        "routing_decision",
+        "routing_history.complete",
+        "transcript.partial",
+        "transcript.confirm",
+        "transcript.retract",
+        "transcript.correct",
+        "transcript.speculation_stats",
+        "listen.device",
+        "listen.session_start",
+        "speech_started",
+        "transcript.delta",
+        "utterance_end",
+        "listen.warning",
+        "listen.session_stats",
+        "listen.controller",
+        "youtube.run_start",
+        "youtube.discovered",
+        "youtube.downloading",
+        "youtube.downloaded",
+        "youtube.transcribing",
+        "youtube.done",
+        "youtube.skipped",
+        "youtube.failed",
+        "youtube.run_complete",
+        "health.report",
+    ];
 
     #[test]
     fn error_envelope_has_terminal_shape() {
@@ -1925,6 +3988,48 @@ mod tests {
                 .len(),
             RUN_ERROR_REQUIRED_FIELDS.len()
         );
+    }
+
+    #[test]
+    fn auxiliary_command_events_use_the_catalogued_contract() {
+        let device = crate::capture::InputDeviceInfo {
+            name: "Test Microphone".to_owned(),
+            is_default: true,
+            default_sample_rate_hz: Some(48_000),
+            default_channels: Some(2),
+        };
+        let device_event = listen_device_value(&device);
+        assert_eq!(device_event["event"], "listen.device");
+        assert_eq!(device_event["name"], "Test Microphone");
+        assert_eq!(device_event["default"], true);
+        assert_eq!(device_event["backend"], "cpal");
+
+        let routing_event = routing_history_complete_value(7);
+        assert_eq!(routing_event["event"], "routing_history.complete");
+        assert_eq!(routing_event["records"], 7);
+
+        let schema = robot_schema_value();
+        for (event_name, value, required) in [
+            ("listen.device", device_event, LISTEN_DEVICE_REQUIRED_FIELDS),
+            (
+                "routing_history.complete",
+                routing_event,
+                ROUTING_HISTORY_COMPLETE_REQUIRED_FIELDS,
+            ),
+        ] {
+            assert_eq!(schema["events"][event_name]["example"]["event"], event_name);
+            assert_eq!(
+                schema["events"][event_name]["required"],
+                json!(required),
+                "{event_name} schema/constant drift"
+            );
+            for field in required {
+                assert!(
+                    value.get(field).is_some(),
+                    "{event_name} constructor is missing required field `{field}`"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2417,6 +4522,7 @@ mod tests {
             pre_mass: Some(-0.0),
             post_mass: None,
             notes: vec!["accelerated\npath".to_owned(), "λ".to_owned()],
+            raw_confidences: vec![Some(0.9), None, Some(1.0)],
         });
         rich.result.raw_output = json!({
             "segments": [{"text": "raw", "tokens": [1, 2, 3]}],
@@ -2429,6 +4535,8 @@ mod tests {
             backend_identity: Some("native:test".to_owned()),
             backend_version: Some("1.2.3".to_owned()),
             output_payload_hash: Some("output-hash".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
 
         let historical = historical_pretty_run_report(&rich);
@@ -2505,6 +4613,7 @@ mod tests {
             pre_mass: Some(9.75),
             post_mass: Some(9.5),
             notes: vec!["native acceleration accepted".to_owned()],
+            raw_confidences: Vec::new(),
         });
         report.result.raw_output = json!({
             "model": "tiny.en",
@@ -2721,7 +4830,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&BorrowedStage::new(cases[0].0, &cases[0].1))
                 .expect("golden stage"),
-            r#"{"event":"stage","schema_version":"1.0.0","run_id":"run","seq":7,"ts":"ts","stage":"stage","code":"code","message":"message","payload":null}"#,
+            r#"{"event":"stage","schema_version":"1.1.0","run_id":"run","seq":7,"ts":"ts","stage":"stage","code":"code","message":"message","payload":null}"#,
         );
     }
 
@@ -2891,7 +5000,7 @@ mod tests {
         let empty_bytes = assert_byte_parity(&empty);
         assert_eq!(
             String::from_utf8(empty_bytes).expect("empty complete is UTF-8"),
-            r#"{"event":"run_complete","schema_version":"1.0.0","run_id":"ndjson-test","trace_id":"00000000000000000000000000000000","started_at":"2026-02-22T00:00:00Z","finished_at":"2026-02-22T00:00:01Z","backend":"whisper_cpp","language":null,"transcript":"","segments":[],"acceleration":null,"diarization":null,"warnings":[],"evidence":[]}"#,
+            r#"{"event":"run_complete","schema_version":"1.1.0","run_id":"ndjson-test","trace_id":"00000000000000000000000000000000","started_at":"2026-02-22T00:00:00Z","finished_at":"2026-02-22T00:00:01Z","backend":"whisper_cpp","language":null,"transcript":"","segments":[],"acceleration":null,"diarization":null,"warnings":[],"evidence":[]}"#,
         );
 
         let mut rich = test_report(vec![], vec![]);
@@ -2920,6 +5029,7 @@ mod tests {
             pre_mass: Some(3.5),
             post_mass: None,
             notes: vec!["accelerated\npath".to_owned()],
+            raw_confidences: Vec::new(),
         });
         rich.warnings = vec!["warning \"quoted\"".to_owned()];
         rich.evidence = vec![
@@ -3106,6 +5216,7 @@ mod tests {
             pre_mass: Some(127.75),
             post_mass: Some(127.5),
             notes: (0..8).map(|index| format!("note-{index}")).collect(),
+            raw_confidences: Vec::new(),
         });
         heavy.warnings = (0..16)
             .map(|index| format!("heavy warning {index}"))
@@ -3283,31 +5394,12 @@ mod tests {
         let events = schema["events"]
             .as_object()
             .expect("events should be object");
+        let actual: HashSet<&str> = events.keys().map(String::as_str).collect();
+        let expected: HashSet<&str> = ROBOT_SCHEMA_EVENT_TYPES.into_iter().collect();
         assert_eq!(
-            events.len(),
-            12,
-            "expected 12 event types including routing history and speculation events, got {}",
-            events.len()
+            actual, expected,
+            "schema must define the exact 31-event robot contract"
         );
-        for expected in [
-            "run_start",
-            "stage",
-            "run_complete",
-            "run_error",
-            "backends.discovery",
-            "routing_decision",
-            "transcript.partial",
-            "transcript.confirm",
-            "transcript.retract",
-            "transcript.correct",
-            "transcript.speculation_stats",
-            "health.report",
-        ] {
-            assert!(
-                events.contains_key(expected),
-                "missing schema event type `{expected}`"
-            );
-        }
     }
 
     #[test]
@@ -3383,6 +5475,7 @@ mod tests {
                     pre_mass: Some(0.95),
                     post_mass: Some(0.99),
                     notes: vec!["accelerated".to_owned()],
+                    raw_confidences: Vec::new(),
                 }),
                 diarization: None,
                 raw_output: json!({}),
@@ -3670,6 +5763,211 @@ mod tests {
     }
 
     #[test]
+    fn batch_records_wrap_the_single_run_report_and_errors() {
+        use crate::error::FwError;
+
+        let report = test_report(vec![], vec![]);
+        let item = super::BatchItem::new(1, 3, std::path::Path::new("clips/b c.wav"));
+        let single = owned_run_report_value(report.clone()).expect("single-input report");
+        let ok = super::batch_result_value(&item, report).expect("ok record");
+        for field in super::BATCH_RESULT_REQUIRED_FIELDS {
+            assert!(ok.get(*field).is_some(), "ok record lacks `{field}`");
+        }
+        assert_eq!(ok["schema_version"], super::BATCH_RESULT_SCHEMA_VERSION);
+        assert_eq!(ok["index"], 1);
+        assert_eq!(ok["total"], 3);
+        assert_eq!(ok["input"], "clips/b c.wav");
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(
+            ok["report"], single,
+            "a batch record embeds exactly the single-input --json report"
+        );
+        assert!(ok.get("error").is_none());
+
+        let error = FwError::MissingArtifact(std::path::PathBuf::from("clips/missing.wav"));
+        let failed = super::batch_error_value(&item, &error);
+        for field in super::BATCH_RESULT_REQUIRED_FIELDS {
+            assert!(failed.get(*field).is_some(), "error record lacks `{field}`");
+        }
+        assert_eq!(failed["status"], "error");
+        assert_eq!(failed["error"]["code"], "FW-MISSING-ARTIFACT");
+        assert_eq!(failed["error"]["message"], error.to_string());
+        assert!(failed.get("report").is_none());
+        for record in [&ok, &failed] {
+            let line = serde_json::to_string(record).expect("serialize record");
+            assert!(!line.contains('\n'), "one record per NDJSON line");
+        }
+    }
+
+    #[test]
+    fn batch_run_events_add_only_the_batch_object() {
+        let report = test_report(vec![], vec![]);
+        let item = super::BatchItem::new(0, 2, std::path::Path::new("a.wav"));
+        let plain = serde_json::to_value(BorrowedComplete::new(&report)).expect("plain");
+        assert!(
+            plain.get("batch").is_none(),
+            "single-run run_complete is unchanged"
+        );
+        let mut tagged = BorrowedComplete::new(&report);
+        tagged.batch = Some(&item);
+        let mut tagged = serde_json::to_value(tagged).expect("tagged");
+        assert_eq!(
+            tagged["batch"],
+            json!({"index": 0, "total": 2, "input": "a.wav"})
+        );
+        tagged
+            .as_object_mut()
+            .expect("run_complete object")
+            .remove("batch");
+        assert_eq!(tagged, plain);
+    }
+
+    #[test]
+    fn batch_complete_reports_ok_incomplete_and_cancelled() {
+        use super::{BATCH_COMPLETE_REQUIRED_FIELDS, BatchTally, batch_complete_value};
+
+        for (tally, status, skipped, code) in [
+            (
+                BatchTally {
+                    total: 2,
+                    succeeded: 2,
+                    failed: 0,
+                    interrupted: false,
+                },
+                "ok",
+                0,
+                None,
+            ),
+            (
+                BatchTally {
+                    total: 0,
+                    succeeded: 0,
+                    failed: 0,
+                    interrupted: false,
+                },
+                "ok",
+                0,
+                None,
+            ),
+            (
+                BatchTally {
+                    total: 3,
+                    succeeded: 2,
+                    failed: 1,
+                    interrupted: false,
+                },
+                "incomplete",
+                0,
+                Some("FW-BATCH-INCOMPLETE"),
+            ),
+            (
+                BatchTally {
+                    total: 4,
+                    succeeded: 1,
+                    failed: 1,
+                    interrupted: true,
+                },
+                "cancelled",
+                2,
+                Some("FW-CANCELLED"),
+            ),
+            // Ctrl+C during the LAST input: nothing was skipped, the
+            // interrupted input failed with FW-CANCELLED and the process
+            // exits 130, so the batch is cancelled, not incomplete.
+            (
+                BatchTally {
+                    total: 2,
+                    succeeded: 1,
+                    failed: 1,
+                    interrupted: true,
+                },
+                "cancelled",
+                0,
+                Some("FW-CANCELLED"),
+            ),
+            // Ctrl+C after the last input already succeeded.
+            (
+                BatchTally {
+                    total: 2,
+                    succeeded: 2,
+                    failed: 0,
+                    interrupted: true,
+                },
+                "cancelled",
+                0,
+                Some("FW-CANCELLED"),
+            ),
+        ] {
+            let value = batch_complete_value(&tally);
+            assert_eq!(value["event"], "batch.complete");
+            assert_eq!(value["status"], status, "{tally:?}");
+            assert_eq!(value["skipped"], skipped, "{tally:?}");
+            for field in BATCH_COMPLETE_REQUIRED_FIELDS {
+                assert!(value.get(*field).is_some(), "missing `{field}`");
+            }
+            // The advertised FW-BATCH-INCOMPLETE must be observable on the
+            // stream, and it must be the process outcome's own code.
+            assert_eq!(
+                value.get("code").and_then(serde_json::Value::as_str),
+                code,
+                "{tally:?}"
+            );
+            assert_eq!(
+                tally.outcome().err().map(|error| error.error_code()),
+                code,
+                "{tally:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_mode_is_feature_detectable() {
+        let capabilities = super::capabilities_value();
+        let batch = &capabilities["batch"];
+        assert_eq!(batch["supported"], true);
+        assert_eq!(
+            batch["transcribe_json"]["schema_version"],
+            super::BATCH_RESULT_SCHEMA_VERSION
+        );
+        assert_eq!(batch["robot_run"]["terminal"], "batch.complete");
+        assert_eq!(
+            batch["error_code_when_any_input_fails"],
+            "FW-BATCH-INCOMPLETE"
+        );
+        // Contract details an agent needs before relying on a batch
+        // (bd-batch-timeout-scope-gbyf, bd-batch-output-case-collision-8y2r).
+        for key in ["timeout", "output_files", "failure_isolation"] {
+            assert!(batch[key].is_string(), "capabilities.batch.{key}");
+        }
+        assert!(
+            batch["timeout"]
+                .as_str()
+                .is_some_and(|text| text.contains("each input separately")),
+            "{}",
+            batch["timeout"]
+        );
+        assert!(batch["transcribe_json"]["outcome"].is_string());
+        assert!(capabilities["error_codes"].as_array().is_some_and(|codes| {
+            codes
+                .iter()
+                .any(|code| code["code"] == "FW-BATCH-INCOMPLETE")
+        }));
+
+        let schema = robot_schema_value();
+        assert_eq!(
+            schema["events"]["batch.complete"]["required"],
+            json!(super::BATCH_COMPLETE_REQUIRED_FIELDS)
+        );
+        for event in ["run_start", "run_complete", "run_error"] {
+            assert!(
+                schema["events"][event]["optional"]["batch"].is_object(),
+                "{event} documents its optional batch object"
+            );
+        }
+        assert!(super::robot_docs_guide().contains("--inputs-from"));
+    }
+
+    #[test]
     fn stage_value_has_exactly_required_fields() {
         let event = test_event(1, "ingest", "ingest.ok");
         let value = run_stage_value("run-exact", &event);
@@ -3732,6 +6030,7 @@ mod tests {
             pre_mass: Some(0.95),
             post_mass: Some(0.88),
             notes: vec!["batch mode".to_owned(), "GPU A100".to_owned()],
+            raw_confidences: Vec::new(),
         });
         let value = run_complete_value(&report);
         let serialized = serde_json::to_string(&value).expect("serialize");
@@ -3801,6 +6100,7 @@ mod tests {
             pre_mass: None,
             post_mass: None,
             notes: vec![],
+            raw_confidences: Vec::new(),
         });
         let value = run_complete_value(&report);
         assert_eq!(value["acceleration"]["backend"], "frankenjax");
@@ -4408,7 +6708,7 @@ mod tests {
                 &cases[0],
             )
             .expect("golden routing decision"),
-            r#"{"event":"routing_decision","schema_version":"1.0.0","run_id":"run-123","ts":"2026-02-22T00:00:00Z","code":"backend.routing.decision_contract","decision_id":"dec-1","chosen_action":"try_whisper_cpp","calibration_score":0.91,"e_process":1.23,"fallback_active":false,"recommended_order":["whisper_cpp","insanely_fast"],"mode":"adaptive"}"#,
+            r#"{"event":"routing_decision","schema_version":"1.1.0","run_id":"run-123","ts":"2026-02-22T00:00:00Z","code":"backend.routing.decision_contract","decision_id":"dec-1","chosen_action":"try_whisper_cpp","calibration_score":0.91,"e_process":1.23,"fallback_active":false,"recommended_order":["whisper_cpp","insanely_fast"],"mode":"adaptive"}"#,
         );
     }
 
@@ -4943,6 +7243,14 @@ mod tests {
                 memory_available_bytes: Some(8_000_000_000),
                 memory_total_bytes: Some(16_000_000_000),
             },
+            audio_input: super::AudioInputCheck {
+                probed: true,
+                available: true,
+                default_device: Some("MacBook Pro Microphone".to_owned()),
+                device_count: 1,
+                backend: "cpal",
+                issues: vec![],
+            },
             overall_status: super::CheckStatus::Ok,
         }
     }
@@ -5366,7 +7674,15 @@ mod tests {
 
     #[test]
     fn snapshot_resources_returns_valid_struct() {
-        let snap = super::snapshot_resources();
+        let snap =
+            super::snapshot_resources(std::path::Path::new(".franken_whisper/storage.sqlite3"));
+        #[cfg(unix)]
+        {
+            // The nearest existing ancestor (the cwd) always has a filesystem.
+            let free = snap.disk_free_bytes.expect("disk free on unix");
+            let total = snap.disk_total_bytes.expect("disk total on unix");
+            assert!(total > 0 && free <= total, "free {free} / total {total}");
+        }
         // On Linux with /proc/meminfo, memory fields should be Some.
         // On other platforms, they may be None. Either way the struct is valid.
         if let Some(avail) = snap.memory_available_bytes {
@@ -5388,6 +7704,9 @@ mod tests {
     #[test]
     fn build_health_report_returns_valid_report() {
         let report = super::build_health_report(std::path::Path::new("/tmp/test_health.sqlite3"));
+        assert!(!report.audio_input.probed);
+        assert!(report.audio_input.default_device.is_none());
+        assert!(report.audio_input.issues[0].contains("fw robot listen --list-devices"));
         // Timestamp should be non-empty.
         assert!(!report.ts.is_empty(), "timestamp should be non-empty");
         // Should have at least one backend.
@@ -5568,6 +7887,70 @@ mod tests {
         }
     }
 
+    /// bd-robot-event-schema-fixture-stale-t8la: the live confirm lane's
+    /// utterance-keyed `transcript.confirm` / `transcript.correct` are a
+    /// catalog `live_variant` whose required fields are exactly what the
+    /// emitters write, and they lack the speculative form's `window_id`.
+    #[test]
+    fn live_confirm_lane_events_match_their_catalog_variant() {
+        use super::{
+            LISTEN_TRANSCRIPT_CONFIRM_REQUIRED_FIELDS, LISTEN_TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
+            listen_transcript_confirm_value, listen_transcript_correct_value,
+        };
+
+        let segment = TranscriptionSegment {
+            start_sec: Some(0.0),
+            end_sec: Some(1.0),
+            text: "ask not".to_owned(),
+            speaker: None,
+            confidence: Some(0.8),
+        };
+        let confirm =
+            listen_transcript_confirm_value("run-live", 9, "t", 2, "turbo", 0.1, 0.0, 1, 40);
+        let correct = listen_transcript_correct_value(
+            "run-live",
+            10,
+            "t",
+            2,
+            0,
+            std::slice::from_ref(&segment),
+            "turbo",
+            0.5,
+            0.2,
+            3,
+            90,
+        );
+        let schema = robot_schema_value();
+        for (event_name, value, required) in [
+            (
+                "transcript.confirm",
+                confirm,
+                LISTEN_TRANSCRIPT_CONFIRM_REQUIRED_FIELDS,
+            ),
+            (
+                "transcript.correct",
+                correct,
+                LISTEN_TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
+            ),
+        ] {
+            let variant = &schema["events"][event_name]["live_variant"];
+            assert_eq!(variant["required"], json!(required), "{event_name}");
+            assert_eq!(variant["keyed_by"], "utterance_id");
+            assert_eq!(variant["example"]["event"], event_name);
+            let mut keys: Vec<&str> = value
+                .as_object()
+                .expect("event object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            let mut expected = required.to_vec();
+            expected.sort_unstable();
+            assert_eq!(keys, expected, "{event_name} live emitter fields");
+            assert!(value.get("window_id").is_none());
+        }
+    }
+
     #[test]
     fn transcript_retract_value_contains_required_fields_and_reason() {
         let value = super::transcript_retract_value(
@@ -5658,7 +8041,7 @@ mod tests {
 
     #[test]
     fn snapshot_resources_memory_fields_not_swapped() {
-        let snap = super::snapshot_resources();
+        let snap = super::snapshot_resources(std::path::Path::new("."));
         if let (Some(avail), Some(total)) = (snap.memory_available_bytes, snap.memory_total_bytes) {
             assert!(
                 avail <= total,
@@ -6106,6 +8489,67 @@ mod tests {
             value["native_compute"]["metal_target_compiled"],
             cfg!(target_os = "macos")
         );
+        // bd-int8-encoder-mishears-m1q9: the encoder precision policy and its
+        // override are discoverable, and agree with the policy the engine runs.
+        let precision = &value["native_compute"]["encoder_precision"];
+        assert_eq!(precision["override_env"], "FW_ENC_ATTN_OUT_I8I32");
+        // bd-77qf / bd-nt0d: the Metal encoder is described by what its
+        // kernels compute (f16 GEMM operands, f32 accumulation), never as f32,
+        // and the per-run record is what ran, not the policy decision.
+        let metal = &precision["metal_encoder_precision"];
+        for family in ["conv_stem", "attn_qkv", "attn_out", "mlp_fc1", "mlp_fc2"] {
+            assert_eq!(metal[family], "f16", "{family}: {metal}");
+        }
+        assert_eq!(metal["attention"], "f16_kv", "{metal}");
+        let forced = precision["override_values"]["1"]
+            .as_str()
+            .expect("override_values.1 text");
+        assert!(
+            forced.contains("f16") && !forced.contains("in f32"),
+            "the Metal encoder must not be described as computing in f32: {forced}"
+        );
+        assert_eq!(
+            precision["per_run_record"],
+            "result.raw_output.encoder_execution"
+        );
+        assert_eq!(
+            precision["policy_record"],
+            "result.raw_output.encoder_int8_policy"
+        );
+        assert_eq!(
+            precision["calibration_id"],
+            crate::native_engine::ENCODER_INT8_CALIBRATION_ID
+        );
+        assert_eq!(precision["corpus_wer_delta_budget"], 0.0);
+        assert_eq!(
+            precision["int8_kernels_compiled"],
+            cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
+        );
+        let calibrated = precision["calibrated_models"]
+            .as_array()
+            .expect("calibrated_models array");
+        let models: Vec<&str> = calibrated
+            .iter()
+            .filter_map(|row| row["model"].as_str())
+            .collect();
+        assert_eq!(models, ["tiny.en", "large-v3-turbo"]);
+        for row in calibrated {
+            let delta = row["measured_corpus_wer_delta"]
+                .as_f64()
+                .expect("measured delta");
+            let expected = if !cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
+                ("f32", "cpu_feature_fallback")
+            } else if delta > 0.0 {
+                ("f32", "calibration_wer_budget_exceeded")
+            } else {
+                ("quality_safe_int8", "calibrated_model_budget_pass")
+            };
+            assert_eq!(
+                (row["default"].as_str(), row["reason"].as_str()),
+                (Some(expected.0), Some(expected.1)),
+                "{row}"
+            );
+        }
         assert!(value["compiled_features"].get("gpu_frankentorch").is_none());
         assert!(value["compiled_features"].get("gpu_frankenjax").is_none());
         assert_eq!(
@@ -6127,10 +8571,36 @@ mod tests {
                     entry["command"] == "fw robot run --input AUDIO" && entry["output"] == "ndjson"
                 }))
         );
+        // bd-m7fv: the youtube curation subcommands must stay discoverable.
+        let commands_text: Vec<String> = value["structured_commands"]
+            .as_array()
+            .expect("structured commands")
+            .iter()
+            .filter_map(|entry| entry["command"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            commands_text
+                .iter()
+                .any(|c| c.starts_with("fw youtube run "))
+        );
+        assert!(
+            commands_text
+                .iter()
+                .any(|c| c.starts_with("fw youtube search "))
+        );
+        assert!(
+            commands_text
+                .iter()
+                .any(|c| c.starts_with("fw youtube enrich "))
+        );
     }
 
     #[test]
     fn model_registry_keeps_sortformer_release_bound_and_exact() {
+        if !ultra_stress_enabled() {
+            eprintln!("SKIP model registry cache authentication: ultra stress mode is disabled");
+            return;
+        }
         let value = super::models_report_value();
         assert_eq!(value["schema_version"], "franken-whisper-model-registry-v2");
         assert_eq!(value["network_access_performed"], false);
@@ -6168,6 +8638,10 @@ mod tests {
 
     #[test]
     fn doctor_and_triage_expose_stable_readiness_contracts() {
+        if !ultra_stress_enabled() {
+            eprintln!("SKIP doctor cache authentication: ultra stress mode is disabled");
+            return;
+        }
         let db = std::path::Path::new("nonexistent-parent/doctor.sqlite3");
         let doctor = super::doctor_report_value(db);
         assert_eq!(doctor["schema_version"], "franken-whisper-doctor-v1");
@@ -6195,5 +8669,449 @@ mod tests {
         assert!(guide.contains("fw pull all --json"));
         assert!(guide.contains("installer does this automatically"));
         assert!(guide.contains("inference itself never accesses the network"));
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-rt-events-ghdx: listen session event family + validator
+    // -----------------------------------------------------------------------
+
+    fn sample_session_info() -> ListenSessionInfo {
+        ListenSessionInfo {
+            source: "file-replay".into(),
+            capture_backend: "none".into(),
+            device: "<fixture>".into(),
+            sample_rate_hz: 16_000,
+            fast_model: "tiny.en".into(),
+            quality_model: None,
+            policy: "endpoint-commit".into(),
+            step_ms: 300,
+            partials: true,
+            vad: json!({"min_speech_ms": 250, "endpoint_ms": 600, "gate_db": 9}),
+        }
+    }
+
+    fn sample_stats() -> ListenSessionStats {
+        ListenSessionStats {
+            audio_sec: 2.5,
+            wall_sec: 2.6,
+            deltas: 2,
+            utterances: 1,
+            capture_overruns: 0,
+            mean_step_latency_ms: 40.0,
+            p95_step_latency_ms: 55.0,
+            ttft_ms: Some(390.0),
+            policy_holdbacks: 1,
+            confirmations_emitted: 0,
+            corrections_emitted: 0,
+            confirm_lag_p50_ms: None,
+            confirm_lag_p95_ms: None,
+            confirm_lag_max_ms: None,
+            controllers: None,
+        }
+    }
+
+    /// A minimal well-formed success stream: one utterance, two deltas.
+    fn sample_success_stream() -> Vec<serde_json::Value> {
+        vec![
+            listen_session_start_value("run-l", 0, "t0", &sample_session_info()),
+            speech_started_value("run-l", 1, "t1", 1, 0.42),
+            transcript_delta_value("run-l", 2, "t2", 1, "hello ", 0.42, 0.90, 2, Some(0.9)),
+            transcript_partial_value(
+                "run-l",
+                3,
+                "t3",
+                &TranscriptionSegment {
+                    start_sec: Some(0.9),
+                    end_sec: Some(1.3),
+                    text: "wor".into(),
+                    speaker: None,
+                    confidence: Some(0.5),
+                },
+            ),
+            transcript_delta_value("run-l", 4, "t4", 1, "world", 0.90, 1.40, 1, Some(0.88)),
+            utterance_end_value(
+                "run-l",
+                5,
+                "t5",
+                1,
+                UtteranceEndReason::Endpoint,
+                0.42,
+                1.40,
+                "hello world",
+                2,
+            ),
+            listen_session_stats_value("run-l", 6, "t6", &sample_stats(), true),
+        ]
+    }
+
+    #[test]
+    fn listen_event_values_contain_all_required_fields() {
+        let cases: Vec<(&str, &[&str], serde_json::Value)> = vec![
+            (
+                "listen.session_start",
+                LISTEN_SESSION_START_REQUIRED_FIELDS,
+                listen_session_start_value("r", 0, "t", &sample_session_info()),
+            ),
+            (
+                "speech_started",
+                SPEECH_STARTED_REQUIRED_FIELDS,
+                speech_started_value("r", 1, "t", 1, 0.5),
+            ),
+            (
+                "transcript.delta",
+                TRANSCRIPT_DELTA_REQUIRED_FIELDS,
+                transcript_delta_value("r", 2, "t", 1, "x", 0.0, 0.5, 1, None),
+            ),
+            (
+                "utterance_end",
+                UTTERANCE_END_REQUIRED_FIELDS,
+                utterance_end_value(
+                    "r",
+                    3,
+                    "t",
+                    1,
+                    UtteranceEndReason::Endpoint,
+                    0.0,
+                    0.5,
+                    "x",
+                    1,
+                ),
+            ),
+            (
+                "listen.warning",
+                LISTEN_WARNING_REQUIRED_FIELDS,
+                listen_warning_value("r", 4, "t", "silent_input", json!({})),
+            ),
+            (
+                "listen.session_stats",
+                LISTEN_SESSION_STATS_REQUIRED_FIELDS,
+                listen_session_stats_value("r", 5, "t", &sample_stats(), false),
+            ),
+            (
+                "listen.controller",
+                LISTEN_CONTROLLER_REQUIRED_FIELDS,
+                listen_controller_value(
+                    "r",
+                    6,
+                    "t",
+                    &crate::listen::AdaptiveControllerEntry {
+                        controller: "step_ms",
+                        from: 300,
+                        to: 350,
+                        reason: "overrun_pressure".to_owned(),
+                        brier: 0.12,
+                        observations: 12,
+                        fallback_active: false,
+                    },
+                ),
+            ),
+        ];
+        for (event_name, required, value) in &cases {
+            assert_eq!(value["event"], *event_name);
+            assert_eq!(value["schema_version"], ROBOT_SCHEMA_VERSION);
+            for field in *required {
+                assert!(
+                    value.get(*field).is_some(),
+                    "`{event_name}` missing required field `{field}`: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn utterance_end_reason_strings_cover_all_variants() {
+        assert_eq!(UtteranceEndReason::Endpoint.as_str(), "endpoint");
+        assert_eq!(UtteranceEndReason::Timeout.as_str(), "timeout");
+        assert_eq!(UtteranceEndReason::MaxLen.as_str(), "max_len");
+        assert_eq!(UtteranceEndReason::SessionEnd.as_str(), "session_end");
+    }
+
+    #[test]
+    fn utterance_end_text_truncates_at_cap_on_char_boundary() {
+        // Multibyte char straddling the cap must not split.
+        let unit = "é"; // 2 bytes
+        let text = unit.repeat(UTTERANCE_END_TEXT_CAP_BYTES); // 2x the cap in bytes
+        let value = utterance_end_value(
+            "r",
+            1,
+            "t",
+            1,
+            UtteranceEndReason::Timeout,
+            0.0,
+            1.0,
+            &text,
+            1,
+        );
+        assert_eq!(value["text_truncated"], true);
+        let emitted = value["text"].as_str().unwrap();
+        assert!(emitted.len() <= UTTERANCE_END_TEXT_CAP_BYTES);
+        assert!(emitted.len() >= UTTERANCE_END_TEXT_CAP_BYTES - 4);
+        assert!(text.starts_with(emitted));
+
+        // Under the cap: untouched, flag false.
+        let short = utterance_end_value(
+            "r",
+            2,
+            "t",
+            1,
+            UtteranceEndReason::Endpoint,
+            0.0,
+            1.0,
+            "short",
+            1,
+        );
+        assert_eq!(short["text_truncated"], false);
+        assert_eq!(short["text"], "short");
+    }
+
+    #[test]
+    fn validator_accepts_well_formed_success_stream() {
+        let events = sample_success_stream();
+        NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .expect("well-formed stream must validate");
+    }
+
+    #[test]
+    fn validator_accepts_controller_and_rejects_missing_controller_evidence() {
+        let mut events = sample_success_stream();
+        let mut final_stats = events.pop().expect("final stats");
+        let controller = listen_controller_value(
+            "run-l",
+            6,
+            "t6",
+            &crate::listen::AdaptiveControllerEntry {
+                controller: "step_ms",
+                from: 300,
+                to: 350,
+                reason: "overrun_pressure".to_owned(),
+                brier: 0.12,
+                observations: 12,
+                fallback_active: false,
+            },
+        );
+        final_stats["seq"] = json!(7);
+        events.push(controller.clone());
+        events.push(final_stats.clone());
+        NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .expect("controller evidence must be accepted in a listen stream");
+
+        let mut missing_brier = controller;
+        missing_brier
+            .as_object_mut()
+            .expect("controller object")
+            .remove("brier");
+        events[6] = missing_brier;
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(err.contains("missing required field `brier`"), "{err}");
+    }
+
+    #[test]
+    fn validator_accepts_fatal_stream_ending_in_run_error() {
+        let mut events = sample_success_stream();
+        events.pop(); // drop final stats
+        events.push(run_error_value("device unplugged", "FW-IO"));
+        NdjsonStreamValidator::new(StreamOutcome::Fatal)
+            .validate(&events)
+            .expect("fatal stream ending in run_error must validate");
+    }
+
+    #[test]
+    fn validator_rejects_seq_regression() {
+        let mut events = sample_success_stream();
+        events[4]["seq"] = json!(2); // duplicate of an earlier seq
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(
+            err.contains("strictly increasing"),
+            "wrong invariant: {err}"
+        );
+        assert!(err.contains(">>>"), "violation context missing: {err}");
+    }
+
+    #[test]
+    fn validator_rejects_rewritten_committed_text() {
+        let mut events = sample_success_stream();
+        // utterance_end.text disagrees with concatenated deltas.
+        events[5]["text"] = json!("hello there");
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(err.contains("append-only"), "wrong invariant: {err}");
+    }
+
+    #[test]
+    fn validator_rejects_unpaired_speech_started() {
+        let mut events = sample_success_stream();
+        events.remove(5); // drop utterance_end
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(err.contains("never closed"), "wrong invariant: {err}");
+    }
+
+    #[test]
+    fn validator_rejects_run_complete_in_listen_stream() {
+        let mut events = sample_success_stream();
+        events.insert(
+            6,
+            json!({"event": "run_complete", "schema_version": ROBOT_SCHEMA_VERSION}),
+        );
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(
+            err.contains("never emit run_start/run_complete"),
+            "wrong invariant: {err}"
+        );
+    }
+
+    #[test]
+    fn validator_rejects_confirm_for_open_or_unknown_utterance() {
+        let mut events = sample_success_stream();
+        // A confirm referencing utterance 9 (never existed).
+        events.insert(
+            6,
+            json!({
+                "event": "transcript.confirm",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "run-l",
+                "seq": 6,
+                "window_id": 0,
+                "quality_model_id": "turbo",
+                "drift": {},
+                "latency_ms": 100,
+                "ts": "t",
+                "utterance_id": 9,
+            }),
+        );
+        events[7]["seq"] = json!(7); // keep seq strictly increasing past the insert
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(err.contains("already-closed"), "wrong invariant: {err}");
+    }
+
+    #[test]
+    fn validator_rejects_missing_success_terminal() {
+        let mut events = sample_success_stream();
+        events.pop(); // no final stats
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(err.contains("final: true"), "wrong invariant: {err}");
+    }
+
+    #[test]
+    fn validator_rejects_delta_outside_open_utterance() {
+        let mut events = sample_success_stream();
+        events.insert(
+            6,
+            transcript_delta_value("run-l", 6, "t", 1, "late", 2.0, 2.5, 1, None),
+        );
+        events[7]["seq"] = json!(7); // keep seq strictly increasing past the insert
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(
+            err.contains("outside an open utterance"),
+            "wrong invariant: {err}"
+        );
+    }
+
+    #[test]
+    fn listen_golden_synthetic_session_is_byte_stable() {
+        // Two independent constructions serialize byte-identically, and the
+        // committed-delta shape matches the frozen literal (insertion-order
+        // serialization is part of the contract surface).
+        let a: Vec<String> = sample_success_stream()
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        let b: Vec<String> = sample_success_stream()
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        assert_eq!(
+            a, b,
+            "synthetic session serialization must be deterministic"
+        );
+        assert_eq!(
+            a[2],
+            r#"{"event":"transcript.delta","schema_version":"1.1.0","run_id":"run-l","seq":2,"ts":"t2","utterance_id":1,"text":"hello ","t0_sec":0.42,"t1_sec":0.9,"tokens":2,"confidence":0.9,"stability":"committed"}"#,
+        );
+        assert_eq!(
+            a[5],
+            r#"{"event":"utterance_end","schema_version":"1.1.0","run_id":"run-l","seq":5,"ts":"t5","utterance_id":1,"reason":"endpoint","t0_sec":0.42,"t1_sec":1.4,"text":"hello world","text_truncated":false,"delta_count":2}"#,
+        );
+    }
+
+    #[test]
+    fn listen_events_registered_in_robot_schema() {
+        let schema = robot_schema_value();
+        let events = schema["events"].as_object().expect("events map");
+        for name in [
+            "listen.session_start",
+            "speech_started",
+            "transcript.delta",
+            "utterance_end",
+            "listen.warning",
+            "listen.session_stats",
+            "listen.controller",
+        ] {
+            let entry = events
+                .get(name)
+                .unwrap_or_else(|| panic!("`{name}` not registered"));
+            assert!(
+                entry.get("required").is_some(),
+                "`{name}` lacks required list"
+            );
+            assert_eq!(
+                entry["example"]["schema_version"], ROBOT_SCHEMA_VERSION,
+                "`{name}` example version mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn youtube_events_registered_in_robot_schema_with_complete_examples() {
+        let schema = robot_schema_value();
+        let events = schema["events"].as_object().expect("events map");
+        for name in [
+            "youtube.run_start",
+            "youtube.discovered",
+            "youtube.downloading",
+            "youtube.downloaded",
+            "youtube.transcribing",
+            "youtube.done",
+            "youtube.skipped",
+            "youtube.failed",
+            "youtube.run_complete",
+        ] {
+            let entry = events
+                .get(name)
+                .unwrap_or_else(|| panic!("`{name}` not registered"));
+            let required = entry["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("`{name}` lacks required list"));
+            let example = entry["example"]
+                .as_object()
+                .unwrap_or_else(|| panic!("`{name}` lacks example object"));
+            for field in required {
+                let field = field.as_str().expect("required field name");
+                assert!(
+                    example.contains_key(field),
+                    "`{name}` example lacks required field `{field}`"
+                );
+            }
+            assert_eq!(
+                entry["example"]["schema_version"], ROBOT_SCHEMA_VERSION,
+                "`{name}` example version mismatch"
+            );
+        }
     }
 }

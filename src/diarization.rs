@@ -47,6 +47,9 @@ pub const ACOUSTIC_DIARIZATION_CONTRACT_VERSION: &str = "acoustic-diarization-v3
 /// acoustic segmentation, constraints, clustering, temporal, and projection
 /// stack.
 pub const NEURAL_DIARIZATION_CONTRACT_VERSION: &str = "neural-diarization-common-v2";
+/// Stable contract identity of native Streaming Sortformer reports (the
+/// `auto` default engine).
+pub const SORTFORMER_DIARIZATION_CONTRACT_VERSION: &str = "sortformer-diarization-v1";
 /// Versioned direct cosine use of the pinned 192-coordinate ECAPA embedding in
 /// the common diarizer's identity-coordinate contract.
 pub const ECAPA_SPEAKER_REPRESENTATION_VERSION: &str = "ecapa-tdnn-voxceleb-cosine-v6-development";
@@ -3229,6 +3232,8 @@ pub const ACOUSTIC_WAVELET_FLATNESS_RELATIVE_POWER_FLOOR: f32 = f32::EPSILON;
 pub const ACOUSTIC_WAVELET_CENTERED_RMS_RELATIVE_FLOOR: f32 = 8.0 * f32::EPSILON;
 /// Independent contract identity for the evaluation-only sidecar surface.
 pub const ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION: &str = "acoustic-multiscale-sidecar-v4";
+/// Frozen absolute tolerance for sidecar scalar-differential and metamorphic checks.
+pub const ACOUSTIC_SIDECAR_DIFFERENTIAL_TOLERANCE: f32 = 2e-6;
 /// Fixed temporal support of the modulation sidecar at the 10 ms cadence.
 pub const ACOUSTIC_MODULATION_HISTORY_FRAMES: usize = 64;
 /// Minimum valid trajectory observations required by a modulation regression.
@@ -14774,7 +14779,36 @@ fn apply_ecapa_speaker_representations(
     model: &EcapaModel,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<(NeuralSpeakerRepresentationSummary, EcapaTrackletEmbeddings)> {
-    if model.info().package_sha256 != ECAPA_PACKAGE_SHA256 {
+    apply_ecapa_speaker_representations_with_infer(
+        samples,
+        tracklets,
+        &model.info().package_sha256,
+        checkpoint,
+        |window| {
+            let mut trace = EcapaInferenceTrace::default();
+            model
+                .infer_pcm_with_checkpoint(
+                    window,
+                    EcapaInferenceConfig::default(),
+                    checkpoint,
+                    &mut trace,
+                )
+                .map(|output| output.embedding.into_array())
+        },
+    )
+}
+
+fn apply_ecapa_speaker_representations_with_infer<Infer>(
+    samples: &[f32],
+    tracklets: &[AcousticTracklet],
+    loaded_model_package_sha256: &str,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    mut infer: Infer,
+) -> FwResult<(NeuralSpeakerRepresentationSummary, EcapaTrackletEmbeddings)>
+where
+    Infer: FnMut(&[f32]) -> FwResult<EcapaSpeakerEmbedding>,
+{
+    if loaded_model_package_sha256 != ECAPA_PACKAGE_SHA256 {
         return Err(FwError::InvalidRequest(
             "ecapa.representation_model: loaded package provenance does not match the pinned speaker representation"
                 .to_owned(),
@@ -14818,27 +14852,10 @@ fn apply_ecapa_speaker_representations(
             saw_short_tracklet = true;
         }
         clamp_ecapa_pcm(&mut windows.discovery);
-        let mut discovery_trace = EcapaInferenceTrace::default();
-        let discovery = model.infer_pcm_with_checkpoint(
-            &windows.discovery,
-            EcapaInferenceConfig::default(),
-            checkpoint,
-            &mut discovery_trace,
-        )?;
+        let discovery = infer(&windows.discovery)?;
         let validation = if let Some(validation) = windows.validation.as_mut() {
             clamp_ecapa_pcm(validation);
-            let mut validation_trace = EcapaInferenceTrace::default();
-            Some(
-                model
-                    .infer_pcm_with_checkpoint(
-                        validation,
-                        EcapaInferenceConfig::default(),
-                        checkpoint,
-                        &mut validation_trace,
-                    )?
-                    .embedding
-                    .into_array(),
-            )
+            Some(infer(validation)?)
         } else {
             None
         };
@@ -14853,7 +14870,7 @@ fn apply_ecapa_speaker_representations(
         embeddings.insert(
             tracklet.tracklet_index,
             EcapaTrackletRepresentation {
-                discovery: discovery.embedding.into_array(),
+                discovery,
                 validation,
                 discovery_weight,
                 validation_weight,
@@ -14884,7 +14901,7 @@ fn apply_ecapa_speaker_representations(
         schema_version: "neural-speaker-representation-summary-v1".to_owned(),
         provider_version: ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
         expected_model_package_sha256: ECAPA_PACKAGE_SHA256.to_owned(),
-        loaded_model_package_sha256: Some(model.info().package_sha256.clone()),
+        loaded_model_package_sha256: Some(loaded_model_package_sha256.to_owned()),
         model_load_source: Some(NeuralModelLoadSource::PackageVerified),
         status,
         embedded_tracklet_count: report_count(embedded_tracklet_count, "embedded tracklet count")?,
@@ -25623,9 +25640,10 @@ mod tests {
         ACOUSTIC_CANCELLATION_INTERVAL_FRAMES, ACOUSTIC_FRAME_SAMPLES, ACOUSTIC_HOP_SAMPLES,
         ACOUSTIC_MODULATION_FREQUENCY_HZ, ACOUSTIC_MODULATION_HISTORY_FRAMES,
         ACOUSTIC_SCATTERING_SCALE_PAIRS, ACOUSTIC_SCATTERING_SCALE_SUPPORTS,
-        ACOUSTIC_TRAJECTORY_HISTORY_FRAMES, AcousticBoundaryHints, AcousticDiarizationInput,
-        AcousticFeatureStream, AcousticFrameFeatures, AcousticModulationSidecar,
-        AcousticQualityMask, AcousticScatteringMode, AcousticSegmentationStream, AcousticSegmenter,
+        ACOUSTIC_SIDECAR_DIFFERENTIAL_TOLERANCE, ACOUSTIC_TRAJECTORY_HISTORY_FRAMES,
+        AcousticBoundaryHints, AcousticDiarizationInput, AcousticFeatureStream,
+        AcousticFrameFeatures, AcousticModulationSidecar, AcousticQualityMask,
+        AcousticScatteringMode, AcousticSegmentationStream, AcousticSegmenter,
         AcousticSidecarFeatureOwner, AcousticSidecarStudy, AcousticSidecarStudyConfig,
         AcousticSidecarStudyMode, AcousticSpeakerAssignment, AcousticTracklet,
         AcousticTrajectoryFamily, AcousticTrajectoryWaveletMode, AcousticWaveletBasis,
@@ -28073,6 +28091,7 @@ mod tests {
 
     #[test]
     fn sidecar_study_modes_are_separate_default_off_and_hash_complete() {
+        assert_eq!(ACOUSTIC_SIDECAR_DIFFERENTIAL_TOLERANCE, 2e-6);
         assert_eq!(
             AcousticSidecarStudyConfig::default().mode,
             AcousticSidecarStudyMode::Off
@@ -30681,6 +30700,50 @@ mod tests {
             expected_sliding_observation.expect("complete sliding reference window")
         );
         assert_eq!(study.retained_state_bytes_on_target(), retained_state_bytes);
+
+        let mut post_wrap_observation = None;
+        for frame_index in
+            ACOUSTIC_TRAJECTORY_HISTORY_FRAMES + 2..=ACOUSTIC_TRAJECTORY_HISTORY_FRAMES * 2
+        {
+            post_wrap_observation = Some(
+                study
+                    .observe_normalized_16khz_frame(
+                        &frame_samples,
+                        &trajectory_sidecar_feature(frame_index),
+                        &mut active,
+                    )
+                    .expect("post-wrap streaming observation"),
+            );
+        }
+        let post_wrap_observation = post_wrap_observation.expect("post-wrap final observation");
+        let mut post_wrap_reference =
+            AcousticSidecarStudy::new(config).expect("post-wrap reference study");
+        let mut expected_post_wrap_observation = None;
+        for frame_index in
+            ACOUSTIC_TRAJECTORY_HISTORY_FRAMES + 1..=ACOUSTIC_TRAJECTORY_HISTORY_FRAMES * 2
+        {
+            expected_post_wrap_observation = Some(
+                post_wrap_reference
+                    .observe_normalized_16khz_frame(
+                        &frame_samples,
+                        &trajectory_sidecar_feature(frame_index),
+                        &mut active,
+                    )
+                    .expect("post-wrap reference observation"),
+            );
+        }
+        assert_eq!(
+            post_wrap_observation,
+            expected_post_wrap_observation.expect("complete post-wrap reference window")
+        );
+        assert_eq!(
+            post_wrap_observation
+                .trajectory_wavelet()
+                .expect("post-wrap trajectory wavelet")
+                .window_start_frame_index,
+            ACOUSTIC_TRAJECTORY_HISTORY_FRAMES + 1
+        );
+        assert_eq!(study.retained_state_bytes_on_target(), retained_state_bytes);
     }
 
     #[test]
@@ -30882,7 +30945,10 @@ mod tests {
         let detector_mode = super::AcousticChangeDetectorMode::CalibratedPosterior;
         let hash = super::acoustic_sidecar_fusion_configuration_sha256(request, detector_mode)
             .expect("valid fusion configuration hash");
-        assert_eq!(hash.len(), 64);
+        assert_eq!(
+            hash,
+            "f42b9449734f6f7ed3d1a16fc9443f19908f948bb8eb343ed895085ea881a5c7"
+        );
         assert_eq!(
             hash,
             super::acoustic_sidecar_fusion_configuration_sha256(request, detector_mode)
@@ -31512,7 +31578,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_opt_out_pipeline_is_exactly_the_existing_evaluation_path() {
+    fn sidecar_opt_out_robot_report_persistence_and_evaluation_path_are_byte_exact() {
         const INPUT_SHA256: &str =
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let samples = sine_wave(140.0, 2.0, 0.35);
@@ -31566,6 +31632,14 @@ mod tests {
             || false,
         )
         .expect("sidecar opt-out path");
+        let baseline_report_bytes =
+            serde_json::to_vec(&baseline.0).expect("serialize baseline robot report");
+        let opt_out_report_bytes =
+            serde_json::to_vec(&opt_out.0).expect("serialize opt-out robot report");
+        assert_eq!(baseline_report_bytes, opt_out_report_bytes);
+        let persisted_report: DiarizationReport =
+            serde_json::from_slice(&opt_out_report_bytes).expect("restore opt-out robot report");
+        assert_eq!(persisted_report, opt_out.0);
         let baseline_bytes = serde_json::to_vec(&(
             &baseline.0,
             &baseline.1.segments,
@@ -39981,6 +40055,104 @@ mod tests {
             super::represented_ecapa_weight(3_000, windows.discovery.len(), source.len());
         assert_eq!(represented, 300.0);
         assert!(represented < 3_000.0);
+    }
+
+    #[test]
+    fn ecapa_short_tracklet_padding_emits_typed_provenance() {
+        let mut embedding = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        embedding[0] = 1.0;
+        let tracklet =
+            profile_tracklet(0, 0, 500, 0.0, 0.0, super::MIN_ECAPA_TRACKLET_VOICED_FRAMES);
+
+        let mut short_source = vec![0.25_f32; super::ECAPA_MINIMUM_RUNTIME_SAMPLES - 3];
+        short_source[0] = 0.125;
+        *short_source.last_mut().expect("short source sample") = -0.375;
+        let mut short_calls = Vec::new();
+        let (short_summary, short_embeddings) =
+            super::apply_ecapa_speaker_representations_with_infer(
+                &short_source,
+                std::slice::from_ref(&tracklet),
+                crate::ecapa_conformance::ECAPA_PACKAGE_SHA256,
+                &|| Ok(()),
+                |window| {
+                    short_calls.push(window.to_vec());
+                    Ok(embedding)
+                },
+            )
+            .expect("short tracklet representation");
+
+        assert_eq!(
+            short_calls.len(),
+            1,
+            "short tracklet has no held-out window"
+        );
+        let padded = &short_calls[0];
+        assert_eq!(padded.len(), super::ECAPA_MINIMUM_RUNTIME_SAMPLES);
+        let offset = (super::ECAPA_MINIMUM_RUNTIME_SAMPLES - short_source.len()) / 2;
+        assert_eq!(offset, 1);
+        assert_eq!(padded[..offset], [0.0]);
+        assert_eq!(
+            &padded[offset..offset + short_source.len()],
+            short_source.as_slice()
+        );
+        assert_eq!(&padded[offset + short_source.len()..], &[0.0, 0.0]);
+        assert_eq!(
+            short_summary.status,
+            NeuralSpeakerRepresentationStatus::Degraded
+        );
+        assert_eq!(short_summary.embedded_tracklet_count, 1);
+        assert_eq!(short_summary.zero_padded_tracklet_count, 1);
+        assert_eq!(short_summary.skipped_tracklet_count, 0);
+        assert_eq!(
+            short_summary.reasons,
+            vec![
+                NeuralSpeakerRepresentationReason::ShortTracklet,
+                NeuralSpeakerRepresentationReason::InsufficientTracklets,
+            ]
+        );
+        let short_representation = short_embeddings.get(&0).expect("short representation");
+        assert_eq!(short_representation.discovery, embedding);
+        assert_eq!(short_representation.validation, None);
+        assert_eq!(short_representation.discovery_weight, 20.0);
+        assert_eq!(short_representation.validation_weight, 0.0);
+
+        let mut missing_provenance = short_summary.clone();
+        missing_provenance
+            .reasons
+            .retain(|reason| *reason != NeuralSpeakerRepresentationReason::ShortTracklet);
+        assert_eq!(
+            missing_provenance.validate(),
+            Err("zero-padded neural tracklets lack short-tracklet provenance".to_owned())
+        );
+
+        let mut exact_source = vec![0.5_f32; super::ECAPA_MINIMUM_RUNTIME_SAMPLES];
+        exact_source[0] = 0.125;
+        *exact_source.last_mut().expect("exact source sample") = -0.375;
+        let mut exact_calls = Vec::new();
+        let (exact_summary, exact_embeddings) =
+            super::apply_ecapa_speaker_representations_with_infer(
+                &exact_source,
+                std::slice::from_ref(&tracklet),
+                crate::ecapa_conformance::ECAPA_PACKAGE_SHA256,
+                &|| Ok(()),
+                |window| {
+                    exact_calls.push(window.to_vec());
+                    Ok(embedding)
+                },
+            )
+            .expect("minimum-length tracklet representation");
+        assert_eq!(exact_calls, vec![exact_source]);
+        assert_eq!(exact_summary.embedded_tracklet_count, 1);
+        assert_eq!(exact_summary.zero_padded_tracklet_count, 0);
+        assert_eq!(exact_summary.skipped_tracklet_count, 0);
+        assert_eq!(
+            exact_summary.reasons,
+            vec![NeuralSpeakerRepresentationReason::InsufficientTracklets]
+        );
+        let exact_representation = exact_embeddings.get(&0).expect("exact representation");
+        assert_eq!(exact_representation.discovery_weight, 20.0);
+        assert_eq!(exact_representation.validation, None);
+        assert_eq!(exact_representation.validation_weight, 0.0);
     }
 
     #[test]

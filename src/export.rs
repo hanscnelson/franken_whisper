@@ -25,7 +25,10 @@ pub fn write_artifacts(
             OutputFormat::JsonFull => "json_full",
             OutputFormat::Lrc => "lrc",
         };
-        let candidate = Path::new(&format!("{}.{ext}", output_prefix.display())).to_path_buf();
+        let mut candidate = output_prefix.as_os_str().to_os_string();
+        candidate.push(".");
+        candidate.push(ext);
+        let candidate = PathBuf::from(candidate);
 
         match fmt {
             OutputFormat::Txt => write_txt(&candidate, result)?,
@@ -49,10 +52,90 @@ fn write_txt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
     // on long transcripts. Explicit flush surfaces write errors (raw-File drop
     // would swallow them).
     let mut file = BufWriter::new(File::create(path)?);
+    if result.segments.is_empty() && !result.transcript.is_empty() {
+        writeln!(file, "{}", result.transcript)?;
+    }
     for seg in &result.segments {
+        write_speaker_prefix(&mut file, seg)?;
         writeln!(file, "{}", seg.text)?;
     }
     file.flush()?;
+    Ok(())
+}
+
+/// The transcript `fw transcribe` prints in human mode: one whisper.cpp-style
+/// `[HH:MM:SS.mmm --> HH:MM:SS.mmm]` line per timed segment, with the
+/// `[SPEAKER] ` prefix of the TXT format on diarized segments. A result with
+/// no timed segment (e.g. `--no-timestamps`) prints its plain transcript.
+#[must_use]
+pub fn render_console_transcript(result: &TranscriptionResult) -> String {
+    let timed = result
+        .segments
+        .iter()
+        .any(|seg| seg.start_sec.is_some() && seg.end_sec.is_some());
+    if !timed {
+        return format!("{}\n", result.transcript);
+    }
+    let mut out = Vec::new();
+    for seg in &result.segments {
+        let text = seg.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        // Writes into a Vec cannot fail.
+        if let (Some(start), Some(end)) = (seg.start_sec, seg.end_sec) {
+            let _ = write!(
+                out,
+                "[{} --> {}]  ",
+                format_timestamp_vtt(start),
+                format_timestamp_vtt(end)
+            );
+        }
+        let _ = write_speaker_prefix(&mut out, seg);
+        let _ = writeln!(out, "{text}");
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The segment's diarization label, ready to embed in a line-oriented format:
+/// `None` for undiarized or blank labels (so undiarized output stays
+/// byte-identical), with line breaks folded to spaces so a hostile or malformed
+/// backend label cannot split a cue or a transcript line.
+fn speaker_label(seg: &TranscriptionSegment) -> Option<std::borrow::Cow<'_, str>> {
+    let speaker = seg.speaker.as_deref()?.trim();
+    if speaker.is_empty() {
+        return None;
+    }
+    if speaker.contains(['\n', '\r']) {
+        Some(std::borrow::Cow::Owned(speaker.replace(['\n', '\r'], " ")))
+    } else {
+        Some(std::borrow::Cow::Borrowed(speaker))
+    }
+}
+
+/// `[SPEAKER_01] ` prefix used by the TXT, SRT, and LRC writers for diarized
+/// segments (the shape the README documents for those formats).
+fn write_speaker_prefix(
+    writer: &mut impl Write,
+    seg: &TranscriptionSegment,
+) -> std::io::Result<()> {
+    match speaker_label(seg) {
+        Some(speaker) => write!(writer, "[{speaker}] "),
+        None => Ok(()),
+    }
+}
+
+/// WebVTT voice-span annotation text: `&`, `<`, and `>` are escaped so the
+/// label cannot terminate the `<v ...>` tag early or inject markup.
+fn write_vtt_voice_annotation(writer: &mut impl Write, speaker: &str) -> std::io::Result<()> {
+    for ch in speaker.chars() {
+        match ch {
+            '&' => writer.write_all(b"&amp;")?,
+            '<' => writer.write_all(b"&lt;")?,
+            '>' => writer.write_all(b"&gt;")?,
+            _ => write!(writer, "{ch}")?,
+        }
+    }
     Ok(())
 }
 
@@ -129,7 +212,14 @@ fn write_vtt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
                 format_timestamp_vtt(start),
                 format_timestamp_vtt(end)
             )?;
-            writeln!(file, "{}\n", seg.text)?;
+            match speaker_label(seg) {
+                Some(speaker) => {
+                    file.write_all(b"<v ")?;
+                    write_vtt_voice_annotation(&mut file, &speaker)?;
+                    writeln!(file, ">{}</v>\n", seg.text)?;
+                }
+                None => writeln!(file, "{}\n", seg.text)?,
+            }
         }
     }
     file.flush()?;
@@ -138,15 +228,18 @@ fn write_vtt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
 
 fn write_srt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
     let mut file = BufWriter::new(File::create(path)?);
-    for (i, seg) in result.segments.iter().enumerate() {
+    let mut cue_number = 0usize;
+    for seg in &result.segments {
         if let (Some(start), Some(end)) = (seg.start_sec, seg.end_sec) {
-            writeln!(file, "{}", i + 1)?;
+            cue_number += 1;
+            writeln!(file, "{cue_number}")?;
             writeln!(
                 file,
                 "{} --> {}",
                 format_timestamp_srt(start),
                 format_timestamp_srt(end)
             )?;
+            write_speaker_prefix(&mut file, seg)?;
             writeln!(file, "{}\n", seg.text)?;
         }
     }
@@ -219,7 +312,9 @@ fn write_lrc(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
             let m = total_ms / 60_000;
             let s = (total_ms % 60_000) / 1000;
             let cs = (total_ms % 1000) / 10;
-            writeln!(file, "[{:02}:{:02}.{:02}] {}", m, s, cs, seg.text)?;
+            write!(file, "[{m:02}:{s:02}.{cs:02}] ")?;
+            write_speaker_prefix(&mut file, seg)?;
+            writeln!(file, "{}", seg.text)?;
         }
     }
     file.flush()?;
@@ -790,5 +885,228 @@ mod tests {
         let txt = dir.path().join("o.txt");
         write_txt(&txt, &result).unwrap();
         assert_eq!(std::fs::read_to_string(&txt).unwrap(), "hello\nworld\n");
+    }
+
+    #[test]
+    fn console_transcript_shows_timed_speaker_lines_or_plain_text() {
+        let segment = |start: Option<f64>, end: Option<f64>, text: &str, speaker: Option<&str>| {
+            TranscriptionSegment {
+                start_sec: start,
+                end_sec: end,
+                text: text.to_owned(),
+                speaker: speaker.map(str::to_owned),
+                confidence: None,
+            }
+        };
+        let mut result = TranscriptionResult {
+            backend: crate::model::BackendKind::WhisperCpp,
+            transcript: "hello there. all clear".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![
+                segment(Some(0.02), Some(10.44), " hello there.", Some("SPEAKER_00")),
+                segment(Some(10.44), Some(3_725.5), "all clear", None),
+                segment(Some(3_725.5), Some(3_726.0), "  ", None),
+            ],
+            acceleration: None,
+            diarization: None,
+            raw_output: serde_json::json!({}),
+            artifact_paths: Vec::new(),
+        };
+        assert_eq!(
+            render_console_transcript(&result),
+            "[00:00:00.020 --> 00:00:10.440]  [SPEAKER_00] hello there.\n\
+             [00:00:10.440 --> 01:02:05.500]  all clear\n"
+        );
+        // --no-timestamps: nothing to place on a timeline, print the text.
+        for seg in &mut result.segments {
+            seg.start_sec = None;
+            seg.end_sec = None;
+        }
+        assert_eq!(
+            render_console_transcript(&result),
+            "hello there. all clear\n"
+        );
+    }
+
+    #[test]
+    fn diarized_segments_carry_speaker_labels_in_every_text_format() {
+        let segment =
+            |start: f64, end: f64, text: &str, speaker: Option<&str>| TranscriptionSegment {
+                start_sec: Some(start),
+                end_sec: Some(end),
+                text: text.to_owned(),
+                speaker: speaker.map(str::to_owned),
+                confidence: None,
+            };
+        let result = TranscriptionResult {
+            backend: crate::model::BackendKind::WhisperCpp,
+            transcript: "hello there all clear".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![
+                segment(0.0, 1.5, "hello there", Some("SPEAKER_00")),
+                segment(1.5, 3.0, "unlabelled", None),
+                segment(3.0, 4.0, "blank label", Some("  ")),
+                segment(4.0, 5.25, "all clear", Some("Ann <&> Bo\nb")),
+            ],
+            acceleration: None,
+            diarization: None,
+            raw_output: serde_json::json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let txt = dir.path().join("d.txt");
+        write_txt(&txt, &result).expect("write TXT");
+        assert_eq!(
+            std::fs::read_to_string(&txt).expect("read TXT"),
+            "[SPEAKER_00] hello there\nunlabelled\nblank label\n[Ann <&> Bo b] all clear\n"
+        );
+
+        let srt = dir.path().join("d.srt");
+        write_srt(&srt, &result).expect("write SRT");
+        assert_eq!(
+            std::fs::read_to_string(&srt).expect("read SRT"),
+            "1\n00:00:00,000 --> 00:00:01,500\n[SPEAKER_00] hello there\n\n\
+             2\n00:00:01,500 --> 00:00:03,000\nunlabelled\n\n\
+             3\n00:00:03,000 --> 00:00:04,000\nblank label\n\n\
+             4\n00:00:04,000 --> 00:00:05,250\n[Ann <&> Bo b] all clear\n\n"
+        );
+
+        let vtt = dir.path().join("d.vtt");
+        write_vtt(&vtt, &result).expect("write VTT");
+        assert_eq!(
+            std::fs::read_to_string(&vtt).expect("read VTT"),
+            "WEBVTT\n\n\
+             00:00:00.000 --> 00:00:01.500\n<v SPEAKER_00>hello there</v>\n\n\
+             00:00:01.500 --> 00:00:03.000\nunlabelled\n\n\
+             00:00:03.000 --> 00:00:04.000\nblank label\n\n\
+             00:00:04.000 --> 00:00:05.250\n<v Ann &lt;&amp;&gt; Bo b>all clear</v>\n\n"
+        );
+
+        let lrc = dir.path().join("d.lrc");
+        write_lrc(&lrc, &result).expect("write LRC");
+        assert_eq!(
+            std::fs::read_to_string(&lrc).expect("read LRC"),
+            "[00:00.00] [SPEAKER_00] hello there\n[00:01.50] unlabelled\n\
+             [00:03.00] blank label\n[00:04.00] [Ann <&> Bo b] all clear\n"
+        );
+    }
+
+    #[test]
+    fn srt_numbers_only_emitted_timed_cues() {
+        let result = TranscriptionResult {
+            backend: crate::model::BackendKind::WhisperCpp,
+            transcript: "timed one timed two".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![
+                TranscriptionSegment {
+                    start_sec: None,
+                    end_sec: None,
+                    text: "untimed prefix".to_owned(),
+                    speaker: None,
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(1.0),
+                    end_sec: Some(2.0),
+                    text: "timed one".to_owned(),
+                    speaker: None,
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(2.0),
+                    end_sec: None,
+                    text: "partial timestamp".to_owned(),
+                    speaker: None,
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(3.0),
+                    end_sec: Some(4.0),
+                    text: "timed two".to_owned(),
+                    speaker: None,
+                    confidence: None,
+                },
+            ],
+            acceleration: None,
+            diarization: None,
+            raw_output: serde_json::json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gapped-source.srt");
+
+        write_srt(&path, &result).expect("write SRT");
+
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read SRT"),
+            "1\n00:00:01,000 --> 00:00:02,000\ntimed one\n\n2\n00:00:03,000 --> 00:00:04,000\ntimed two\n\n"
+        );
+    }
+
+    #[test]
+    fn txt_uses_root_transcript_when_backend_emits_no_segments() {
+        let result = TranscriptionResult {
+            backend: crate::model::BackendKind::InsanelyFast,
+            transcript: "root-only transcript".to_owned(),
+            language: Some("en".to_owned()),
+            segments: Vec::new(),
+            acceleration: None,
+            diarization: None,
+            raw_output: serde_json::json!({"text": "root-only transcript"}),
+            artifact_paths: Vec::new(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("root-only.txt");
+
+        write_txt(&path, &result).expect("write TXT");
+
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read TXT"),
+            "root-only transcript\n"
+        );
+    }
+
+    // Darwin's filesystem APIs reject ill-formed UTF-8 path components with
+    // EILSEQ even though Rust exposes Unix OsString byte constructors there.
+    // Exercise the byte-preservation contract only on Unix targets whose file
+    // APIs can actually create such a name.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    #[test]
+    fn artifact_extension_preserves_non_utf8_prefix_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let result = TranscriptionResult {
+            backend: crate::model::BackendKind::WhisperCpp,
+            transcript: "hello".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![TranscriptionSegment {
+                start_sec: Some(0.0),
+                end_sec: Some(1.0),
+                text: "hello".to_owned(),
+                speaker: None,
+                confidence: None,
+            }],
+            acceleration: None,
+            diarization: None,
+            raw_output: serde_json::json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefix = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"artifact-\x80".to_vec()));
+        let mut expected = prefix.as_os_str().to_os_string();
+        expected.push(".txt");
+        let expected = PathBuf::from(expected);
+
+        let artifacts = write_artifacts(&[OutputFormat::Txt], &result, &prefix)
+            .expect("write artifact with non-UTF-8 prefix");
+
+        assert_eq!(artifacts, vec![expected.clone()]);
+        assert_eq!(
+            std::fs::read_to_string(expected).expect("read exact artifact path"),
+            "hello\n"
+        );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "franken_whisper"
-version = "0.9.3"
+version = "0.11.0"
 edition = "2024"
 license-file = "LICENSE"
 description = "Native Rust Whisper ASR and speaker diarization with agent-first NDJSON and durable local workflows"
@@ -11,6 +11,7 @@ readme = "README.md"
 keywords = ["whisper", "speech-to-text", "diarization", "asr", "audio"]
 categories = ["command-line-utilities", "multimedia::audio"]
 include = [
+    "/.cargo/config.toml",
     "/Cargo.toml",
     "/Cargo.lock",
     "/rust-toolchain.toml",
@@ -22,6 +23,12 @@ include = [
     "/src/**",
     "!/src/.DS_Store",
     "/models/**",
+    # Keep the independent, model-free oracle runnable from the shipped crate.
+    "/tests/conformance_oracle_tests.rs",
+    # Hardware-required release probes; explicitly run by native qualification.
+    "/tests/registry_metal_production.rs",
+    "/tests/registry_metal_faults.rs",
+    "/scripts/convert_generic_to_safetensors.py",
     "/scripts/convert_to_safetensors.py",
     "/scripts/export_sortformer_activations.py",
     "/docs/native_engine_contract.md",
@@ -31,6 +38,7 @@ include = [
 [features]
 default = []
 tui = ["dep:ftui"]
+fj-oracle = ["dep:fj-lax", "dep:fj-core"]
 
 # Two binaries from the same entry point: the full name and the short `fw`
 # alias agents and humans actually type. Listing them explicitly disables the
@@ -49,6 +57,10 @@ path = "src/main.rs"
 [[bin]]
 name = "fw"
 path = "src/bin/fw.rs"
+
+[[bin]]
+name = "sortformer-f16-downcast"
+path = "src/bin/sortformer_f16_downcast.rs"
 
 [dependencies]
 ctrlc = "3.4"
@@ -74,12 +86,26 @@ symphonia = { version = "0.5.5", features = ["mp3", "aac", "isomp4", "ogg", "fla
 # ft-kernel-cpu; pinned to the same minor.
 rayon = "1.10"
 
-asupersync = { version = "0.3.4", default-features = false, features = ["tls-webpki-roots"] }
-franken-kernel = "0.3.4"
-franken-evidence = "0.3.4"
-franken-decision = "0.3.4"
-fsqlite = { version = "0.3.0", path = "../frankensqlite/crates/fsqlite" }
-fsqlite-types = { version = "0.3.0", path = "../frankensqlite/crates/fsqlite-types" }
+# Continuous microphone capture for the real-time listen driver
+# (bd-rt-capture-trait-lckq). cpal is the Rust ecosystem standard for input
+# streams (CoreAudio/ALSA/WASAPI); its platform glue carries internal unsafe,
+# which is acceptable under the crate-local #![deny(unsafe_code)] posture
+# (same as symphonia / ft-kernel deps). ringbuf provides the lock-free SPSC
+# ring the audio callback writes into (callback never blocks or allocates).
+cpal = "0.15"
+ringbuf = "0.4"
+
+asupersync = { version = "=0.5.0", default-features = false, features = ["tls-webpki-roots"] }
+franken-kernel = "=0.5.0"
+franken-evidence = "=0.5.0"
+franken-decision = "=0.5.0"
+fsqlite = { version = "0.4.0", path = "../frankensqlite/crates/fsqlite" }
+fsqlite-types = { version = "0.4.0", path = "../frankensqlite/crates/fsqlite-types" }
+# Gives each storage statement's poll a guaranteed native stack whatever
+# thread runs it (`storage::block_on`, bd-c376). Already in the tree via
+# fsqlite-core, which uses it for the same purpose; rust-lang maintained, and
+# it keeps the stack-switching `unsafe` outside this crate.
+stacker = "0.1"
 
 # FrankenTorch compute kernels for the in-process native whisper engine
 # (rayon-parallel GEMM, softmax, gelu; f16 storage types). These are
@@ -88,14 +114,22 @@ ft-kernel-cpu = { version = "0.1.0", path = "../frankentorch/crates/ft-kernel-cp
 ft-core = { version = "0.1.0", path = "../frankentorch/crates/ft-core", package = "frankentorch-core" }
 # FastEnhancer-S speech denoiser (default pipeline stage when its pinned
 # artifact is present; see src/denoise.rs). Zero required deps of its own.
-ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", default-features = false }
+ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", default-features = false, features = ["accelerate-sgemm"] }
 # Direct dep on `half` (same crate ft-core re-exports as `Float16`) for its
 # `HalfFloatSliceExt::convert_to_f32_slice` SIMD bulk f16->f32 dequant — the
 # `std` feature enables runtime aarch64 `fp16` / x86 `f16c` vector paths used
 # by the f16-compute GEMV kernels (nn::gemv_f16). Pinned to ft-core's version.
 half = { version = "2.7", features = ["std"] }
 
-ftui = { version = "0.5.0", path = "../frankentui/crates/ftui", default-features = false, features = ["crossterm"], optional = true }
+ftui = { version = "0.9.0", path = "../frankentui/crates/ftui", default-features = false, features = ["crossterm"], optional = true }
+
+# frankenjax differential oracle (feature `fj-oracle`, bd-ohra): the fj
+# interpreter family serves as the independent evaluation oracle for
+# conformance cross-checks of native_engine nn.rs primitives. Optional +
+# feature-gated so default builds never compile it; run with
+# `cargo test --features fj-oracle --test conformance_oracle_tests`.
+fj-lax = { version = "0.1.0", path = "../frankenjax/crates/fj-lax", optional = true }
+fj-core = { version = "0.1.0", path = "../frankenjax/crates/fj-core", optional = true }
 
 # Safe handle-relative openat, ownership checks, and no-clobber rename
 # publication are unavailable in std. This narrowly featured target-specific
@@ -136,10 +170,14 @@ criterion = { version = "0.5", features = ["html_reports"] }
 ft-core = { version = "0.1.0", path = "../frankentorch/crates/ft-core", package = "frankentorch-core" }
 # FastEnhancer-S speech denoiser (default pipeline stage when its pinned
 # artifact is present; see src/denoise.rs). Zero required deps of its own.
-ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", default-features = false }
+ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", default-features = false, features = ["accelerate-sgemm"] }
 # For the hugepage_gemv_probe (madvise(MADV_HUGEPAGE) A/B on weight streaming).
 # Already a transitive dependency; dev-only, does not affect the shipped binary.
 libc = "0.2"
+# bd-rt-vad-stream-ulp5 VERDICT: rejected for the VAD tier-2 default (passes
+# loud music at every usable threshold); kept only for the ignored
+# re-evaluation battery in src/listen.rs.
+earshot = "1.2.2"
 
 [[bench]]
 name = "storage_bench"

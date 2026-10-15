@@ -211,7 +211,7 @@ pub struct DiarizationRequest {
     /// enrollment-profile nodes admitted into the affinity graph.
     pub max_prototypes: u16,
     /// Record explicit consent for reusable-profile persistence. Default-off.
-    /// Schema v5 deliberately persists only privacy-safe summaries; raw
+    /// Schema v6 deliberately persists only privacy-safe summaries; raw
     /// acoustic vectors remain excluded until a separately reviewed schema.
     #[serde(default)]
     pub persist_profiles: bool,
@@ -3979,6 +3979,9 @@ pub enum BackendKind {
     InsanelyFast,
     #[value(alias = "whisper_diarization")]
     WhisperDiarization,
+    /// Live streaming session (`fw robot listen`, bd-rt-persist-a66y):
+    /// one run row per session, utterance-granular durability.
+    NativeListen,
 }
 
 impl BackendKind {
@@ -3989,6 +3992,7 @@ impl BackendKind {
             Self::WhisperCpp => "whisper_cpp",
             Self::InsanelyFast => "insanely_fast",
             Self::WhisperDiarization => "whisper_diarization",
+            Self::NativeListen => "native-listen",
         }
     }
 }
@@ -4026,7 +4030,7 @@ pub struct TranscribeRequest {
     pub backend_params: BackendParams,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptionSegment {
     pub start_sec: Option<f64>,
     pub end_sec: Option<f64>,
@@ -4064,6 +4068,14 @@ pub struct AccelerationReport {
     pub pre_mass: Option<f64>,
     pub post_mass: Option<f64>,
     pub notes: Vec<String>,
+    /// The backend's own confidence for each segment before normalization,
+    /// parallel to `segments` (bd-raw-segment-confidence-isdm). `None` where
+    /// the backend reported no usable (finite, positive) value, so the
+    /// normalized `confidence` was derived from the text-length fallback
+    /// weight. Empty when no confidences were normalized, or when a later
+    /// stage could not keep it parallel to `segments`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_confidences: Vec<Option<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4104,6 +4116,15 @@ pub struct ReplayEnvelope {
     /// SHA-256 of the raw backend output JSON payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_payload_hash: Option<String>,
+    /// Live-session integrity fingerprint (bd-rt-persist-a66y): streamed
+    /// SHA-256 over the concatenated session PCM (16 kHz mono f32,
+    /// little-endian). Audio is NOT retained, so this marks integrity only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcm_sha256: Option<String>,
+    /// Honest labeling for live rows: why there is no replayable reference
+    /// and what the hash does and does not attest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4710,12 +4731,24 @@ mod tests {
             pre_mass: Some(0.8),
             post_mass: Some(1.0),
             notes: vec!["normalized".to_owned()],
+            raw_confidences: vec![Some(0.8), None],
         };
         let json = serde_json::to_string(&report).unwrap();
         let deserialized: AccelerationReport = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.backend, AccelerationBackend::Frankentorch);
         assert_eq!(deserialized.input_values, 100);
         assert!(deserialized.normalized_confidences);
+        assert_eq!(deserialized.raw_confidences, vec![Some(0.8), None]);
+    }
+
+    #[test]
+    fn acceleration_report_without_raw_confidences_keeps_its_historical_json() {
+        // Reports persisted before bd-raw-segment-confidence-isdm deserialize
+        // with an empty vector, and an empty vector is omitted on output.
+        let historical = r#"{"backend":"none","input_values":2,"normalized_confidences":true,"pre_mass":1.5,"post_mass":1.0,"notes":[]}"#;
+        let report: AccelerationReport = serde_json::from_str(historical).unwrap();
+        assert!(report.raw_confidences.is_empty());
+        assert_eq!(serde_json::to_string(&report).unwrap(), historical);
     }
 
     #[test]
@@ -4779,6 +4812,8 @@ mod tests {
             backend_identity: Some("whisper-cli".to_owned()),
             backend_version: Some("1.7.2".to_owned()),
             output_payload_hash: Some("def456".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let parsed: ReplayEnvelope = serde_json::from_str(&json).unwrap();
@@ -4830,6 +4865,7 @@ mod tests {
             pre_mass: None,
             post_mass: None,
             notes: vec![],
+            raw_confidences: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: AccelerationReport = serde_json::from_str(&json).unwrap();
@@ -5011,12 +5047,15 @@ mod tests {
                 pre_mass: Some(0.7),
                 post_mass: Some(1.0),
                 notes: vec!["jax accelerated".to_owned()],
+                raw_confidences: Vec::new(),
             }),
             replay: ReplayEnvelope {
                 input_content_hash: Some("sha256-abc".to_owned()),
                 backend_identity: Some("whisper-diarization".to_owned()),
                 backend_version: Some("0.0.15".to_owned()),
                 output_payload_hash: Some("sha256-def".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         };
         let json = serde_json::to_string(&details).unwrap();
@@ -5133,6 +5172,8 @@ mod tests {
                 backend_identity: Some("whisper-cli".to_owned()),
                 backend_version: Some("1.7.2".to_owned()),
                 output_payload_hash: Some("sha256-output".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         }
     }
@@ -5518,6 +5559,8 @@ mod tests {
             backend_identity: None,
             backend_version: Some("1.0".to_owned()),
             output_payload_hash: None,
+            pcm_sha256: None,
+            live_note: None,
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let parsed: ReplayEnvelope = serde_json::from_str(&json).unwrap();
@@ -5644,6 +5687,7 @@ mod tests {
                 pre_mass: None,
                 post_mass: Some(0.99),
                 notes: vec!["jax".to_owned(), "fast".to_owned()],
+                raw_confidences: Vec::new(),
             }),
             diarization: None,
             raw_output: json!({}),

@@ -253,6 +253,25 @@ pub fn command_exists(program: &str) -> bool {
     which::which(program).is_ok()
 }
 
+/// Borrow `path` as an exact UTF-8 command-line argument (bd-dckt).
+///
+/// External tools receive `String` argv, and `Path::display` replaces
+/// non-UTF-8 bytes, which would silently point the tool at a different
+/// (nonexistent or colliding) file. Such a path is rejected instead.
+///
+/// # Errors
+///
+/// Returns [`FwError::InvalidRequest`] when `path` is not valid UTF-8.
+pub(crate) fn utf8_path_arg(path: &Path) -> FwResult<&str> {
+    path.to_str().ok_or_else(|| {
+        FwError::InvalidRequest(format!(
+            "path `{}` is not valid UTF-8 and cannot be passed to an external tool \
+             without changing which file it names",
+            path.display()
+        ))
+    })
+}
+
 pub fn run_command(program: &str, args: &[String], cwd: Option<&Path>) -> FwResult<Output> {
     run_command_with_timeout(program, args, cwd, None)
 }
@@ -266,6 +285,17 @@ fn render_command_for_log(program: &str, args: &[String]) -> String {
     let mut redact_next = false;
     for arg in args {
         if redact_next {
+            if let Some((flag, _value)) = arg.split_once('=')
+                && is_sensitive_flag(flag)
+            {
+                capacity = capacity.saturating_add(flag.len().saturating_add(4));
+                redact_next = false;
+                continue;
+            }
+            if is_sensitive_flag(arg) {
+                capacity = capacity.saturating_add(arg.len());
+                continue;
+            }
             capacity = capacity.saturating_add(3);
             redact_next = false;
             continue;
@@ -290,6 +320,18 @@ fn render_command_for_log(program: &str, args: &[String]) -> String {
     for arg in args {
         rendered.push(' ');
         if redact_next {
+            if let Some((flag, _value)) = arg.split_once('=')
+                && is_sensitive_flag(flag)
+            {
+                rendered.push_str(flag);
+                rendered.push_str("=***");
+                redact_next = false;
+                continue;
+            }
+            if is_sensitive_flag(arg) {
+                rendered.push_str(arg);
+                continue;
+            }
             rendered.push_str("***");
             redact_next = false;
             continue;
@@ -325,10 +367,206 @@ fn is_sensitive_flag(flag: &str) -> bool {
             | "--auth_token"
             | "--password"
             | "--pass"
+            | "--prompt"
             | "--secret"
             | "--secret-key"
             | "--secret_key"
     )
+}
+
+fn sensitive_arg_values(args: &[String]) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut capture_next = false;
+
+    for arg in args {
+        if capture_next {
+            if let Some((flag, value)) = arg.split_once('=')
+                && is_sensitive_flag(flag)
+            {
+                if !value.is_empty() {
+                    values.push(value.to_owned());
+                }
+                capture_next = false;
+                continue;
+            }
+            if is_sensitive_flag(arg) {
+                continue;
+            }
+            if !arg.is_empty() {
+                values.push(arg.clone());
+            }
+            capture_next = false;
+            continue;
+        }
+
+        if let Some((flag, value)) = arg.split_once('=')
+            && is_sensitive_flag(flag)
+        {
+            if !value.is_empty() {
+                values.push(value.to_owned());
+            }
+            continue;
+        }
+
+        capture_next = is_sensitive_flag(arg);
+    }
+
+    sort_sensitive_values(&mut values);
+    values
+}
+
+fn sort_sensitive_values(values: &mut Vec<String>) {
+    // Replace longer values first so an overlapping short secret cannot leave
+    // the suffix of a longer secret visible. The lexical tie-breaker makes the
+    // order deterministic and groups duplicates for `dedup`.
+    values
+        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    values.dedup();
+}
+
+const SENSITIVE_INHERITED_ENVIRONMENT: [&str; 5] = [
+    "FRANKEN_WHISPER_HF_TOKEN",
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "HUGGINGFACE_TOKEN",
+    "FW_INITIAL_PROMPT",
+];
+
+fn redact_sensitive_text(text: &str, sensitive_values: &[String]) -> String {
+    let replacement: String = std::iter::repeat_n(redaction_marker(sensitive_values), 3).collect();
+    let mut redacted = text.to_owned();
+    for value in sensitive_values {
+        redacted = redacted.replace(value.as_str(), &replacement);
+    }
+    redacted
+}
+
+fn redaction_marker(sensitive_values: &[String]) -> char {
+    const PREFERRED: [char; 5] = ['*', '#', '•', '█', '�'];
+    let used: std::collections::HashSet<char> = sensitive_values
+        .iter()
+        .flat_map(|value| value.chars())
+        .collect();
+    PREFERRED
+        .into_iter()
+        .find(|candidate| !used.contains(candidate))
+        .or_else(|| ('\u{e000}'..='\u{f8ff}').find(|candidate| !used.contains(candidate)))
+        // NUL cannot be passed to a spawned process argument, so even a
+        // pathological value containing every visible fallback cannot equal
+        // this final separator.
+        .unwrap_or('\0')
+}
+
+fn sensitive_byte_mask(bytes: &[u8], sensitive_values: &[String]) -> Vec<bool> {
+    let mut mask = vec![false; bytes.len()];
+    for value in sensitive_values {
+        let needle = value.as_bytes();
+        if needle.is_empty() {
+            continue;
+        }
+        mark_sensitive_matches(bytes, needle, &mut mask);
+    }
+    mask
+}
+
+fn mark_sensitive_matches(bytes: &[u8], needle: &[u8], mask: &mut [bool]) {
+    debug_assert!(!needle.is_empty());
+    debug_assert_eq!(bytes.len(), mask.len());
+
+    let mut prefix = vec![0usize; needle.len()];
+    for index in 1..needle.len() {
+        let mut matched = prefix[index - 1];
+        while matched > 0 && needle[index] != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if needle[index] == needle[matched] {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+
+    let mut matched = 0usize;
+    let mut pending_range: Option<(usize, usize)> = None;
+    for (index, byte) in bytes.iter().enumerate() {
+        while matched > 0 && *byte != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if *byte == needle[matched] {
+            matched += 1;
+        }
+        if matched == needle.len() {
+            let end = index + 1;
+            let start = end - needle.len();
+            pending_range = match pending_range.take() {
+                Some((range_start, range_end)) if start <= range_end => {
+                    Some((range_start, range_end.max(end)))
+                }
+                Some((range_start, range_end)) => {
+                    mask[range_start..range_end].fill(true);
+                    Some((start, end))
+                }
+                None => Some((start, end)),
+            };
+            matched = prefix[matched - 1];
+        }
+    }
+    if let Some((start, end)) = pending_range {
+        mask[start..end].fill(true);
+    }
+}
+
+fn render_redacted_bytes(bytes: &[u8], mask: &[bool], start: usize, marker: char) -> String {
+    debug_assert_eq!(bytes.len(), mask.len());
+    let mut rendered = Vec::with_capacity(bytes.len().saturating_sub(start));
+    let mut marker_buf = [0u8; 4];
+    let marker = marker.encode_utf8(&mut marker_buf).as_bytes();
+    let mut index = start.min(bytes.len());
+    while index < bytes.len() {
+        if mask[index] {
+            for _ in 0..3 {
+                rendered.extend_from_slice(marker);
+            }
+            index += 1;
+            while index < bytes.len() && mask[index] {
+                index += 1;
+            }
+        } else {
+            rendered.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&rendered).into_owned()
+}
+
+fn captured_stderr_for_error(stderr: &[u8], sensitive_values: &[String]) -> String {
+    let mask = sensitive_byte_mask(stderr, sensitive_values);
+    let rendered = render_redacted_bytes(stderr, &mask, 0, redaction_marker(sensitive_values));
+    redact_sensitive_text(&rendered, sensitive_values)
+}
+
+fn command_error_diagnostics(program: &str, args: &[String]) -> (String, Vec<String>) {
+    command_error_diagnostics_with_environment(program, args, |name| std::env::var(name).ok())
+}
+
+fn command_error_diagnostics_with_environment<F>(
+    program: &str,
+    args: &[String],
+    mut environment_value: F,
+) -> (String, Vec<String>)
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut sensitive_values = sensitive_arg_values(args);
+    sensitive_values.extend(
+        SENSITIVE_INHERITED_ENVIRONMENT
+            .iter()
+            .filter_map(|name| environment_value(name))
+            .filter(|value| !value.is_empty()),
+    );
+    sort_sensitive_values(&mut sensitive_values);
+    let rendered = render_command_for_log(program, args);
+    let rendered = redact_sensitive_text(&rendered, &sensitive_values);
+    (rendered, sensitive_values)
 }
 
 pub fn run_command_with_timeout(
@@ -343,103 +581,101 @@ pub fn run_command_with_timeout(
         });
     }
 
-    let rendered = render_command_for_log(program, args);
+    let (rendered, sensitive_values) = command_error_diagnostics(program, args);
     let mut command = Command::new(program);
     command.args(args);
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
+    command.stdin(Stdio::null());
 
-    if let Some(limit) = timeout {
-        if bounded_process_tree_unsupported() {
-            return Err(FwError::Unsupported(
-                "bounded subprocess trees are unsupported on this platform".to_owned(),
-            ));
-        }
-        let prepared_capture = prepare_bounded_output_capture(&mut command)?;
-        let owns_process_group = configure_descendant_process_tree(&mut command);
-        let mut child = spawn_managed_child(command)?;
-        let started_at = Instant::now();
-        let (stdout_reader, stderr_reader) =
-            match start_bounded_output_capture(&mut child, prepared_capture, &rendered) {
-                Ok(readers) => readers,
-                Err(error) => {
-                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
-                    return Err(merge_process_tree_cleanup_result(error, cleanup));
-                }
-            };
-
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // A bounded command owns its complete process tree. Even
-                    // after the root exits successfully, descendants must not
-                    // retain inherited pipes or continue operator-local work.
-                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let stdout_result = stdout_reader.finish();
-                    let stderr_result = stderr_reader.finish();
-                    cleanup?;
-                    let stdout = stdout_result?;
-                    let stderr = stderr_result?;
-                    return validate_captured_command_output(&rendered, status, stdout, stderr);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let _ = stdout_reader.finish();
-                    let _ = stderr_reader.finish();
-                    return Err(merge_process_tree_cleanup_result(
-                        FwError::Io(error),
-                        cleanup,
-                    ));
-                }
+    if bounded_process_tree_unsupported() {
+        return Err(FwError::Unsupported(
+            "bounded subprocess trees are unsupported on this platform".to_owned(),
+        ));
+    }
+    let prepared_capture = prepare_bounded_output_capture(&mut command)?;
+    let process_tree = configure_descendant_process_tree(&mut command);
+    let mut child = spawn_managed_child(command)?;
+    let started_at = Instant::now();
+    let (stdout_reader, stderr_reader) =
+        match start_bounded_output_capture(&mut child, prepared_capture, &rendered) {
+            Ok(readers) => readers,
+            Err(error) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
+                return Err(merge_process_tree_cleanup_result(error, cleanup));
             }
+        };
 
-            match bounded_output_limit_stream(&stdout_reader, &stderr_reader) {
-                Ok(Some(stream)) => {
-                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let _ = stdout_reader.finish();
-                    let _ = stderr_reader.finish();
-                    return Err(merge_process_tree_cleanup_result(
-                        capture_limit_error(stream),
-                        cleanup,
-                    ));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let _ = stdout_reader.finish();
-                    let _ = stderr_reader.finish();
-                    return Err(merge_process_tree_cleanup_result(error, cleanup));
-                }
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Clean the platform ownership boundary even after the root
+                // exits successfully, so in-bound descendants cannot retain
+                // inherited pipes or continue operator-local work.
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
+                let stdout_result = stdout_reader.finish();
+                let stderr_result = stderr_reader.finish();
+                cleanup?;
+                let stdout = stdout_result?;
+                let stderr = stderr_result?;
+                return validate_captured_command_output(
+                    &rendered,
+                    status,
+                    stdout,
+                    stderr,
+                    &sensitive_values,
+                );
             }
-
-            if started_at.elapsed() >= limit {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            Ok(None) => {}
+            Err(error) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let _ = stdout_reader.finish();
-                let stderr = stderr_reader
-                    .finish()
-                    .map(|capture| capture.bytes)
-                    .unwrap_or_default();
-                let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
+                let _ = stderr_reader.finish();
                 return Err(merge_process_tree_cleanup_result(
-                    FwError::from_command_timeout(
-                        rendered,
-                        saturating_duration_ms(limit),
-                        stderr_str,
-                    ),
+                    FwError::Io(error),
                     cleanup,
                 ));
             }
-
-            thread::sleep(Duration::from_millis(20));
         }
-    }
 
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    let output = command.output()?;
-    validate_command_output(&rendered, output)
+        match bounded_output_limit_stream(&stdout_reader, &stderr_reader) {
+            Ok(Some(stream)) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
+                let _ = stdout_reader.finish();
+                let _ = stderr_reader.finish();
+                return Err(merge_process_tree_cleanup_result(
+                    capture_limit_error(stream),
+                    cleanup,
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
+                let _ = stdout_reader.finish();
+                let _ = stderr_reader.finish();
+                return Err(merge_process_tree_cleanup_result(error, cleanup));
+            }
+        }
+
+        if let Some(limit) = timeout
+            && started_at.elapsed() >= limit
+        {
+            let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
+            let _ = stdout_reader.finish();
+            let stderr = stderr_reader
+                .finish()
+                .map(|capture| capture.bytes)
+                .unwrap_or_default();
+            let stderr_str = captured_stderr_for_error(&stderr, &sensitive_values);
+            return Err(merge_process_tree_cleanup_result(
+                FwError::from_command_timeout(rendered, saturating_duration_ms(limit), stderr_str),
+                cleanup,
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 // The early sleeps total 50ms, preserving the original polling phase and
@@ -574,7 +810,7 @@ fn run_command_cancellable_with_optional_input(
         });
     }
 
-    let rendered = render_command_for_log(program, args);
+    let (rendered, sensitive_values) = command_error_diagnostics(program, args);
     let mut command = Command::new(program);
     command.args(args);
     if bounded_process_tree_unsupported() {
@@ -606,9 +842,9 @@ fn run_command_cancellable_with_optional_input(
         prepare_parent_liveness_lease(&mut command)?;
     }
 
-    let owns_process_group = configure_descendant_process_tree(&mut command);
+    let process_tree = configure_descendant_process_tree(&mut command);
     #[cfg(unix)]
-    if observer.is_some() && !owns_process_group {
+    if observer.is_some() && !process_tree.owns_process_group {
         return Err(FwError::Unsupported(
             "process-tree observation requires a fresh caller-owned process group".to_owned(),
         ));
@@ -623,19 +859,19 @@ fn run_command_cancellable_with_optional_input(
         match start_bounded_output_capture(&mut child, prepared_capture, &rendered) {
             Ok(readers) => readers,
             Err(error) => {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 return Err(merge_process_tree_cleanup_result(error, cleanup));
             }
         };
     loop {
         if let Err(err) = token.checkpoint() {
-            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
             let _ = stdout_reader.finish();
             let _ = stderr_reader.finish();
             return Err(merge_process_tree_cleanup_result(err, cleanup));
         }
         if additional_cancel.is_some_and(|probe| probe()) {
-            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
             let _ = stdout_reader.finish();
             let _ = stderr_reader.finish();
             return Err(merge_process_tree_cleanup_result(
@@ -648,13 +884,13 @@ fn run_command_cancellable_with_optional_input(
         if let Some(limit) = hard_timeout
             && started_at.elapsed() >= limit
         {
-            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
             let _ = stdout_reader.finish();
             let stderr = stderr_reader
                 .finish()
                 .map(|capture| capture.bytes)
                 .unwrap_or_default();
-            let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
+            let stderr_str = captured_stderr_for_error(&stderr, &sensitive_values);
             return Err(merge_process_tree_cleanup_result(
                 FwError::from_command_timeout(rendered, saturating_duration_ms(limit), stderr_str),
                 cleanup,
@@ -663,7 +899,7 @@ fn run_command_cancellable_with_optional_input(
 
         match bounded_output_limit_stream(&stdout_reader, &stderr_reader) {
             Ok(Some(stream)) => {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let _ = stdout_reader.finish();
                 let _ = stderr_reader.finish();
                 return Err(merge_process_tree_cleanup_result(
@@ -673,7 +909,7 @@ fn run_command_cancellable_with_optional_input(
             }
             Ok(None) => {}
             Err(error) => {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let _ = stdout_reader.finish();
                 let _ = stderr_reader.finish();
                 return Err(merge_process_tree_cleanup_result(error, cleanup));
@@ -685,17 +921,23 @@ fn run_command_cancellable_with_optional_input(
                 // Close inherited stdin/stdout/stderr in any descendants before
                 // joining I/O helpers; otherwise a successful root could leave
                 // the bounded caller blocked forever.
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let stdout_result = stdout_reader.finish();
                 let stderr_result = stderr_reader.finish();
                 cleanup?;
                 let stdout = stdout_result?;
                 let stderr = stderr_result?;
-                return validate_captured_command_output(&rendered, status, stdout, stderr);
+                return validate_captured_command_output(
+                    &rendered,
+                    status,
+                    stdout,
+                    stderr,
+                    &sensitive_values,
+                );
             }
             Ok(None) => {}
             Err(error) => {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let _ = stdout_reader.finish();
                 let _ = stderr_reader.finish();
                 return Err(merge_process_tree_cleanup_result(
@@ -708,7 +950,7 @@ fn run_command_cancellable_with_optional_input(
         if let Some(observer) = observer.as_deref_mut()
             && let Err(error) = observer(child.id())
         {
-            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
             let _ = stdout_reader.finish();
             let _ = stderr_reader.finish();
             return Err(merge_process_tree_cleanup_result(error, cleanup));
@@ -719,27 +961,72 @@ fn run_command_cancellable_with_optional_input(
     }
 }
 
+/// Environment variable listing the ownership tokens of every bounded process
+/// tree a process belongs to (`:`-separated; a nested owner appends its own).
+#[cfg(unix)]
+const PROCESS_TREE_TOKENS_ENV: &str = "FRANKEN_WHISPER_PROCESS_TREE_TOKENS";
+
+/// How a spawned child's process tree is owned and later terminated.
+struct ProcessTreeOwnership {
+    /// The child roots a fresh Unix process group (`process_group(0)`).
+    owns_process_group: bool,
+    /// Unique token stamped into the child's environment. Every descendant
+    /// inherits it, including one that `setsid`s out of the process group,
+    /// so cleanup can find and kill such escapees (bd-jedl). `None` when the
+    /// tree is not owned here.
+    #[cfg(unix)]
+    tree_token: Option<String>,
+}
+
+#[cfg(unix)]
+fn next_process_tree_token() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!("fwtree-{}-{sequence}-{nanos}", std::process::id())
+}
+
 /// Put each bounded child at the root of a process tree that cancellation can
 /// terminate as one unit. On Unix, `process_group(0)` creates a group whose id
-/// is the child pid. Windows tree ownership is established later by
-/// `spawn_managed_child`, which assigns the suspended root to a Job Object
-/// before allowing it to run.
-fn configure_descendant_process_tree(command: &mut Command) -> bool {
+/// is the child pid, and a fresh tree token in the environment marks every
+/// descendant, even ones that leave the group. Windows tree ownership is
+/// established later by `spawn_managed_child`, which assigns the suspended
+/// root to a Job Object before allowing it to run.
+fn configure_descendant_process_tree(command: &mut Command) -> ProcessTreeOwnership {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
 
         let externally_owned =
             PROCESS_TREE_EXTERNALLY_OWNED.load(std::sync::atomic::Ordering::Acquire);
-        if !externally_owned {
-            command.process_group(0);
+        if externally_owned {
+            return ProcessTreeOwnership {
+                owns_process_group: false,
+                tree_token: None,
+            };
         }
-        !externally_owned
+        command.process_group(0);
+        let token = next_process_tree_token();
+        // Keep any tokens inherited from an outer owner so ITS cleanup still
+        // recognizes this subtree.
+        let tokens = match std::env::var(PROCESS_TREE_TOKENS_ENV) {
+            Ok(inherited) if !inherited.is_empty() => format!("{inherited}:{token}"),
+            _ => token.clone(),
+        };
+        command.env(PROCESS_TREE_TOKENS_ENV, tokens);
+        ProcessTreeOwnership {
+            owns_process_group: true,
+            tree_token: Some(token),
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = command;
-        false
+        ProcessTreeOwnership {
+            owns_process_group: false,
+        }
     }
 }
 
@@ -747,8 +1034,28 @@ const fn bounded_process_tree_unsupported() -> bool {
     !cfg!(any(unix, windows))
 }
 
+/// How long cleanup tolerates a member of the owned tree that the SIGKILL did
+/// not reach (one still running with no SIGKILL queued and not exiting) before
+/// it reports the tree uncertifiable. Failure is only ever declared from an
+/// observation that began after this window: one `/proc` pass reads every
+/// process's `stat` (or `environ`), which takes 0.2-0.3 s on a loaded host
+/// with ~2,000 processes, so a verdict from a probe taken before such a pass
+/// would report members that died during it (bd-yixf).
 #[cfg(not(windows))]
 const PROCESS_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long cleanup waits for processes it has SIGKILLed to finish exiting
+/// (bd-yixf). A process whose every live thread has SIGKILL queued or is
+/// already in the kernel's exit path (`PF_EXITING`) never executes another
+/// user instruction and cannot fork; it only needs CPU time to finish dying,
+/// which on an oversubscribed host is scheduler latency, not a cleanup
+/// failure. On a 128-thread Linux host at load 120-250, every member still in
+/// a SIGKILLed group was runnable with SIGKILL pending, exiting, or a zombie
+/// awaiting its reaper. The ceiling is the backstop for a member stuck in
+/// uninterruptible sleep, which no signal can hurry; reaching it still fails
+/// the certification.
+#[cfg(unix)]
+const PROCESS_TREE_EXIT_CEILING: Duration = Duration::from_secs(10);
 
 fn process_tree_cleanup_error(detail: &str) -> FwError {
     FwError::ContractViolation(format!(
@@ -792,10 +1099,12 @@ fn wait_for_child_reap(child: &mut ManagedChild, deadline: Instant) -> FwResult<
 #[cfg(unix)]
 fn terminate_descendant_process_tree(
     child: &mut ManagedChild,
-    owns_process_group: bool,
+    process_tree: &ProcessTreeOwnership,
 ) -> FwResult<()> {
-    let deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
-    let process_group = owns_process_group.then(|| rustix::process::Pid::from_child(child));
+    let exit_deadline = Instant::now() + PROCESS_TREE_EXIT_CEILING;
+    let process_group = process_tree
+        .owns_process_group
+        .then(|| rustix::process::Pid::from_child(child));
     let mut group_signal_error = None;
     if let Some(process_group) = process_group
         && let Err(error) =
@@ -822,21 +1131,55 @@ fn terminate_descendant_process_tree(
             ));
         }
     }
-    wait_for_child_reap(child, deadline)?;
+    // The root has been SIGKILLed (by the group kill or directly): reaping it
+    // waits only for it to be scheduled through its exit.
+    wait_for_child_reap(child, exit_deadline)?;
 
     if let Some(process_group) = process_group {
+        // The window for members the kill did not reach starts once the root
+        // is reaped: waiting for the SIGKILLed root to be scheduled through
+        // its exit must not use it up.
+        let survivor_deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
         loop {
-            match rustix::process::test_kill_process_group(process_group) {
+            // A verdict is drawn only from a pass that began after the window
+            // it judges: the member scan below is slow on a loaded host, and
+            // members routinely finish dying while it runs.
+            let pass_started = Instant::now();
+            let state = match rustix::process::test_kill_process_group(process_group) {
                 Err(error) if error == rustix::io::Errno::SRCH => break,
-                Err(_) => {
+                Ok(()) => killed_process_group_state(process_group),
+                // macOS answers a probe of a group whose only members are
+                // zombies awaiting their reaper with EPERM (Linux answers 0).
+                // After the group took the kill, that is members finishing
+                // their exit, not a survivor.
+                Err(error) if error == rustix::io::Errno::PERM && group_signal_error.is_none() => {
+                    killed_group_state_after_permission_denied(process_group)
+                }
+                // Signal probes can be interrupted on Unix. That says nothing
+                // about whether the group survived; retry within the same
+                // bounded certification window.
+                Err(error)
+                    if error == rustix::io::Errno::INTR && pass_started < survivor_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(process_tree_cleanup_error(&format!(
+                        "the owned Unix process group could not be inspected after termination ({error})"
+                    )));
+                }
+            };
+            match state {
+                KilledTreeState::Terminated => break,
+                KilledTreeState::Exiting if pass_started < exit_deadline => {}
+                KilledTreeState::Exiting => {
                     return Err(process_tree_cleanup_error(
-                        "the owned Unix process group could not be inspected after termination",
+                        "SIGKILLed members of the owned Unix process group did not finish exiting",
                     ));
                 }
-                Ok(()) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Ok(()) => {
+                KilledTreeState::Live if pass_started < survivor_deadline => {}
+                KilledTreeState::Live => {
                     if let Some(error) = group_signal_error {
                         return Err(process_tree_cleanup_error(&format!(
                             "the owned Unix process group rejected termination ({error}) and remained alive"
@@ -847,15 +1190,393 @@ fn terminate_descendant_process_tree(
                     ));
                 }
             }
+            thread::sleep(Duration::from_millis(5));
         }
     }
+    if let Some(token) = process_tree.tree_token.as_deref() {
+        terminate_escaped_tree_members(token, exit_deadline)?;
+    }
     Ok(())
+}
+
+/// Kill every live process that carries `token` in its environment but left
+/// the owned process group (bd-jedl: `setsid`, daemonizing helpers). Rescans
+/// until a pass finds none, so an escapee forking during cleanup is caught
+/// too. A pass that began more than [`PROCESS_TREE_CLEANUP_TIMEOUT`] after the
+/// first one and still finds an escapee the kill has not doomed is a
+/// certification failure; escapees that are already dying are awaited until
+/// `exit_deadline` instead of being signalled again (bd-yixf). The window
+/// starts with the first pass, which is the first moment escapees (outside
+/// the killed group) are signalled at all.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn terminate_escaped_tree_members(token: &str, exit_deadline: Instant) -> FwResult<()> {
+    let survivor_deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
+    loop {
+        let pass_started = Instant::now();
+        let pass = signal_processes_carrying_tree_token(token);
+        if pass.live == 0 && pass.exiting == 0 {
+            return Ok(());
+        }
+        if pass.live > 0 && pass_started >= survivor_deadline {
+            return Err(process_tree_cleanup_error(
+                "descendants that left the owned process group survived termination",
+            ));
+        }
+        if pass.live == 0 && pass_started >= exit_deadline {
+            return Err(process_tree_cleanup_error(
+                "SIGKILLed descendants that left the owned process group did not finish exiting",
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Without `/proc` there is no portable way to enumerate escapees; the
+/// process-group boundary remains the containment guarantee there.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn terminate_escaped_tree_members(_token: &str, _exit_deadline: Instant) -> FwResult<()> {
+    Ok(())
+}
+
+/// What one `/proc` pass over the processes carrying a tree token found.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TreeTokenPass {
+    /// Carriers the kill had not doomed; each was sent SIGKILL in this pass.
+    live: usize,
+    /// Carriers already dying (SIGKILL queued or exiting); not signalled again.
+    exiting: usize,
+}
+
+/// One `/proc` pass: SIGKILL each live process whose environment carries
+/// `token` and count the carriers that are already dying. Zombies (and
+/// processes past releasing their memory) have no readable environment, so
+/// they drop out of later passes. The identity is pinned with a pidfd and the
+/// environment re-read through it before signalling, so a recycled pid can
+/// never receive the kill.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn signal_processes_carrying_tree_token(token: &str) -> TreeTokenPass {
+    let own_pid = std::process::id();
+    let mut pass = TreeTokenPass::default();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return pass;
+    };
+    for entry in entries.flatten() {
+        let Some(raw_pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if u32::try_from(raw_pid).ok() == Some(own_pid) {
+            continue;
+        }
+        let environ_path = entry.path().join("environ");
+        // Cheap pre-filter: other users' and exited processes fail here.
+        if !std::fs::read(&environ_path)
+            .is_ok_and(|bytes| environ_carries_tree_token(&bytes, token))
+        {
+            continue;
+        }
+        let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
+            continue;
+        };
+        match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+            Ok(pidfd) => {
+                if !std::fs::read(&environ_path)
+                    .is_ok_and(|bytes| environ_carries_tree_token(&bytes, token))
+                {
+                    continue;
+                }
+                match killed_process_state(raw_pid) {
+                    KilledProcessState::Gone | KilledProcessState::Zombie => {}
+                    KilledProcessState::Exiting => pass.exiting += 1,
+                    KilledProcessState::Live => {
+                        // Counted whether or not the kill is accepted: a
+                        // carrier that refuses it stays live and is reported.
+                        let _ = rustix::process::pidfd_send_signal(
+                            &pidfd,
+                            rustix::process::Signal::KILL,
+                        );
+                        pass.live += 1;
+                    }
+                }
+            }
+            // Pre-5.3 kernels have no pidfd; fall back to a plain kill.
+            Err(rustix::io::Errno::NOSYS) => match killed_process_state(raw_pid) {
+                KilledProcessState::Gone | KilledProcessState::Zombie => {}
+                KilledProcessState::Exiting => pass.exiting += 1,
+                KilledProcessState::Live => {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                    pass.live += 1;
+                }
+            },
+            Err(_) => {}
+        }
+    }
+    pass
+}
+
+/// Whether a NUL-separated `/proc/<pid>/environ` image lists `token` among
+/// its `FRANKEN_WHISPER_PROCESS_TREE_TOKENS` entries.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn environ_carries_tree_token(environ: &[u8], token: &str) -> bool {
+    let prefix = format!("{PROCESS_TREE_TOKENS_ENV}=");
+    environ
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+        .any(|tokens| {
+            tokens
+                .split(|byte| *byte == b':')
+                .any(|candidate| candidate == token.as_bytes())
+        })
+}
+
+/// What is left of a set of processes cleanup has SIGKILLed (bd-yixf).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Without `/proc` the members cannot be classified, so only `Live` is built.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+enum KilledTreeState {
+    /// Every remaining member is a dead zombie.
+    ///
+    /// After `SIGKILL`, a descendant reparented to an init that never reaps
+    /// (PID 1 in many containers runs no reaper) lingers as a zombie: it
+    /// executes nothing and holds no memory, CPU, or file descriptors, but
+    /// keeps the group ID alive for a `kill(-pgid, 0)` probe forever. Such a
+    /// group is fully terminated.
+    Terminated,
+    /// Every remaining member is a dead zombie or still exiting (see
+    /// [`KilledProcessState::Exiting`]), or the members finished dying while
+    /// the `/proc` pass ran. Waiting only takes CPU time.
+    Exiting,
+    /// A member the kill has not doomed is still running, or the group could
+    /// not be classified.
+    Live,
+}
+
+/// One process, as seen from `/proc` after cleanup sent it (or its group)
+/// `SIGKILL`.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KilledProcessState {
+    /// No longer in `/proc`.
+    Gone,
+    /// Every thread is a zombie: it executes nothing and holds no resources.
+    Zombie,
+    /// Every live thread has `SIGKILL` queued (privately or for its thread
+    /// group) or is already in the kernel's exit path (`PF_EXITING`): it can
+    /// never execute another user instruction or fork, and only needs CPU
+    /// time to finish dying.
+    Exiting,
+    /// Some thread runs with no `SIGKILL` queued and is not exiting.
+    Live,
+}
+
+/// `PF_EXITING` in the `flags` field of `/proc/<pid>/stat` (include/linux/sched.h).
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+const PROC_FLAG_EXITING: u64 = 0x0000_0004;
+
+/// `SIGKILL` (9) in the hexadecimal `SigPnd`/`ShdPnd` masks of
+/// `/proc/<pid>/status`: bit `signal - 1`.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+const SIGKILL_PENDING_BIT: u64 = 1 << (9 - 1);
+
+/// Whether a `/proc/<pid>/task/<tid>/status` image has `SIGKILL` queued for
+/// the thread (`SigPnd`) or its thread group (`ShdPnd`).
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn status_has_pending_sigkill(status: &str) -> bool {
+    status.lines().any(|line| {
+        ["SigPnd:", "ShdPnd:"].iter().any(|key| {
+            line.strip_prefix(key)
+                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+                .is_some_and(|mask| mask & SIGKILL_PENDING_BIT != 0)
+        })
+    })
+}
+
+/// One thread of a SIGKILLed process.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KilledThreadState {
+    /// A zombie (`Z`) or dead (`X`) thread.
+    Dead,
+    /// `SIGKILL` queued or `PF_EXITING` set.
+    Exiting,
+    /// Runs with no `SIGKILL` queued and is not exiting.
+    Live,
+}
+
+/// Classify one thread from its `stat` fields, reading its `status` image
+/// only when the state and flags do not already decide. A `status` that can
+/// no longer be read belongs to a thread being released.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn killed_thread_state(
+    thread: ProcStatGroupMember,
+    status: impl FnOnce() -> Option<String>,
+) -> KilledThreadState {
+    if matches!(thread.state, 'Z' | 'X') {
+        KilledThreadState::Dead
+    } else if thread.flags & PROC_FLAG_EXITING != 0
+        || status().is_none_or(|status| status_has_pending_sigkill(&status))
+    {
+        KilledThreadState::Exiting
+    } else {
+        KilledThreadState::Live
+    }
+}
+
+/// A process is live while any thread is live (a zombie leader whose other
+/// threads still run is not dead), exiting while any thread is, and a zombie
+/// once every thread is dead.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn killed_process_state_of_threads(
+    threads: impl IntoIterator<Item = KilledThreadState>,
+) -> KilledProcessState {
+    let mut state = KilledProcessState::Gone;
+    for thread in threads {
+        state = match (state, thread) {
+            (_, KilledThreadState::Live) => return KilledProcessState::Live,
+            (_, KilledThreadState::Exiting) | (KilledProcessState::Exiting, _) => {
+                KilledProcessState::Exiting
+            }
+            _ => KilledProcessState::Zombie,
+        };
+    }
+    state
+}
+
+/// Classify process `pid` thread by thread from `/proc/<pid>/task`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn killed_process_state(pid: i32) -> KilledProcessState {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return KilledProcessState::Gone;
+    };
+    let mut threads = Vec::new();
+    for task in tasks.flatten() {
+        // A thread that exits between listing and reading is no longer live.
+        let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
+            continue;
+        };
+        let Some(thread) = parse_proc_stat_group_member(&stat) else {
+            return KilledProcessState::Live;
+        };
+        threads.push(killed_thread_state(thread, || {
+            std::fs::read_to_string(task.path().join("status")).ok()
+        }));
+    }
+    killed_process_state_of_threads(threads)
+}
+
+/// Classify the members of a SIGKILLed process group that a `kill(-pgid, 0)`
+/// probe just reported alive.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn killed_process_group_state(process_group: rustix::process::Pid) -> KilledTreeState {
+    let target = process_group.as_raw_nonzero().get();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return KilledTreeState::Live;
+    };
+    let mut exiting = false;
+    let mut saw_zombie = false;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .filter(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        // A process that exits between listing and reading is no longer a
+        // member; any other unreadable entry is judged by its absence.
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(member) = parse_proc_stat_group_member(&stat) else {
+            return KilledTreeState::Live;
+        };
+        if member.process_group != target {
+            continue;
+        }
+        match killed_process_state(pid) {
+            KilledProcessState::Gone => {}
+            KilledProcessState::Zombie => saw_zombie = true,
+            KilledProcessState::Exiting => exiting = true,
+            KilledProcessState::Live => return KilledTreeState::Live,
+        }
+    }
+    if saw_zombie && !exiting {
+        KilledTreeState::Terminated
+    } else {
+        // Members exiting, or none left by the time the pass reached them
+        // although the probe before it saw the group: re-probe.
+        KilledTreeState::Exiting
+    }
+}
+
+/// Without `/proc` the members cannot be classified; the group must vanish
+/// within [`PROCESS_TREE_CLEANUP_TIMEOUT`].
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn killed_process_group_state(_process_group: rustix::process::Pid) -> KilledTreeState {
+    KilledTreeState::Live
+}
+
+/// The group after a `kill(-pgid, 0)` probe answered EPERM although the
+/// group's SIGKILL was accepted. Linux classifies the members from `/proc`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn killed_group_state_after_permission_denied(
+    process_group: rustix::process::Pid,
+) -> KilledTreeState {
+    killed_process_group_state(process_group)
+}
+
+/// macOS refuses to signal a zombie-only group with EPERM (measured:
+/// `kill(-pgid, 0)` is EPERM for a group whose only member is an unreaped
+/// zombie, ESRCH once it is reaped), so after the SIGKILL was accepted the
+/// remaining members are zombies waiting for their reaper (bd-yixf). They are
+/// awaited, bounded by [`PROCESS_TREE_EXIT_CEILING`]; other Unix systems
+/// without `/proc` are treated the same way.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn killed_group_state_after_permission_denied(
+    _process_group: rustix::process::Pid,
+) -> KilledTreeState {
+    KilledTreeState::Exiting
+}
+
+/// The `/proc/<pid>/stat` (or `/proc/<pid>/task/<tid>/stat`) fields that
+/// decide whether a killed process or thread is still alive.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcStatGroupMember {
+    state: char,
+    process_group: i32,
+    /// Kernel `PF_*` task flags.
+    flags: u64,
+}
+
+/// Parse state, process group, and flags from a `/proc/<pid>/stat` line. The
+/// command name is parenthesized and may itself contain spaces or
+/// parentheses, so fields are read after its last `)`.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn parse_proc_stat_group_member(stat: &str) -> Option<ProcStatGroupMember> {
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = after_comm.split_ascii_whitespace().collect();
+    // Field numbers from proc(5): 3 state, 5 pgrp, 9 flags.
+    let state = fields.first()?.chars().next()?;
+    let process_group = fields.get(2)?.parse().ok()?;
+    let flags = fields.get(6)?.parse().ok()?;
+    Some(ProcStatGroupMember {
+        state,
+        process_group,
+        flags,
+    })
 }
 
 #[cfg(windows)]
 fn terminate_descendant_process_tree(
     child: &mut ManagedChild,
-    _owns_process_group: bool,
+    _process_tree: &ProcessTreeOwnership,
 ) -> FwResult<()> {
     child.kill().map_err(|_| {
         process_tree_cleanup_error("the owned Windows Job Object rejected termination")
@@ -865,7 +1586,7 @@ fn terminate_descendant_process_tree(
 #[cfg(not(any(unix, windows)))]
 fn terminate_descendant_process_tree(
     child: &mut ManagedChild,
-    _owns_process_group: bool,
+    _process_tree: &ProcessTreeOwnership,
 ) -> FwResult<()> {
     child
         .kill()
@@ -873,13 +1594,17 @@ fn terminate_descendant_process_tree(
     wait_for_child_reap(child, Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT)
 }
 
-fn validate_command_output(rendered: &str, output: Output) -> FwResult<Output> {
+fn validate_command_output(
+    rendered: &str,
+    output: Output,
+    sensitive_values: &[String],
+) -> FwResult<Output> {
     if output.status.success() {
         return Ok(output);
     }
 
     let status = output.status.code().unwrap_or(-1);
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stderr = captured_stderr_for_error(&output.stderr, sensitive_values);
     Err(FwError::from_command_failure(
         rendered.to_owned(),
         status,
@@ -1201,6 +1926,7 @@ fn validate_captured_command_output(
     status: std::process::ExitStatus,
     stdout: PipeCapture,
     stderr: PipeCapture,
+    sensitive_values: &[String],
 ) -> FwResult<Output> {
     if stdout.drain_incomplete || stderr.drain_incomplete {
         return Err(FwError::ContractViolation(
@@ -1224,6 +1950,7 @@ fn validate_captured_command_output(
             stdout: stdout.bytes,
             stderr: stderr.bytes,
         },
+        sensitive_values,
     )
 }
 
@@ -1243,29 +1970,520 @@ pub(crate) fn is_stdout_capture_limit_error(error: &FwError) -> bool {
         || message == &capture_limit_message("stdout and stderr")
 }
 
+// ---------------------------------------------------------------------------
+// bd-rt-ffmpeg-pipe-7dbu: incremental-stdout subprocess plumbing
+//
+// Everything above buffers a child's output to completion; the live listen
+// path needs to READ WHILE THE CHILD RUNS (unbounded ffmpeg device capture).
+// StreamingChild hands the caller the live stdout pipe, drains stderr on a
+// dedicated thread into a bounded tail (the pipe-deadlock discipline), and
+// guarantees the child is killed and reaped on drop.
+// ---------------------------------------------------------------------------
+
+/// Public stderr-tail bound for error reporting (last bytes win). The drainer
+/// retains up to one maximum-secret-length of private overlap so redaction can
+/// recognize a value that crosses this nominal boundary; callers still receive
+/// at most this many raw-context bytes before replacement markers are rendered.
+const STREAMING_STDERR_TAIL_BYTES: usize = 4096;
+
+fn streaming_stderr_tail_capacity(sensitive_values: &[String]) -> usize {
+    let overlap = sensitive_values
+        .iter()
+        .map(String::len)
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(1);
+    STREAMING_STDERR_TAIL_BYTES.saturating_add(overlap)
+}
+
+fn append_streaming_stderr_tail(tail: &mut Vec<u8>, chunk: &[u8], capacity: usize) {
+    tail.extend_from_slice(chunk);
+    if tail.len() > capacity {
+        let excess = tail.len() - capacity;
+        tail.drain(..excess);
+    }
+}
+
+#[cfg(not(windows))]
+fn drain_streaming_stderr<R: Read>(mut pipe: R, tail: &std::sync::Mutex<Vec<u8>>, capacity: usize) {
+    let mut buf = [0u8; 1024];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                append_streaming_stderr_tail(&mut tail, &buf[..n], capacity);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                tracing::debug!(%error, "streaming stderr drain stopped after read failure");
+                break;
+            }
+        }
+    }
+}
+
+fn sanitized_streaming_stderr_tail(tail: &[u8], sensitive_values: &[String]) -> String {
+    let mask = sensitive_byte_mask(tail, sensitive_values);
+    let start = tail.len().saturating_sub(STREAMING_STDERR_TAIL_BYTES);
+    let rendered = render_redacted_bytes(tail, &mask, start, redaction_marker(sensitive_values));
+    let rendered = redact_sensitive_text(&rendered, sensitive_values);
+    bounded_text_tail(&rendered, STREAMING_STDERR_TAIL_BYTES)
+}
+
+fn bounded_text_tail(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
+}
+
+/// A spawned child whose stdout is consumed incrementally by the caller.
+///
+/// stderr is drained continuously (a child that logs megabytes can never
+/// wedge us) with only the tail retained; [`StreamingChild::kill`] terminates
+/// and reaps the complete owned process group (idempotent), and dropping the
+/// handle does the same — no zombies or pipe-holding descendants, matching
+/// `run_command_cancellable`'s ownership semantics.
+#[cfg(not(windows))]
+impl std::fmt::Debug for StreamingChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingChild")
+            .field("command", &self.rendered_command)
+            .field("reaped", &self.reaped)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(not(windows))]
+pub struct StreamingChild {
+    child: ManagedChild,
+    stdout: Option<std::process::ChildStdout>,
+    stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_join: Option<thread::JoinHandle<()>>,
+    rendered_command: String,
+    sensitive_values: Vec<String>,
+    process_tree: ProcessTreeOwnership,
+    reaped: bool,
+}
+
+#[cfg(windows)]
+pub struct StreamingChild {
+    _never_constructed: std::convert::Infallible,
+}
+
+// Shared capture code needs the same interface on every target. Windows
+// spawning still returns Unsupported, so this uninhabited handle cannot reach
+// any of these methods and does not imply Windows streaming-process support.
+#[cfg(windows)]
+impl std::fmt::Debug for StreamingChild {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self._never_constructed {}
+    }
+}
+
+#[cfg(windows)]
+impl StreamingChild {
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        match self._never_constructed {}
+    }
+
+    #[must_use]
+    pub fn rendered_command(&self) -> &str {
+        match self._never_constructed {}
+    }
+
+    pub fn try_wait(&mut self) -> FwResult<Option<std::process::ExitStatus>> {
+        match self._never_constructed {}
+    }
+
+    pub fn kill(&mut self) -> FwResult<Option<std::process::ExitStatus>> {
+        match self._never_constructed {}
+    }
+
+    pub(crate) fn finish_after_stdout_eof(&mut self, _max_wait: Duration) -> FwResult<()> {
+        match self._never_constructed {}
+    }
+
+    #[must_use]
+    pub fn stderr_tail(&self) -> String {
+        match self._never_constructed {}
+    }
+}
+
+#[cfg(not(windows))]
+impl StreamingChild {
+    /// Take the live stdout pipe (once). The caller owns read pacing;
+    /// blocking reads unblock promptly after [`Self::kill`] closes the pipe.
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.stdout.take()
+    }
+
+    /// The redacted command line (for logs / error context).
+    #[must_use]
+    pub fn rendered_command(&self) -> &str {
+        &self.rendered_command
+    }
+
+    /// Non-blocking exit probe.
+    pub fn try_wait(&mut self) -> FwResult<Option<std::process::ExitStatus>> {
+        self.child.try_wait().map_err(FwError::Io)
+    }
+
+    /// Terminate and reap the complete owned process group. Idempotent;
+    /// returns the root exit status when cleanup ran on this call.
+    pub fn kill(&mut self) -> FwResult<Option<std::process::ExitStatus>> {
+        if self.reaped {
+            return Ok(None);
+        }
+        if let Err(error) = terminate_descendant_process_tree(&mut self.child, &self.process_tree) {
+            // A descendant may still own stderr. Detach instead of converting
+            // the cleanup failure into an unbounded join; Drop will retry the
+            // process-group cleanup once more.
+            let _ = self.stderr_join.take();
+            return Err(error);
+        }
+        let status = self.child.try_wait().map_err(FwError::Io)?.ok_or_else(|| {
+            process_tree_cleanup_error(
+                "the streaming root was not reaped after process-tree termination",
+            )
+        })?;
+        self.reaped = true;
+        if let Some(join) = self.stderr_join.take() {
+            join.join().map_err(|_| {
+                process_tree_cleanup_error("the streaming stderr drainer panicked during cleanup")
+            })?;
+        }
+        tracing::debug!(command = %self.rendered_command, ?status, "streaming process tree terminated and reaped");
+        Ok(Some(status))
+    }
+
+    /// Finish a producer after its stdout reaches EOF. Natural nonzero exits
+    /// become `FW-CMD-FAILED`; a root that closes stdout but does not exit
+    /// within `max_wait` is terminated as a complete tree and becomes
+    /// `FW-CMD-TIMEOUT`. In every branch, cleanup failure is preserved rather
+    /// than being replaced by a successful end-of-stream result.
+    pub(crate) fn finish_after_stdout_eof(&mut self, max_wait: Duration) -> FwResult<()> {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    let cleanup = self.kill().map(drop);
+                    let stderr = self.stderr_tail();
+                    let outcome = if status.success() {
+                        Ok(())
+                    } else {
+                        Err(FwError::from_command_failure(
+                            self.rendered_command.clone(),
+                            status.code().unwrap_or(-1),
+                            stderr,
+                        ))
+                    };
+                    return match outcome {
+                        Ok(()) => cleanup,
+                        Err(primary) => Err(merge_process_tree_cleanup_result(primary, cleanup)),
+                    };
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) => {
+                    let cleanup = self.kill().map(drop);
+                    let stderr = self.stderr_tail();
+                    return Err(merge_process_tree_cleanup_result(
+                        FwError::from_command_timeout(
+                            self.rendered_command.clone(),
+                            saturating_duration_ms(max_wait),
+                            stderr,
+                        ),
+                        cleanup,
+                    ));
+                }
+                Err(error) => {
+                    let cleanup = self.kill().map(drop);
+                    return Err(merge_process_tree_cleanup_result(
+                        FwError::Io(error),
+                        cleanup,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The retained, argv-secret-redacted stderr tail (lossy UTF-8), for
+    /// FW-CMD-FAILED messages.
+    #[must_use]
+    pub fn stderr_tail(&self) -> String {
+        let tail = self
+            .stderr_tail
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sanitized_streaming_stderr_tail(&tail, &self.sensitive_values)
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for StreamingChild {
+    fn drop(&mut self) {
+        if let Err(error) = self.kill() {
+            tracing::warn!(command = %self.rendered_command, %error, "streaming process-tree cleanup failed during drop");
+        }
+    }
+}
+
+/// Spawn `program args...` with a live stdout pipe and continuously-drained
+/// bounded stderr. See [`StreamingChild`].
+///
+/// Windows: not yet supported — the Job-Object child wrapper does not expose
+/// pipe handles the way `std::process::Child` does; live ffmpeg capture on
+/// Windows lands with that plumbing (the cpal WASAPI source is the primary
+/// Windows path regardless).
+#[cfg(windows)]
+pub fn spawn_streaming_stdout(_program: &str, _args: &[String]) -> FwResult<StreamingChild> {
+    Err(FwError::Unsupported(
+        "streaming subprocess capture is not yet supported on Windows; use the cpal capture backend"
+            .to_owned(),
+    ))
+}
+
+#[cfg(not(windows))]
+pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<StreamingChild> {
+    let (rendered_command, sensitive_values) = command_error_diagnostics(program, args);
+    let stderr_tail_capacity = streaming_stderr_tail_capacity(&sensitive_values);
+    tracing::debug!(command = %rendered_command, "spawning streaming-stdout child");
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if bounded_process_tree_unsupported() {
+        return Err(FwError::Unsupported(
+            "bounded streaming subprocess trees are unsupported on this platform".to_owned(),
+        ));
+    }
+    let process_tree = configure_descendant_process_tree(&mut command);
+    if !process_tree.owns_process_group {
+        return Err(FwError::Unsupported(
+            "streaming subprocess capture requires a fresh caller-owned process group".to_owned(),
+        ));
+    }
+    let mut child = spawn_managed_child(command).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            FwError::CommandMissing {
+                command: program.to_owned(),
+            }
+        } else {
+            FwError::Io(error)
+        }
+    })?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stderr_join = stderr.map(|pipe| {
+        let tail = std::sync::Arc::clone(&stderr_tail);
+        thread::spawn(move || drain_streaming_stderr(pipe, &tail, stderr_tail_capacity))
+    });
+    Ok(StreamingChild {
+        child,
+        stdout,
+        stderr_tail,
+        stderr_join,
+        rendered_command,
+        sensitive_values,
+        process_tree,
+        reaped: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::time::Duration;
 
     use crate::orchestrator::CancellationToken;
 
     #[cfg(unix)]
     use super::run_command_cancellable_with_input_probe_and_observer;
+    #[cfg(target_os = "linux")]
+    use super::{PROCESS_TREE_TOKENS_ENV, environ_carries_tree_token};
+    use super::{ProcStatGroupMember, parse_proc_stat_group_member, utf8_path_arg};
+
+    #[test]
+    fn utf8_path_arg_is_exact_for_utf8_paths() {
+        let path = std::path::Path::new("/tmp/caf\u{e9} dir/input.wav");
+        assert_eq!(
+            utf8_path_arg(path).expect("utf-8 path"),
+            "/tmp/caf\u{e9} dir/input.wav"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn utf8_path_arg_rejects_paths_display_would_rewrite() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // `Path::display` would turn the 0xFF byte into U+FFFD and name a
+        // different file; the command boundary must refuse instead.
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/in\xFFput.wav"));
+        let error = utf8_path_arg(path).expect_err("non-UTF-8 path must be rejected");
+        assert!(
+            matches!(error, crate::error::FwError::InvalidRequest(_)),
+            "{error:?}"
+        );
+    }
     use super::{
-        cancellable_poll_delay, render_command_for_log, run_command_cancellable,
-        run_command_cancellable_with_input_and_probe, run_command_cancellable_with_probe,
+        cancellable_poll_delay, command_error_diagnostics_with_environment, render_command_for_log,
+        run_command_cancellable, run_command_cancellable_with_input_and_probe,
+        run_command_cancellable_with_probe, sensitive_arg_values,
     };
 
-    fn assert_reported_cwd(stdout: &[u8], expected: &Path) {
-        let reported_text = String::from_utf8_lossy(stdout);
-        let reported = Path::new(reported_text.trim())
-            .canonicalize()
-            .expect("reported cwd should resolve");
-        let expected = expected
-            .canonicalize()
-            .expect("expected cwd should resolve");
-        assert_eq!(reported, expected, "reported cwd: {reported_text}");
+    #[test]
+    fn proc_stat_parser_reads_fields_after_a_hostile_command_name() {
+        // A zombie as reported by Linux, with a command name containing spaces
+        // and parentheses that must not shift the field positions.
+        let stat = "81 (sh (x) y) Z 1 81 0 0 -1 4227340 94 203 30 11 0 2 0 1 20 0 1 0 272 \
+                    0 0 18446744073709551615 0 0 0 0 0 0 0 0 65538 1 0 0 17 2 0 0 0 0 0";
+        let member = parse_proc_stat_group_member(stat).expect("parse");
+        assert_eq!(
+            member,
+            ProcStatGroupMember {
+                state: 'Z',
+                process_group: 81,
+                flags: 4_227_340,
+            }
+        );
+        assert_eq!(parse_proc_stat_group_member("12 (truncated"), None);
+        assert_eq!(parse_proc_stat_group_member("12 (sh) Z 1 12 0 0 -1"), None);
+    }
+
+    /// bd-yixf: the states a SIGKILLed thread passes through, from `/proc`
+    /// lines recorded on a loaded 128-thread Linux host while a killed `sh`
+    /// group lingered (flags 0x40044c carry PF_EXITING, 0x400040 do not).
+    #[test]
+    fn killed_threads_are_classified_from_state_flags_and_pending_signals() {
+        use super::{KilledThreadState, killed_thread_state};
+
+        let stat = |line: &str| parse_proc_stat_group_member(line).expect("parse");
+        let status = |sig_pnd: &str, shd_pnd: &str| {
+            format!("Name:\tsh\nState:\tR (running)\nSigPnd:\t{sig_pnd}\nShdPnd:\t{shd_pnd}\n")
+        };
+        let unread = || -> Option<String> { panic!("state and flags already decide") };
+
+        // Runnable, SIGKILL queued for the thread, not yet scheduled.
+        assert_eq!(
+            killed_thread_state(
+                stat("3603094 (sh) R 1 3603078 3600819 0 -1 4194368"),
+                || Some(status("0000000000000100", "0000000000000100"))
+            ),
+            KilledThreadState::Exiting
+        );
+        // Group-directed SIGKILL only (the shared set).
+        assert_eq!(
+            killed_thread_state(
+                stat("3603094 (sh) S 1 3603078 3600819 0 -1 4194368"),
+                || Some(status("0000000000000000", "0000000000000100"))
+            ),
+            KilledThreadState::Exiting
+        );
+        // Dequeued its SIGKILL and is in do_exit: PF_EXITING decides alone.
+        assert_eq!(
+            killed_thread_state(
+                stat("3603062 (sh) R 1 3603054 3600819 0 -1 4195404"),
+                unread
+            ),
+            KilledThreadState::Exiting
+        );
+        // A status that can no longer be read: the thread is being released.
+        assert_eq!(
+            killed_thread_state(
+                stat("3603094 (sh) R 1 3603078 3600819 0 -1 4194368"),
+                || None
+            ),
+            KilledThreadState::Exiting
+        );
+        assert_eq!(
+            killed_thread_state(
+                stat("3603063 (sh) Z 1 3603054 3600819 0 -1 4228172"),
+                unread
+            ),
+            KilledThreadState::Dead
+        );
+        assert_eq!(
+            killed_thread_state(stat("7 (sleep) X 1 7 7 0 -1 4228108"), unread),
+            KilledThreadState::Dead
+        );
+        // Running with only other signals queued: the kill did not reach it.
+        assert_eq!(
+            killed_thread_state(stat("9 (sleep) S 1 9 9 0 -1 4194304"), || Some(status(
+                "0000000000004000",
+                "0000000000000002"
+            ))),
+            KilledThreadState::Live
+        );
+    }
+
+    #[test]
+    fn a_killed_process_is_live_while_any_thread_is() {
+        use super::{KilledProcessState, KilledThreadState, killed_process_state_of_threads};
+        use KilledThreadState::{Dead, Exiting, Live};
+
+        assert_eq!(
+            killed_process_state_of_threads([]),
+            KilledProcessState::Gone
+        );
+        assert_eq!(
+            killed_process_state_of_threads([Dead]),
+            KilledProcessState::Zombie
+        );
+        assert_eq!(
+            killed_process_state_of_threads([Dead, Exiting, Dead]),
+            KilledProcessState::Exiting
+        );
+        assert_eq!(
+            killed_process_state_of_threads([Exiting, Dead]),
+            KilledProcessState::Exiting
+        );
+        // A zombie leader whose other thread still runs is alive.
+        assert_eq!(
+            killed_process_state_of_threads([Dead, Live]),
+            KilledProcessState::Live
+        );
+        assert_eq!(
+            killed_process_state_of_threads([Exiting, Live, Dead]),
+            KilledProcessState::Live
+        );
+    }
+
+    struct PlatformCommand {
+        program: &'static str,
+        args: Vec<String>,
+    }
+
+    #[cfg(unix)]
+    fn platform_command(unix_script: &str, _windows_script: &str) -> PlatformCommand {
+        PlatformCommand {
+            program: "sh",
+            args: vec!["-c".to_owned(), unix_script.to_owned()],
+        }
+    }
+
+    #[cfg(windows)]
+    fn platform_command(_unix_script: &str, windows_script: &str) -> PlatformCommand {
+        PlatformCommand {
+            program: "powershell.exe",
+            args: vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                windows_script.to_owned(),
+            ],
+        }
     }
 
     #[test]
@@ -1281,25 +2499,35 @@ mod tests {
     fn cancellable_completes_fast_command() {
         // A command that exits immediately should succeed with a far-future deadline.
         let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(60));
-        let result =
-            run_command_cancellable("true", &[], None, &cancel, Some(Duration::from_secs(10)));
-        assert!(result.is_ok(), "true should succeed: {result:?}");
+        let command = platform_command("exit 0", "exit 0");
+        let result = run_command_cancellable(
+            command.program,
+            &command.args,
+            None,
+            &cancel,
+            Some(Duration::from_secs(10)),
+        );
+        assert!(result.is_ok(), "success fixture should succeed: {result:?}");
     }
 
     #[test]
     fn cancellable_stdin_payload_reaches_the_child_exactly() {
         let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(60));
         let payload = b"strict worker request\n";
-        let output = run_command_cancellable_with_input_and_probe(
+        let command = platform_command(
             "cat",
-            &[],
+            "[Console]::OpenStandardInput().CopyTo([Console]::OpenStandardOutput())",
+        );
+        let output = run_command_cancellable_with_input_and_probe(
+            command.program,
+            &command.args,
             None,
             &cancel,
             Some(Duration::from_secs(10)),
             None,
             payload,
         )
-        .expect("cat must receive the bounded stdin payload");
+        .expect("stdin fixture must receive the bounded payload");
         assert_eq!(output.stdout, payload);
     }
 
@@ -1368,17 +2596,9 @@ mod tests {
             .expect("descendant pid fixture")
             .parse()
             .expect("numeric descendant pid");
-        let descendant_pid =
-            rustix::process::Pid::from_raw(descendant_pid).expect("positive descendant process id");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while rustix::process::test_kill_process(descendant_pid).is_ok()
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            rustix::process::test_kill_process(descendant_pid).is_err(),
-            "observer failure left a descendant process alive"
+        assert_descendant_terminated(
+            descendant_pid,
+            "observer failure left a descendant process alive",
         );
     }
 
@@ -1389,9 +2609,10 @@ mod tests {
         // Tiny sleep to ensure we're past the deadline.
         std::thread::sleep(Duration::from_millis(10));
 
+        let command = platform_command("sleep 60", "Start-Sleep -Seconds 60");
         let result = run_command_cancellable(
-            "sleep",
-            &["60".to_owned()],
+            command.program,
+            &command.args,
             None,
             &cancel,
             Some(Duration::from_secs(120)),
@@ -1410,9 +2631,10 @@ mod tests {
         let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(60));
         let polls = std::sync::atomic::AtomicUsize::new(0);
         let caller_cancelled = || polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2;
+        let command = platform_command("sleep 60", "Start-Sleep -Seconds 60");
         let result = run_command_cancellable_with_probe(
-            "sleep",
-            &["60".to_owned()],
+            command.program,
+            &command.args,
             None,
             &cancel,
             Some(Duration::from_secs(120)),
@@ -1428,9 +2650,10 @@ mod tests {
     fn cancellable_hard_timeout_takes_effect() {
         // Token with no deadline (far future), but hard timeout is tiny.
         let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(600));
+        let command = platform_command("sleep 60", "Start-Sleep -Seconds 60");
         let result = run_command_cancellable(
-            "sleep",
-            &["60".to_owned()],
+            command.program,
+            &command.args,
             None,
             &cancel,
             Some(Duration::from_millis(100)),
@@ -1449,7 +2672,8 @@ mod tests {
     fn cancellable_no_deadline_still_works() {
         // Token with no deadline at all — should complete normally for fast commands.
         let cancel = CancellationToken::no_deadline();
-        let result = run_command_cancellable("true", &[], None, &cancel, None);
+        let command = platform_command("exit 0", "exit 0");
+        let result = run_command_cancellable(command.program, &command.args, None, &cancel, None);
         assert!(result.is_ok());
     }
 
@@ -1460,8 +2684,10 @@ mod tests {
     use super::{run_command, run_command_with_timeout, saturating_duration_ms};
 
     #[test]
-    fn run_command_succeeds_for_true() {
-        let output = run_command("true", &[], None).expect("true should succeed");
+    fn run_command_succeeds_for_platform_fixture() {
+        let command = platform_command("exit 0", "exit 0");
+        let output = run_command(command.program, &command.args, None)
+            .expect("platform success fixture should succeed");
         assert!(output.status.success());
     }
 
@@ -1578,7 +2804,9 @@ mod tests {
 
     #[test]
     fn run_command_nonzero_exit_returns_command_failed() {
-        let err = run_command("false", &[], None).expect_err("false should fail");
+        let command = platform_command("exit 7", "exit 7");
+        let err = run_command(command.program, &command.args, None)
+            .expect_err("nonzero fixture should fail");
         let text = err.to_string();
         assert!(
             text.contains("command failed") || text.contains("status"),
@@ -1588,16 +2816,23 @@ mod tests {
 
     #[test]
     fn run_command_with_timeout_succeeds_when_fast() {
-        let output = run_command_with_timeout("true", &[], None, Some(Duration::from_secs(5)))
-            .expect("true should succeed within timeout");
+        let command = platform_command("exit 0", "exit 0");
+        let output = run_command_with_timeout(
+            command.program,
+            &command.args,
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .expect("success fixture should complete within timeout");
         assert!(output.status.success());
     }
 
     #[test]
     fn run_command_with_timeout_kills_slow_command() {
+        let command = platform_command("sleep 60", "Start-Sleep -Seconds 60");
         let err = run_command_with_timeout(
-            "sleep",
-            &["60".to_owned()],
+            command.program,
+            &command.args,
             None,
             Some(Duration::from_millis(100)),
         )
@@ -1624,6 +2859,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn run_command_without_timeout_rejects_finite_output_over_capture_limit() {
+        let args = vec![
+            "-c".to_owned(),
+            format!("head -c {} /dev/zero", super::MAX_CAPTURED_OUTPUT_BYTES + 1),
+        ];
+        let error = run_command("sh", &args, None)
+            .expect_err("timeout-free capture must enforce the output bound");
+        assert!(super::is_stdout_capture_limit_error(&error));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn timeout_terminates_the_complete_descendant_process_group() {
         let directory = tempfile::tempdir().expect("temporary pid directory");
         let pid_path = directory.path().join("descendant.pid");
@@ -1633,25 +2880,190 @@ mod tests {
             "fw-process-tree-test".to_owned(),
             pid_path.to_string_lossy().into_owned(),
         ];
-        let result = run_command_with_timeout("sh", &args, None, Some(Duration::from_millis(250)));
-        assert!(result.is_err(), "forking fixture must hit the timeout");
-
-        let descendant_pid: i32 = std::fs::read_to_string(&pid_path)
-            .expect("descendant pid fixture")
-            .parse()
-            .expect("numeric descendant pid");
+        // The timeout must fire after the fixture has forked its descendant;
+        // on a loaded host the shell may not even start within 250 ms
+        // (bd-yixf). Each attempt's timeout is four times the last until one
+        // fires with the descendant recorded.
+        let mut timeout = Duration::from_millis(250);
+        let descendant_pid: i32 = loop {
+            let result = run_command_with_timeout("sh", &args, None, Some(timeout));
+            assert!(
+                matches!(result, Err(crate::error::FwError::CommandTimedOut { .. })),
+                "forking fixture must hit the timeout and cleanup must certify the tree: {result:?}"
+            );
+            // Opened by the redirection but killed before printf wrote it
+            // counts as not yet forked.
+            if let Some(pid) = std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                timeout < Duration::from_secs(16),
+                "the fixture never forked its descendant before a {timeout:?} timeout"
+            );
+            timeout *= 4;
+        };
         let descendant_pid =
             rustix::process::Pid::from_raw(descendant_pid).expect("positive descendant process id");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while rustix::process::test_kill_process(descendant_pid).is_ok()
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            rustix::process::test_kill_process(descendant_pid).is_err(),
-            "timeout left a descendant process alive"
+        assert_descendant_terminated(
+            descendant_pid.as_raw_nonzero().get(),
+            "timeout left a descendant process alive",
         );
+    }
+
+    /// How long a test waits for a descendant the cleanup killed to actually
+    /// leave the process table (bd-yixf). Cleanup has already certified it:
+    /// gone, a zombie, or SIGKILLed and exiting. What remains is scheduler and
+    /// reaper latency (orphans are reaped by PID 1, which a loaded host may
+    /// not run for a while), which the product does not control, so the
+    /// ceiling is generous. A descendant the cleanup missed still fails: on
+    /// Linux at once (it is classified live), elsewhere at the ceiling (the
+    /// fixtures' descendants sleep 60 s).
+    #[cfg(unix)]
+    const KILLED_DESCENDANT_EXIT_CEILING: Duration = Duration::from_secs(30);
+
+    /// Assert that cleanup terminated process `pid`: on Linux it must be gone,
+    /// a zombie, or exiting with SIGKILL queued the moment cleanup returns,
+    /// and then actually finish dying.
+    #[cfg(unix)]
+    fn assert_descendant_terminated(pid: i32, failure: &str) {
+        let deadline = std::time::Instant::now() + KILLED_DESCENDANT_EXIT_CEILING;
+        #[cfg(target_os = "linux")]
+        {
+            use super::{KilledProcessState, killed_process_state};
+
+            let at_return = killed_process_state(pid);
+            assert_ne!(
+                at_return,
+                KilledProcessState::Live,
+                "{failure}: process {pid} still runs, unkilled, after cleanup returned"
+            );
+            while killed_process_state(pid) == KilledProcessState::Exiting
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let settled = killed_process_state(pid);
+            assert!(
+                matches!(
+                    settled,
+                    KilledProcessState::Gone | KilledProcessState::Zombie
+                ),
+                "{failure}: killed process {pid} is {settled:?} {KILLED_DESCENDANT_EXIT_CEILING:?} after cleanup"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let pid = rustix::process::Pid::from_raw(pid).expect("positive descendant pid");
+            while rustix::process::test_kill_process(pid).is_ok()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                rustix::process::test_kill_process(pid).is_err(),
+                "{failure}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_escapee_terminated(pid_path: &std::path::Path) {
+        let escapee: i32 = std::fs::read_to_string(pid_path)
+            .expect("escapee pid fixture")
+            .trim()
+            .parse()
+            .expect("numeric escapee pid");
+        assert_descendant_terminated(
+            escapee,
+            "a descendant that left the process group via setsid survived cleanup",
+        );
+    }
+
+    /// The escapee keeps the inherited stdout/stderr pipes, so a cleanup that
+    /// missed it would also wedge the bounded output capture.
+    #[cfg(target_os = "linux")]
+    fn setsid_escape_fixture(pid_path: &std::path::Path, root_tail: &str) -> Vec<String> {
+        vec![
+            "-c".to_owned(),
+            format!(
+                "setsid sleep 60 </dev/null & printf '%s' \"$!\" > \"$1\"; sleep 0.3; {root_tail}"
+            ),
+            "fw-process-escape-test".to_owned(),
+            pid_path.to_string_lossy().into_owned(),
+        ]
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timeout_terminates_descendants_that_setsid_out_of_the_group() {
+        if !command_exists("setsid") {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("escapee.pid");
+        let args = setsid_escape_fixture(&pid_path, "sleep 60");
+        let started = std::time::Instant::now();
+        let result = run_command_with_timeout("sh", &args, None, Some(Duration::from_millis(800)));
+        // A plain timeout: a cleanup that could not certify the tree would
+        // have turned it into a ContractViolation.
+        assert!(
+            matches!(result, Err(crate::error::FwError::CommandTimedOut { .. })),
+            "fixture must hit the timeout and cleanup must certify the tree: {result:?}"
+        );
+        // Not the escapee's 60 s: the timeout plus at most the exit ceiling.
+        assert!(started.elapsed() < super::PROCESS_TREE_EXIT_CEILING + Duration::from_secs(5));
+        assert_escapee_terminated(&pid_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_root_exit_still_terminates_setsid_escapees() {
+        if !command_exists("setsid") {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("escapee.pid");
+        // The root waits until the escapee exists, then exits 0 with the
+        // daemonized child still running.
+        let args = setsid_escape_fixture(&pid_path, "exit 0");
+        let started = std::time::Instant::now();
+        run_command_with_timeout("sh", &args, None, Some(Duration::from_secs(30)))
+            .expect("root exits successfully");
+        // Not the escapee's 60 s: the root's 0.3 s plus at most the exit ceiling.
+        assert!(started.elapsed() < super::PROCESS_TREE_EXIT_CEILING + Duration::from_secs(5));
+        assert_escapee_terminated(&pid_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn environ_token_matching_is_exact_per_list_entry() {
+        let environ = |value: &str| {
+            format!("PATH=/bin\0{PROCESS_TREE_TOKENS_ENV}={value}\0HOME=/root\0").into_bytes()
+        };
+        assert!(environ_carries_tree_token(
+            &environ("fwtree-1-2-3"),
+            "fwtree-1-2-3"
+        ));
+        assert!(environ_carries_tree_token(
+            &environ("fwtree-9-0-0:fwtree-1-2-3"),
+            "fwtree-1-2-3"
+        ));
+        assert!(!environ_carries_tree_token(
+            &environ("fwtree-1-2-33"),
+            "fwtree-1-2-3"
+        ));
+        assert!(!environ_carries_tree_token(
+            &environ("xfwtree-1-2-3"),
+            "fwtree-1-2-3"
+        ));
+        assert!(!environ_carries_tree_token(
+            b"OTHER=fwtree-1-2-3\0",
+            "fwtree-1-2-3"
+        ));
+        assert!(!environ_carries_tree_token(b"", "fwtree-1-2-3"));
     }
 
     #[cfg(windows)]
@@ -1813,51 +3225,60 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn successful_root_cannot_leave_a_descendant_process_alive() {
-        let output = run_command_with_timeout(
+        let output = run_command(
             "sh",
             &[
                 "-c".to_owned(),
-                "sleep 60 & child=$!; printf '%s' \"$child\"; exit 0".to_owned(),
+                "sleep 60 </dev/null >/dev/null 2>&1 & child=$!; printf '%s' \"$child\"; exit 0"
+                    .to_owned(),
             ],
             None,
-            Some(Duration::from_secs(5)),
         )
         .expect("successful root command");
         let descendant_pid: i32 = String::from_utf8(output.stdout)
             .expect("UTF-8 descendant pid")
             .parse()
             .expect("numeric descendant pid");
-        let descendant_pid =
-            rustix::process::Pid::from_raw(descendant_pid).expect("positive descendant pid");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while rustix::process::test_kill_process(descendant_pid).is_ok()
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            rustix::process::test_kill_process(descendant_pid).is_err(),
-            "successful bounded command left a descendant process alive"
+        assert_descendant_terminated(
+            descendant_pid,
+            "successful timeout-free command left a descendant process alive",
         );
     }
 
     #[test]
     fn run_command_captures_stderr() {
-        // `ls` on a nonexistent path writes to stderr and exits non-zero.
-        let err = run_command("ls", &["/nonexistent_path_xyz_99999".to_owned()], None)
-            .expect_err("ls on nonexistent should fail");
+        let command = platform_command(
+            "printf '%s' 'nonexistent_path_xyz_99999' >&2; exit 7",
+            "[Console]::Error.Write('nonexistent_path_xyz_99999'); exit 7",
+        );
+        let err = run_command(command.program, &command.args, None)
+            .expect_err("stderr fixture should fail");
         let text = err.to_string();
         assert!(
-            text.contains("nonexistent_path") || text.contains("No such file"),
+            text.contains("nonexistent_path_xyz_99999"),
             "expected stderr content, got: {text}"
         );
     }
 
     #[test]
     fn run_command_with_cwd() {
+        // Behavior contract, not path identity: RCH workers expose the same
+        // checkout/temp trees under different path spellings (/data vs /Users
+        // aliases), so comparing reported cwd strings is environment-sensitive.
+        // A child that creates a file relative to its cwd proves the requested
+        // directory took effect under every spelling, including root.
         let dir = tempfile::tempdir().expect("tempdir");
-        let output = run_command("pwd", &[], Some(dir.path())).expect("pwd should succeed");
-        assert_reported_cwd(&output.stdout, dir.path());
+        let marker = "fw-cwd-marker.txt";
+        let command = platform_command(
+            "printf '' > fw-cwd-marker.txt",
+            "[IO.File]::WriteAllBytes('fw-cwd-marker.txt', [byte[]]@())",
+        );
+        run_command(command.program, &command.args, Some(dir.path()))
+            .expect("cwd fixture should succeed");
+        assert!(
+            dir.path().join(marker).is_file(),
+            "child must resolve relative paths against the requested cwd"
+        );
     }
 
     #[test]
@@ -1866,6 +3287,7 @@ mod tests {
             "--hf-token".to_owned(),
             "hf_secret_123".to_owned(),
             "--api-key=secret_api_key".to_owned(),
+            "--prompt=private patient context".to_owned(),
             "--token-threshold".to_owned(),
             "0.1".to_owned(),
             "positional".to_owned(),
@@ -1873,6 +3295,7 @@ mod tests {
         let rendered = render_command_for_log("prog", &args);
         assert!(rendered.contains("--hf-token ***"));
         assert!(rendered.contains("--api-key=***"));
+        assert!(rendered.contains("--prompt=***"));
         assert!(rendered.contains("--token-threshold 0.1"));
         assert!(rendered.contains("positional"));
         assert!(
@@ -1883,11 +3306,481 @@ mod tests {
             !rendered.contains("secret_api_key"),
             "api key should be redacted"
         );
+        assert!(
+            !rendered.contains("private patient context"),
+            "prompt text should be redacted"
+        );
         assert_eq!(
             rendered,
-            "prog --hf-token *** --api-key=*** --token-threshold 0.1 positional"
+            "prog --hf-token *** --api-key=*** --prompt=*** --token-threshold 0.1 positional"
         );
         assert_eq!(render_command_for_log("prog", &[]), "prog");
+    }
+
+    #[test]
+    fn sensitive_arg_values_are_longest_first_unique_and_nonempty() {
+        let args = vec![
+            "--hf-token".to_owned(),
+            "token".to_owned(),
+            "--api-key=token-suffix".to_owned(),
+            "--auth-token=token".to_owned(),
+            "--password=".to_owned(),
+            "--secret".to_owned(),
+        ];
+
+        assert_eq!(
+            sensitive_arg_values(&args),
+            vec!["token-suffix".to_owned(), "token".to_owned()]
+        );
+    }
+
+    #[test]
+    fn adjacent_sensitive_flags_rearm_redaction_for_their_own_values() {
+        let split_secret = "adjacent_secret_123";
+        let equal_secret = "equal_secret_456";
+        let args = vec![
+            "--hf-token".to_owned(),
+            "--api-key".to_owned(),
+            split_secret.to_owned(),
+            "--secret".to_owned(),
+            format!("--auth-token={equal_secret}"),
+        ];
+
+        let (rendered, sensitive_values) =
+            command_error_diagnostics_with_environment("prog", &args, |_| None);
+        assert_eq!(
+            sensitive_values,
+            vec![split_secret.to_owned(), equal_secret.to_owned()]
+        );
+        assert_eq!(
+            rendered,
+            "prog --hf-token --api-key *** --secret --auth-token=***"
+        );
+        assert!(!rendered.contains(split_secret));
+        assert!(!rendered.contains(equal_secret));
+    }
+
+    #[test]
+    fn command_diagnostics_redact_repeated_sensitive_value_everywhere() {
+        let secret = "repeated_secret_123";
+        let args = vec![
+            "--hf-token".to_owned(),
+            secret.to_owned(),
+            "--label".to_owned(),
+            secret.to_owned(),
+        ];
+
+        let (rendered, sensitive_values) =
+            command_error_diagnostics_with_environment("prog", &args, |_| None);
+        assert_eq!(sensitive_values, vec![secret.to_owned()]);
+        assert!(
+            !rendered.contains(secret),
+            "repeated secret leaked: {rendered}"
+        );
+        assert!(
+            rendered.contains("--label ***"),
+            "nonsensitive occurrence was not scrubbed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn command_diagnostics_do_not_reemit_asterisk_only_secret() {
+        let secret = "***";
+        let args = vec!["--secret".to_owned(), secret.to_owned()];
+
+        let (rendered, _) = command_error_diagnostics_with_environment("prog", &args, |_| None);
+        assert!(
+            !rendered.contains(secret),
+            "mask re-emitted the secret: {rendered}"
+        );
+        assert!(
+            rendered.contains("--secret ###"),
+            "alternate marker was not selected: {rendered}"
+        );
+    }
+
+    #[test]
+    fn command_diagnostics_include_known_inherited_secrets() {
+        let secret = "inherited_hf_secret_987";
+        let args = vec!["--label".to_owned(), secret.to_owned()];
+        let (rendered, sensitive_values) =
+            command_error_diagnostics_with_environment("prog", &args, |name| {
+                (name == "HF_TOKEN").then(|| secret.to_owned())
+            });
+
+        assert!(sensitive_values.iter().any(|value| value == secret));
+        assert!(!rendered.contains(secret));
+        let stderr = super::captured_stderr_for_error(secret.as_bytes(), &sensitive_values);
+        assert!(!stderr.contains(secret));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_child_stderr_redacts_inherited_hf_token() {
+        const PROBE_ENV: &str = "__FW_INHERITED_SECRET_PROBE";
+        const SECRET: &str = "inherited_hf_token_live_654321";
+        if std::env::var_os(PROBE_ENV).is_some() {
+            let args = vec![
+                "-c".to_owned(),
+                "printf 'inherited-context:%s\n' \"$HF_TOKEN\" >&2; exit 9".to_owned(),
+            ];
+            let error = run_command("sh", &args, None).expect_err("fixture must fail");
+            let text = error.to_string();
+            assert!(text.contains("inherited-context:"));
+            assert!(!text.contains(SECRET), "inherited HF token leaked: {text}");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("process::tests::failing_child_stderr_redacts_inherited_hf_token")
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PROBE_ENV, "1")
+            .env("HF_TOKEN", SECRET)
+            .output()
+            .expect("spawn inherited-secret probe");
+        assert!(
+            output.status.success(),
+            "inherited-secret probe failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn captured_stderr_scrubs_secret_reconstructed_by_lossy_utf8() {
+        let secret = "A�B";
+        let sensitive_values = vec![secret.to_owned()];
+
+        let rendered = super::captured_stderr_for_error(b"A\xffB", &sensitive_values);
+        assert_eq!(rendered, "***");
+        assert!(
+            !rendered.contains(secret),
+            "lossy UTF-8 reconstructed the secret: {rendered}"
+        );
+    }
+
+    #[test]
+    fn captured_stderr_redacts_overlapping_repetitive_matches() {
+        let sensitive_values = vec!["aaa".to_owned()];
+
+        let rendered = super::captured_stderr_for_error(b"aaaaab", &sensitive_values);
+        assert_eq!(rendered, "***b");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_child_stderr_redacts_split_and_equal_argv_secrets() {
+        let hf_secret = "hf_secret_echo_123";
+        let api_secret = "api_secret_echo_456";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'benign-context:%s:%s:%s\\n' \"$1\" \"$2\" \"$3\" >&2; exit 9".to_owned(),
+            "fw-secret-probe".to_owned(),
+            "--hf-token".to_owned(),
+            hf_secret.to_owned(),
+            format!("--api-key={api_secret}"),
+        ];
+
+        let error = run_command("sh", &args, None).expect_err("fixture must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("benign-context"),
+            "benign stderr was lost: {text}"
+        );
+        assert!(
+            text.contains("--hf-token:***:--api-key=***"),
+            "sensitive argv values were not replaced in context: {text}"
+        );
+        assert!(!text.contains(hf_secret), "HF token leaked: {text}");
+        assert!(!text.contains(api_secret), "API key leaked: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_child_stderr_redacts_whisper_prompt_text() {
+        let prompt = "patient Jane Doe; access phrase blue orchard";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'whisper-context:%s:%s\n' \"$1\" \"$2\" >&2; exit 9".to_owned(),
+            "fw-prompt-probe".to_owned(),
+            "--prompt".to_owned(),
+            prompt.to_owned(),
+        ];
+
+        let error = run_command("sh", &args, None).expect_err("fixture must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("whisper-context:--prompt:***"),
+            "benign prompt context was lost: {text}"
+        );
+        assert!(!text.contains(prompt), "Whisper prompt leaked: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_timeout_stderr_redacts_argv_secret() {
+        let secret = "timeout_secret_echo_789";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'timeout-context:%s\\n' \"$2\" >&2; sleep 30".to_owned(),
+            "fw-timeout-probe".to_owned(),
+            "--hf-token".to_owned(),
+            secret.to_owned(),
+        ];
+
+        let error = run_command_with_timeout("sh", &args, None, Some(Duration::from_secs(1)))
+            .expect_err("fixture must time out");
+        let text = error.to_string();
+        assert!(
+            text.contains("timeout-context:***"),
+            "context was lost: {text}"
+        );
+        assert!(!text.contains(secret), "timeout leaked argv secret: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_nonzero_stderr_redacts_argv_secret() {
+        let secret = "bounded_failure_secret_901";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'bounded-failure:%s\\n' \"$2\" >&2; exit 7".to_owned(),
+            "fw-bounded-failure-probe".to_owned(),
+            "--api-key".to_owned(),
+            secret.to_owned(),
+        ];
+
+        let error = run_command_with_timeout("sh", &args, None, Some(Duration::from_secs(5)))
+            .expect_err("fixture must fail");
+        let text = error.to_string();
+        assert!(text.contains("bounded-failure"), "context was lost: {text}");
+        assert!(
+            !text.contains(secret),
+            "bounded failure leaked secret: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_timeout_stderr_redacts_argv_secret() {
+        let secret = "cancellable_secret_echo_012";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'cancellable-context:%s\\n' \"$2\" >&2; sleep 30".to_owned(),
+            "fw-cancellable-probe".to_owned(),
+            "--auth-token".to_owned(),
+            secret.to_owned(),
+        ];
+        let token = CancellationToken::no_deadline();
+
+        let error =
+            run_command_cancellable("sh", &args, None, &token, Some(Duration::from_secs(1)))
+                .expect_err("fixture must time out");
+        let text = error.to_string();
+        assert!(
+            text.contains("cancellable-context:***"),
+            "context was lost: {text}"
+        );
+        assert!(
+            !text.contains(secret),
+            "cancellable timeout leaked argv secret: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_nonzero_stderr_redacts_argv_secret() {
+        let secret = "cancellable_failure_secret_234";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'cancellable-failure:%s\\n' \"$2\" >&2; exit 8".to_owned(),
+            "fw-cancellable-failure-probe".to_owned(),
+            "--auth-token".to_owned(),
+            secret.to_owned(),
+        ];
+        let token = CancellationToken::no_deadline();
+
+        let error =
+            run_command_cancellable("sh", &args, None, &token, Some(Duration::from_secs(5)))
+                .expect_err("fixture must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("cancellable-failure"),
+            "context was lost: {text}"
+        );
+        assert!(
+            !text.contains(secret),
+            "cancellable failure leaked secret: {text}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn streaming_stderr_tail_redacts_argv_secret() {
+        let secret = "streaming_secret_echo_345";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'stream-context:%s\\n' \"$2\" >&2".to_owned(),
+            "fw-stream-probe".to_owned(),
+            "--access-token".to_owned(),
+            secret.to_owned(),
+        ];
+        let mut child = super::spawn_streaming_stdout("sh", &args).expect("spawn fixture");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.try_wait().expect("probe child").is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "streaming fixture did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().expect("join stderr drainer");
+
+        let tail = child.stderr_tail();
+        assert!(
+            tail.contains("stream-context:***"),
+            "context was lost: {tail}"
+        );
+        assert!(
+            !tail.contains(secret),
+            "streaming tail leaked argv secret: {tail}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn streaming_stderr_drain_retries_interrupted_reads() {
+        struct InterruptedOnce {
+            interrupted: bool,
+            bytes: std::io::Cursor<Vec<u8>>,
+        }
+
+        impl std::io::Read for InterruptedOnce {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                std::io::Read::read(&mut self.bytes, buf)
+            }
+        }
+
+        let tail = std::sync::Mutex::new(Vec::new());
+        super::drain_streaming_stderr(
+            InterruptedOnce {
+                interrupted: false,
+                bytes: std::io::Cursor::new(b"retained after interrupt".to_vec()),
+            },
+            &tail,
+            super::STREAMING_STDERR_TAIL_BYTES,
+        );
+        let tail = tail
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(tail, b"retained after interrupt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_child_kill_terminates_descendant_holding_pipes() {
+        use std::io::BufRead as _;
+
+        let args = vec![
+            "-c".to_owned(),
+            "sleep 30 & printf '%s\\n' \"$!\"; wait".to_owned(),
+        ];
+        let mut child = super::spawn_streaming_stdout("sh", &args).expect("spawn process tree");
+        let stdout = child.take_stdout().expect("streaming stdout");
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut descendant = String::new();
+        stdout
+            .read_line(&mut descendant)
+            .expect("read descendant pid");
+        let descendant = descendant
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .expect("valid descendant pid");
+        drop(stdout);
+
+        let started = std::time::Instant::now();
+        child.kill().expect("terminate complete process group");
+        // Cleanup waits for SIGKILLed members to finish exiting for at most
+        // PROCESS_TREE_EXIT_CEILING (bd-yixf); a kill that instead waited for
+        // the descendant's own 30 s sleep still breaks this bound.
+        let bound = super::PROCESS_TREE_EXIT_CEILING + Duration::from_secs(2);
+        assert!(
+            started.elapsed() < bound,
+            "process-tree cleanup exceeded its {bound:?} bound: {:?}",
+            started.elapsed()
+        );
+        assert_descendant_terminated(
+            descendant.as_raw_nonzero().get(),
+            "streaming descendant survived root cleanup",
+        );
+    }
+
+    #[test]
+    fn streaming_stderr_tail_redacts_secret_across_nominal_boundary() {
+        let secret = "boundary_secret_567";
+        let sensitive_values = vec![secret.to_owned()];
+        let capacity = super::streaming_stderr_tail_capacity(&sensitive_values);
+        let suffix_len = super::STREAMING_STDERR_TAIL_BYTES + 1 - secret.len();
+        let mut raw = vec![b'p'; 100];
+        raw.extend_from_slice(secret.as_bytes());
+        raw.extend(std::iter::repeat_n(b'z', suffix_len));
+
+        let mut retained = Vec::new();
+        for chunk in raw.chunks(257) {
+            super::append_streaming_stderr_tail(&mut retained, chunk, capacity);
+        }
+        let tail = super::sanitized_streaming_stderr_tail(&retained, &sensitive_values);
+
+        assert!(tail.len() <= super::STREAMING_STDERR_TAIL_BYTES);
+        assert!(
+            tail.starts_with('*'),
+            "boundary secret prefix was not masked"
+        );
+        assert!(
+            !tail.contains(secret) && !tail.contains(&secret[1..]),
+            "boundary-straddling secret leaked: {tail}"
+        );
+        assert!(tail.ends_with("zzzz"), "benign tail context was lost");
+    }
+
+    #[test]
+    fn streaming_stderr_tail_remains_bounded_when_markers_expand() {
+        let sensitive_values = vec!["*".to_owned(), "#".to_owned()];
+        let capacity = super::streaming_stderr_tail_capacity(&sensitive_values);
+        let raw: Vec<u8> = (0..super::STREAMING_STDERR_TAIL_BYTES + 100)
+            .map(|index| match index % 3 {
+                0 => b'*',
+                1 => b'#',
+                _ => b'a',
+            })
+            .collect();
+        let mut retained = Vec::new();
+        for chunk in raw.chunks(257) {
+            super::append_streaming_stderr_tail(&mut retained, chunk, capacity);
+        }
+
+        let tail = super::sanitized_streaming_stderr_tail(&retained, &sensitive_values);
+        assert!(
+            tail.len() <= super::STREAMING_STDERR_TAIL_BYTES,
+            "expanded marker tail exceeded the public bound: {}",
+            tail.len()
+        );
+        assert!(
+            !tail.contains('*') && !tail.contains('#'),
+            "one-byte secret leaked: {tail}"
+        );
+        assert!(tail.contains('a'), "benign tail context was lost");
     }
 
     #[test]
@@ -1909,10 +3802,12 @@ mod tests {
     use super::command_exists;
 
     #[test]
-    fn command_exists_true_for_known_binary() {
-        // `ls` and `true` exist on all Unix-like systems.
-        assert!(command_exists("ls"), "ls should exist");
-        assert!(command_exists("true"), "true should exist");
+    fn command_exists_true_for_platform_fixture() {
+        let command = platform_command("exit 0", "exit 0");
+        assert!(
+            command_exists(command.program),
+            "platform test shell should exist"
+        );
     }
 
     #[test]
@@ -1953,16 +3848,51 @@ mod tests {
     }
 
     #[test]
+    fn validate_command_output_redacts_overlapping_argv_secrets() {
+        let args = vec![
+            "--hf-token".to_owned(),
+            "fwsecret".to_owned(),
+            "--api-key=fwsecret-long".to_owned(),
+        ];
+        let sensitive_values = sensitive_arg_values(&args);
+        let output = fake_output(
+            1,
+            "benign failure: --api-key=fwsecret-long and --hf-token fwsecret",
+        );
+
+        let error = validate_command_output(
+            "test-cmd --hf-token *** --api-key=***",
+            output,
+            &sensitive_values,
+        )
+        .expect_err("fixture must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("benign failure"),
+            "benign context was lost: {text}"
+        );
+        assert!(
+            text.contains("--api-key=*** and --hf-token ***"),
+            "redacted context is incomplete: {text}"
+        );
+        assert!(!text.contains("fwsecret"), "secret leaked: {text}");
+        assert!(
+            !text.contains("-long"),
+            "longer overlapping secret was only partially redacted: {text}"
+        );
+    }
+
+    #[test]
     fn validate_command_output_success_returns_ok() {
         let output = fake_output(0, "");
-        let result = validate_command_output("test-cmd", output);
+        let result = validate_command_output("test-cmd", output, &[]);
         assert!(result.is_ok());
     }
 
     #[test]
     fn validate_command_output_nonzero_exit_returns_error() {
         let output = fake_output(1, "something went wrong");
-        let result = validate_command_output("test-cmd", output);
+        let result = validate_command_output("test-cmd", output, &[]);
         assert!(result.is_err());
         let text = result.unwrap_err().to_string();
         assert!(
@@ -1974,7 +3904,7 @@ mod tests {
     #[test]
     fn validate_command_output_preserves_exit_code_in_error() {
         let output = fake_output(42, "exit code 42");
-        let err = validate_command_output("my-tool --flag", output).unwrap_err();
+        let err = validate_command_output("my-tool --flag", output, &[]).unwrap_err();
         let text = err.to_string();
         assert!(
             text.contains("42"),
@@ -1985,7 +3915,7 @@ mod tests {
     #[test]
     fn validate_command_output_empty_stderr_still_fails_on_nonzero() {
         let output = fake_output(2, "");
-        let result = validate_command_output("cmd", output);
+        let result = validate_command_output("cmd", output, &[]);
         assert!(
             result.is_err(),
             "non-zero exit with empty stderr should still fail"
@@ -1996,18 +3926,63 @@ mod tests {
 
     #[test]
     fn run_command_with_timeout_none_behaves_like_run_command() {
-        let output = run_command_with_timeout("true", &[], None, None).expect("should succeed");
+        let command = platform_command("exit 0", "exit 0");
+        let output = run_command_with_timeout(command.program, &command.args, None, None)
+            .expect("success fixture should succeed");
         assert!(output.status.success());
     }
 
     #[test]
     fn run_command_with_args() {
-        let output = run_command("echo", &["hello".to_owned(), "world".to_owned()], None)
-            .expect("echo should succeed");
+        let command = platform_command(
+            "printf '%s' 'hello world'",
+            "[Console]::Out.Write('hello world')",
+        );
+        let output = run_command(command.program, &command.args, None)
+            .expect("stdout fixture should succeed");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("hello world"),
             "expected 'hello world', got: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_does_not_inherit_parent_stdin() {
+        const PROBE_ENV: &str = "__FW_NULL_STDIN_PROBE";
+        if std::env::var_os(PROBE_ENV).is_some() {
+            let args = vec![
+                "-c".to_owned(),
+                "if IFS= read -r value; then printf 'unexpected:%s' \"$value\" >&2; exit 9; fi"
+                    .to_owned(),
+            ];
+            run_command_with_timeout("sh", &args, None, Some(Duration::from_secs(2)))
+                .expect("bounded subprocess stdin must be EOF");
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("process::tests::run_command_with_timeout_does_not_inherit_parent_stdin")
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PROBE_ENV, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn stdin probe");
+        let mut stdin = child.stdin.take().expect("probe stdin");
+        std::io::Write::write_all(&mut stdin, b"parent-only-sentinel\n")
+            .expect("write parent sentinel");
+        drop(stdin);
+        let output = child.wait_with_output().expect("wait for stdin probe");
+        assert!(
+            output.status.success(),
+            "stdin probe failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -2025,9 +4000,12 @@ mod tests {
     #[test]
     fn cancellable_captures_output_from_successful_command() {
         let cancel = CancellationToken::no_deadline();
-        let output =
-            run_command_cancellable("echo", &["test_output".to_owned()], None, &cancel, None)
-                .expect("echo should succeed");
+        let command = platform_command(
+            "printf '%s' 'test_output'",
+            "[Console]::Out.Write('test_output')",
+        );
+        let output = run_command_cancellable(command.program, &command.args, None, &cancel, None)
+            .expect("stdout fixture should succeed");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("test_output"),
@@ -2038,8 +4016,9 @@ mod tests {
     #[test]
     fn cancellable_nonzero_exit_returns_error() {
         let cancel = CancellationToken::no_deadline();
-        let err = run_command_cancellable("false", &[], None, &cancel, None)
-            .expect_err("false should fail");
+        let command = platform_command("exit 7", "exit 7");
+        let err = run_command_cancellable(command.program, &command.args, None, &cancel, None)
+            .expect_err("nonzero fixture should fail");
         assert!(
             !matches!(err, crate::error::FwError::Cancelled(_)),
             "should not be cancelled, should be command failure: {err:?}"
@@ -2060,7 +4039,7 @@ mod tests {
     #[test]
     fn validate_command_output_includes_command_name_in_error() {
         let output = fake_output(1, "boom");
-        let err = validate_command_output("my-special-cmd --flag", output).unwrap_err();
+        let err = validate_command_output("my-special-cmd --flag", output, &[]).unwrap_err();
         let text = err.to_string();
         assert!(
             text.contains("my-special-cmd"),
@@ -2070,16 +4049,36 @@ mod tests {
 
     #[test]
     fn cancellable_with_cwd_succeeds() {
+        // Same behavior contract as run_command_with_cwd: prove the requested
+        // cwd took effect via a relative-path side effect instead of comparing
+        // reported path strings, which differ across RCH /data vs /Users
+        // aliases.
         let dir = tempfile::tempdir().expect("tempdir");
+        let marker = "fw-cwd-cancellable-marker.txt";
         let cancel = CancellationToken::no_deadline();
-        let output = run_command_cancellable("pwd", &[], Some(dir.path()), &cancel, None)
-            .expect("pwd should succeed");
-        assert_reported_cwd(&output.stdout, dir.path());
+        let command = platform_command(
+            "printf '' > fw-cwd-cancellable-marker.txt",
+            "[IO.File]::WriteAllBytes('fw-cwd-cancellable-marker.txt', [byte[]]@())",
+        );
+        run_command_cancellable(
+            command.program,
+            &command.args,
+            Some(dir.path()),
+            &cancel,
+            None,
+        )
+        .expect("cancellable cwd fixture should succeed");
+        assert!(
+            dir.path().join(marker).is_file(),
+            "cancelled-capable child must resolve relative paths against the requested cwd"
+        );
     }
 
     #[test]
-    fn run_command_empty_args_succeeds() {
-        let output = run_command("true", &[], None).expect("true with no args");
+    fn run_command_success_fixture_succeeds() {
+        let command = platform_command("exit 0", "exit 0");
+        let output = run_command(command.program, &command.args, None)
+            .expect("platform success fixture should succeed");
         assert!(output.status.success());
     }
 
@@ -2087,7 +4086,8 @@ mod tests {
     fn cancellable_with_hard_timeout_none_and_no_deadline() {
         // Both safety nets disabled — should still work for fast commands.
         let cancel = CancellationToken::no_deadline();
-        let output = run_command_cancellable("echo", &["ok".to_owned()], None, &cancel, None)
+        let command = platform_command("printf '%s' ok", "[Console]::Out.Write('ok')");
+        let output = run_command_cancellable(command.program, &command.args, None, &cancel, None)
             .expect("should succeed");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("ok"));
@@ -2095,12 +4095,12 @@ mod tests {
 
     #[test]
     fn run_command_preserves_large_stdout_payload() {
-        let output = run_command(
-            "sh",
-            &["-c".to_owned(), "yes x | head -c 200000".to_owned()],
-            None,
-        )
-        .expect("large stdout command should succeed");
+        let command = platform_command(
+            "yes x | head -c 200000",
+            "[Console]::Out.Write('x' * 200000)",
+        );
+        let output = run_command(command.program, &command.args, None)
+            .expect("large stdout command should succeed");
         assert_eq!(
             output.stdout.len(),
             200_000,
@@ -2110,15 +4110,12 @@ mod tests {
 
     #[test]
     fn run_command_preserves_large_stderr_payload_on_failure() {
-        let err = run_command(
-            "sh",
-            &[
-                "-c".to_owned(),
-                "yes e | head -c 200000 >&2; exit 7".to_owned(),
-            ],
-            None,
-        )
-        .expect_err("command should fail with large stderr output");
+        let command = platform_command(
+            "yes e | head -c 200000 >&2; exit 7",
+            "[Console]::Error.Write('e' * 200000); exit 7",
+        );
+        let err = run_command(command.program, &command.args, None)
+            .expect_err("command should fail with large stderr output");
         let text = err.to_string();
         assert!(
             text.len() > 100_000,
@@ -2140,7 +4137,7 @@ mod tests {
             stdout: Vec::new(),
             stderr: b"killed".to_vec(),
         };
-        let result = validate_command_output("signaled-cmd", output);
+        let result = validate_command_output("signaled-cmd", output, &[]);
         assert!(result.is_err(), "signal-killed process should fail");
         let text = result.unwrap_err().to_string();
         // The code falls back to -1 when .code() returns None.

@@ -1,9 +1,24 @@
 # FrankenWhisper for iOS
 
 The browser playground as a native SwiftUI app: download the models once, then
-record or import audio and get a speaker-attributed transcript entirely on
-device — the same pure-Rust engine (`src/native_engine`) the CLI and the
+record or import audio or video and get a speaker-attributed transcript entirely
+on device — the same pure-Rust engine (`src/native_engine`) the CLI and the
 website run, compiled for the phone through the `fw-ios` boundary crate.
+
+Videos from Photos, Files, and the Share sheet keep their pixels on the device.
+AVFoundation extracts a local audio track for the Rust engine; the original
+video is retained only in the app's purgeable cache. Decoder-provided DTW word
+alignment powers an optional Subtitle Studio with a live preview, four polished
+starting looks, font/size/text/highlight/backdrop controls, and word-level
+karaoke glow/pop animation. The burned H.264/QuickTime export can be shared or
+saved to Photos. FrankenWhisper refuses to fabricate karaoke timing when a
+decoder result does not contain real alignment data.
+
+Finished batch transcripts also enter a private, bounded recent-results library:
+the newest 20 Markdown transcripts are retained for up to 14 days and can be
+copied, shared, or deleted individually. Source audio/video, prompts, and
+word-level timing are never copied into that history, and its files are excluded
+from device backups.
 
 ## Building
 
@@ -41,6 +56,27 @@ xcodebuild -exportArchive \
 The export configuration preserves the checked-in marketing version and build
 number instead of letting App Store Connect renumber the binary.
 
+## Live dictation keyboard (1.1)
+
+The containing app now has a low-latency dictation lane backed by the pinned
+74 MB multilingual Whisper tiny package. It keeps an explicitly activated,
+visible microphone session alive for at most one hour, splits speech at
+natural pauses, and decodes each bounded phrase through the same local Rust
+engine. A bundled custom keyboard reads only append-only committed text from an
+App Group and inserts it into the current text field. While listening, the app
+also publishes a normalized level plus 14 real frequency bands so the keyboard
+can render the captured signal without exposing raw microphone samples.
+
+iOS does not allow keyboard extensions to use the microphone. The first Start
+therefore opens FrankenWhisper for one visible activation; after the user
+returns, subsequent Start/Finish commands stay in the keyboard for the life of
+that one-hour session. Between utterances the microphone remains visibly
+active but incoming samples are discarded. The keyboard requires Full Access
+because Apple gates App Group access behind that switch. It uses the expanded
+sandbox only for this local command/transcript handoff: the extension contains
+no network client and never receives audio or model bytes. Background audio
+mode exists solely to keep that explicit recording session alive across apps.
+
 ## How it hangs together
 
 - **`fw-ios/`** (repo root) is the boundary crate: a `staticlib` that mounts
@@ -50,8 +86,9 @@ number instead of letting App Store Connect renumber the binary.
   live-transcript callbacks, cooperative cancel.
 - **Models are downloaded, never bundled** (`Sources/ModelStore.swift`):
   Whisper large-v3-turbo **q8_0** (874 MB, the browser lane's
-  transcript-identical quantization), the Sortformer diarizer package
-  (492 MB + receipt), and the FastEnhancer denoiser (838 KB) — resumable
+  transcript-identical quantization), multilingual Whisper **tiny f16** (74 MB,
+  realtime/keyboard speed lane), the Sortformer diarizer package (492 MB +
+  receipt), and the FastEnhancer denoiser (838 KB) — resumable
   32 MiB ranged downloads, SHA-256 pinned to `site/model-manifest.js`,
   stored in Application Support, excluded from iCloud backup.
 - **Memory**: the q8_0 weights stay block-resident (the `target_os = "ios"`
@@ -61,20 +98,43 @@ number instead of letting App Store Connect renumber the binary.
   (whisper) + 0.5 GB (Sortformer); the entitlement requests the increased
   memory limit, which needs that capability on your signing profile for
   device runs.
-- **Live transcript**: the engine's per-window segment feed and span
+- **Two accuracy classes**: ordinary transcription never changes model or
+  options; it remains on large-v3-turbo with optional denoising, timestamps,
+  and Sortformer. Realtime/keyboard work uses a separate resident tiny handle,
+  greedy text-only decode, and no diarization. `FW_IOS_LIVE_FAST_MODEL=0` is
+  the diagnostic kill switch that routes live work back through the established
+  large-model path.
+- **Live transcript**: the batch engine's per-window segment feed and span
   heartbeat (`src/native_engine/plat.rs`, `ios_hooks`) stream through the
   C callbacks into the UI, so text appears window by window and the progress
   bar counts real `encoder_window` events.
+- **Live / Keyboard AlignAtt**: the host-pushed microphone lane calls
+  `fw_live_decode_pcm` over only the uncommitted utterance slice. Mid-utterance
+  decodes use the core's dynamic encoder context, attention tap, and the exact
+  AlignAtt policy shared with `fw robot listen`, keeping mutable preview text
+  separate from append-only committed text. Endpoint decodes restore full
+  context before committing the remainder.
 - **Speaker names, like the website**: an optional pre-run names field feeds
   Whisper's decoding prompt (so names come out spelled right) and then labels
   the detected `SPEAKER_NN` lanes in order of first appearance; after a run,
   each voice can be renamed in place. Names flow into every export.
+- **Transcribe or translate**: the batch workspace exposes the native Whisper
+  task directly. Source-language transcription remains the default; Translate
+  to English is an explicit opt-in, runs through the same local Rust decoder,
+  and is labeled in the result and human-readable exports.
+- **Advanced decoding without clutter**: a compact disclosure exposes the
+  native engine's byte-identical greedy default, its real beam-5 careful mode,
+  and a bounded in-memory vocabulary/context prompt. Speaker-name prompting is
+  preserved and composed with that context; live keyboard dictation keeps its
+  separate low-latency policy.
 - **Exports**: a styled self-contained HTML page and GitHub-flavored Markdown
   (both matching the browser demo's exports), plus plain text; SRT and JSON
-  live behind the "More" menu.
+  live behind the "More" menu. Video results additionally offer an entirely
+  local caption burn-in with real word-timed karaoke animation.
 - **Capture** is an `AVAudioEngine` tap converted to 16 kHz mono f32
-  (`Sources/AudioRecorder.swift`); imported files decode in Rust via the same
-  symphonia path the browser uses.
+  (`Sources/AudioRecorder.swift`); imported audio decodes in Rust via the same
+  symphonia path the browser uses, while imported video audio is extracted by
+  AVFoundation into a cache-scoped M4A before entering that same engine.
 
 ## Notes
 

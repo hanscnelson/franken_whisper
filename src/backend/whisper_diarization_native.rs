@@ -53,7 +53,7 @@ use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, SpeakerCountRequest, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
 };
-use crate::native_engine::{self, NativeWhisperModel, decode};
+use crate::native_engine::{self, decode};
 use crate::orchestrator::{self, DiarizeReport};
 
 use super::native_audio::analyze_wav;
@@ -84,34 +84,23 @@ pub fn is_available() -> bool {
     super::whisper_cpp_native::is_available()
 }
 
-/// Resolve the effective model spec for a request, or a [`FwError`] explaining
-/// how to provision one. Identical precedence to the whisper.cpp native engine:
+/// Resolve the effective model spec for a request. Identical precedence to the
+/// whisper.cpp native engine:
 /// `request.model`, then `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then the
-/// authenticated default release package, else an actionable
-/// [`FwError::BackendUnavailable`].
-fn effective_model_spec(request: &TranscribeRequest) -> FwResult<String> {
+/// authenticated default release-package sentinel.
+fn effective_model_spec(request: &TranscribeRequest) -> String {
     if let Some(model) = request.model.clone().filter(|m| !m.is_empty()) {
-        return Ok(model);
+        return model;
     }
-    native_engine::configured_or_release_model_spec().map_err(|error| {
-        FwError::BackendUnavailable(format!(
-            "native whisper-diarization engine has no usable local model: pass --model, or set \
-             $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. {error}"
-        ))
-    })
+    native_engine::configured_or_release_model_spec()
 }
 
 /// Build the [`decode::DecodeParams`] for a request. Diarization keeps the
 /// engine's native segment boundaries (no word-level splitting) since the
 /// diarizer assigns one speaker per segment.
 fn decode_params(request: &TranscribeRequest) -> decode::DecodeParams {
-    let n_threads = request
-        .backend_params
-        .threads
-        .map_or_else(native_engine::default_threads, |t| {
-            usize::try_from(t).unwrap_or_else(|_| native_engine::default_threads())
-        });
-    decode::DecodeParams {
+    let n_threads = super::request_compute_threads(request);
+    let mut params = decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
         // Same quality knobs as the sequential native backend: a request prompt
@@ -122,6 +111,7 @@ fn decode_params(request: &TranscribeRequest) -> decode::DecodeParams {
             .prompt
             .clone()
             .filter(|p| !p.is_empty()),
+        carry_initial_prompt: request.backend_params.carry_initial_prompt,
         beam_size: request
             .backend_params
             .decoding
@@ -140,7 +130,9 @@ fn decode_params(request: &TranscribeRequest) -> decode::DecodeParams {
         n_threads,
         max_text_ctx: None,
         ..decode::DecodeParams::default()
-    }
+    };
+    super::apply_native_decode_controls(&mut params, request);
+    params
 }
 
 /// Bridge an optional orchestrator [`CancellationToken`] into the engine's
@@ -218,6 +210,20 @@ fn audio_duration_sec(request: &TranscribeRequest, output: &decode::DecodeOutput
 pub fn run(
     request: &TranscribeRequest,
     normalized_wav: &Path,
+    work_dir: &Path,
+    timeout: Duration,
+    token: Option<&crate::orchestrator::CancellationToken>,
+) -> FwResult<TranscriptionResult> {
+    // `--threads` bounds the model load, the decode and the diarizer alike
+    // (bd-threads-flag-unbounded-f4pq).
+    native_engine::with_compute_threads(super::request_compute_threads(request), || {
+        run_in_compute_pool(request, normalized_wav, work_dir, timeout, token)
+    })?
+}
+
+fn run_in_compute_pool(
+    request: &TranscribeRequest,
+    normalized_wav: &Path,
     _work_dir: &Path,
     _timeout: Duration,
     token: Option<&crate::orchestrator::CancellationToken>,
@@ -231,13 +237,23 @@ pub fn run(
     // failure or disappear behind the silence fast path.
     let speaker_count = validate_speaker_count_capability(request)?;
 
-    // Resolve the model spec up front so an unavailability error is reported
-    // before any expensive work.
-    let spec = effective_model_spec(request)?;
+    // Select the model spec up front. Package authentication stays below the
+    // silence pre-gate so silent clips avoid hashing multi-GB weights.
+    let spec = effective_model_spec(request);
+
+    // Requested audio window (`--offset-ms` / `--duration-ms`): the normalized
+    // PCM is sliced before decode and timestamps are shifted back into the
+    // source timebase, exactly as on whisper.cpp native.
+    let audio_window = super::requested_audio_window(request);
 
     // Silence pre-gate: cheap energy analysis avoids a multi-GB model load on a
-    // pure-silence clip (shared policy with the sibling native engines).
-    let analysis = analyze_wav(normalized_wav, request.backend_params.duration_ms).ok();
+    // pure-silence clip (shared policy with the sibling native engines). The
+    // analyzer scans the whole clip, so a windowed request skips it.
+    let analysis = if audio_window.is_none() {
+        analyze_wav(normalized_wav, None).ok()
+    } else {
+        None
+    };
     if let Some(analysis) = analysis.as_ref()
         && analysis.active_regions.is_empty()
     {
@@ -249,20 +265,47 @@ pub fn run(
     }
 
     // Resolve + load the model (cached). A resolution miss here is unavailable.
-    let model_path = native_engine::resolve_model(&spec)
-        .map_err(|e| FwError::BackendUnavailable(e.to_string()))?;
-    let model = NativeWhisperModel::load(&model_path)?;
+    let is_cancelled = || token.is_some_and(|token| token.checkpoint().is_err());
+    let model_source = native_engine::resolve_model_source_with_cancel(&spec, &is_cancelled)
+        .map_err(|error| match error {
+            error @ FwError::Cancelled(_) => token
+                .and_then(|token| token.checkpoint().err())
+                .unwrap_or(error),
+            error @ FwError::StageTimeout { .. } => error,
+            other => FwError::BackendUnavailable(format!(
+                "{other}; select a model with --model or FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL, or provision the default with `fw pull whisper`"
+            )),
+        })?;
+    let model_path = model_source.path().to_path_buf();
+    let checkpoint = checkpoint_for(token);
+    let model = model_source.load_with_checkpoint(&checkpoint)?;
 
-    let samples = read_normalized_wav(normalized_wav)?;
+    let Some((samples, window_offset_ms)) =
+        super::windowed_samples(read_normalized_wav(normalized_wav)?, audio_window)
+    else {
+        let mut result = silence_result(request, &spec, 0);
+        super::tag_audio_window(&mut result.raw_output, audio_window, true);
+        return Ok(result);
+    };
 
     if let Some(tok) = token {
         tok.checkpoint()?;
     }
 
+    // `--detect-language-only`: report the language without decoding text.
+    if request.backend_params.detect_language_only {
+        let detection = model.detect_language(&samples, &checkpoint)?;
+        return Ok(super::native_language_detection_result(
+            BackendKind::WhisperDiarization,
+            "whisper-diarization-native",
+            &spec,
+            &detection,
+        ));
+    }
+
     // Real ASR: the engine decides what (and when) words were spoken.
     let params = decode_params(request);
-    let checkpoint = checkpoint_for(token);
-    let output = model.transcribe(&samples, &params, &checkpoint)?;
+    let mut output = model.transcribe(&samples, &params, &checkpoint)?;
 
     if let Some(tok) = token {
         tok.checkpoint()?;
@@ -270,18 +313,22 @@ pub fn run(
 
     // Legacy diarization: assign provisional speaker labels from transcript
     // timing/text features. This path cannot fuse soft acoustic count evidence
-    // and never forces cluster collapse from count cardinality alone.
-    let mut segments = output.segments.clone();
+    // and never forces cluster collapse from count cardinality alone. It runs
+    // in the decoded audio's own timebase; a windowed run is shifted after.
     let duration_sec = audio_duration_sec(request, &output);
     let diarize_token = token
         .copied()
         .unwrap_or_else(crate::orchestrator::CancellationToken::unbounded);
     let report = orchestrator::diarize_segments(
-        &mut segments,
+        &mut output.segments,
         duration_sec,
         &speaker_count,
         &diarize_token,
     )?;
+    if window_offset_ms > 0 {
+        super::shift_decode_output(&mut output, window_offset_ms as f64 / 1000.0);
+    }
+    let segments = std::mem::take(&mut output.segments);
 
     let transcript = super::transcript_from_segments(&segments);
     let language = output.language.clone().or_else(|| request.language.clone());
@@ -291,15 +338,23 @@ pub fn run(
     let audio_provenance = analysis
         .as_ref()
         .map(super::native_audio::NativeAudioAnalysis::as_json);
-    let raw_output = raw_output_json(
+    let version_tag = model.version_tag_with_checkpoint(&checkpoint)?;
+    let mut raw_output = raw_output_json(
         &spec,
         &model_path,
-        model.version_tag(),
+        version_tag,
         &output.windows,
         &report,
         audio_provenance,
         false,
     );
+    if let Value::Object(map) = &mut raw_output {
+        map.extend(super::whisper_cpp_native::encoder_provenance_fields(
+            native_engine::encoder_int8_effective_policy_decision(&model.loaded().hparams),
+            &output.work.encoder_executions,
+        ));
+    }
+    super::tag_audio_window(&mut raw_output, audio_window, false);
 
     Ok(TranscriptionResult {
         backend: BackendKind::WhisperDiarization,
@@ -492,6 +547,114 @@ mod tests {
         assert_eq!(dp.beam_size, Some(4));
     }
 
+    #[test]
+    fn decode_params_map_fallback_thresholds_and_audio_ctx_only_when_passed() {
+        use crate::model::DecodingParams;
+        use crate::native_engine::decode::AudioCtxPolicy;
+
+        // No decoding flags: none of the bd-6goy controls are set, so the
+        // engine decodes byte-identically to before (greedy, no ladder).
+        let dp = decode_params(&request());
+        assert_eq!(dp.temperature_fallback, None);
+        assert_eq!(dp.best_of, None);
+        assert_eq!(dp.temperature_increment_milli, None);
+        assert_eq!(dp.logprob_threshold_milli, None);
+        assert_eq!(dp.no_speech_threshold_milli, None);
+        assert_eq!(dp.entropy_threshold_milli, None);
+        assert_eq!(dp.audio_ctx, AudioCtxPolicy::Full);
+
+        let mut req = request();
+        req.backend_params.decoding = Some(DecodingParams {
+            best_of: Some(3),
+            temperature_increment: Some(0.25),
+            entropy_threshold: Some(2.2),
+            logprob_threshold: Some(-0.75),
+            no_speech_threshold: Some(0.65),
+            ..DecodingParams::default()
+        });
+        req.backend_params.audio_ctx = Some(768);
+        let dp = decode_params(&req);
+        assert_eq!(dp.temperature_fallback, Some(true));
+        assert_eq!(dp.best_of, Some(3));
+        assert_eq!(dp.temperature_increment_milli, Some(250));
+        assert_eq!(dp.entropy_threshold_milli, Some(2200));
+        assert_eq!(dp.logprob_threshold_milli, Some(-750));
+        assert_eq!(dp.no_speech_threshold_milli, Some(650));
+        assert_eq!(dp.audio_ctx, AudioCtxPolicy::fixed(768));
+
+        // --no-fallback wins over every flag that would enable the ladder.
+        req.backend_params.no_fallback = true;
+        assert_eq!(decode_params(&req).temperature_fallback, Some(false));
+
+        // --no-speech-threshold alone only moves the silence gate.
+        let mut req = request();
+        req.backend_params.decoding = Some(DecodingParams {
+            no_speech_threshold: Some(0.8),
+            ..DecodingParams::default()
+        });
+        req.backend_params.audio_ctx = Some(0);
+        let dp = decode_params(&req);
+        assert_eq!(dp.temperature_fallback, None);
+        assert_eq!(dp.no_speech_threshold_milli, Some(800));
+        assert_eq!(dp.audio_ctx, AudioCtxPolicy::Full, "0 = full context");
+    }
+
+    #[test]
+    fn native_reports_whisper_cpp_options_it_cannot_honor() {
+        use crate::model::DecodingParams;
+
+        let warnings_for = |req: &TranscribeRequest| {
+            super::super::native_ignored_option_warnings(req, BackendKind::WhisperDiarization)
+        };
+        assert!(warnings_for(&request()).is_empty());
+        let mut req = request();
+        req.backend_params.decoding = Some(DecodingParams {
+            temperature: Some(0.0),
+            ..DecodingParams::default()
+        });
+        assert!(
+            warnings_for(&req).is_empty(),
+            "temperature 0 is exactly the native greedy first pass"
+        );
+        req.backend_params.decoding = Some(DecodingParams {
+            temperature: Some(0.4),
+            max_segment_length: Some(40),
+            ..DecodingParams::default()
+        });
+        // Every native backend implements language-only detection.
+        req.backend_params.detect_language_only = true;
+        req.backend_params.suppress_regex = Some("[0-9]".to_owned());
+        req.backend_params.timestamp_level = Some(crate::model::TimestampLevel::Word);
+        let warnings = warnings_for(&req);
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.starts_with("native engine ignored"))
+        );
+        assert!(warnings.iter().any(|w| w.contains("--temperature")));
+        assert!(warnings.iter().any(|w| w.contains("--max-segment-length")));
+        assert!(warnings.iter().any(|w| w.contains("--suppress-regex")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("--timestamp-level word"))
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("--detect-language-only"))
+        );
+        // The transcription backends regroup words to --max-segment-length
+        // and split them for --timestamp-level word.
+        for resolved in [BackendKind::WhisperCpp, BackendKind::InsanelyFast] {
+            let warnings = super::super::native_ignored_option_warnings(&req, resolved);
+            assert_eq!(warnings.len(), 2, "{resolved:?}: {warnings:?}");
+            assert!(!warnings.iter().any(|w| w.contains("--max-segment-length")));
+            assert!(!warnings.iter().any(|w| w.contains("--timestamp-level")));
+        }
+    }
+
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
         let data_len = (samples.len() * 2) as u32;
         let mut bytes = Vec::with_capacity(44 + data_len as usize);
@@ -531,6 +694,7 @@ mod tests {
             no_speech_prob: 0.01,
             tokens: 5,
             window_offset_sec: offset,
+            token_attn: Vec::new(),
         }
     }
 

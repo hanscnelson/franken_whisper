@@ -284,6 +284,34 @@ The fallback policy is fail-closed, not fail-open:
 - Contract violations increment the adaptive routing calibration penalty for that engine.
 - After `ADAPTIVE_FALLBACK_BRIER_THRESHOLD` (0.35) consecutive poor scores, the engine is deprioritized in routing.
 
+### 6.4 Per-request whisper.cpp decoding controls (bd-6goy)
+
+The native backends map the whisper.cpp decoding flags onto
+`DecodeParams` per request (`backend::apply_native_decode_controls`). A
+request that passes none of them decodes byte-identically to the default
+(greedy, no ladder, whisper.cpp thresholds):
+
+| Flag | Native effect |
+|---|---|
+| `--beam-size N` | beam search on temperature-0 windows (clamped to 1..8) |
+| `--best-of N`, `--temperature-increment X`, `--entropy-threshold X`, `--logprob-threshold X` | enable the quality-gated temperature-fallback ladder for this run, with these values (ladder rungs are `k * X` up to 1.0; `0` = no rungs) |
+| `--no-fallback` | ladder off; wins over every flag above |
+| `--no-speech-threshold X` | moves the silent-window gate only |
+| `--audio-ctx N` (N > 0) | fixed encoder context (`AudioCtxPolicy::fixed`); 0 = full window |
+| `--max-segment-length N` | whisper.cpp `-ml N` when no explicit word-timestamp params are given: 1 = one word per segment, N > 1 = segments of at most N characters regrouped at word boundaries (like `-ml N -sow`); whisper.cpp-native uses attention-DTW word times, insanely-fast-native interpolated ones; the diarization backend keeps engine segments and warns |
+| `--detect-language-only` | every native backend returns the detected language and its top-10 posterior with no transcript; downstream speaker stages skip |
+| `--prompt TEXT` | seeds the first window's carried context (insanely-fast-native: the range starting at window 0) |
+| `--carry-initial-prompt` | `DecodeParams::carry_initial_prompt`: the prompt's last `max(1, ctx - 1)` tokens prefix every window's carried prompt and the rolling decoded context fills the rest (whisper.cpp `prompt_past0`); the short-tail clear drops both, and tiny.en's segment-timestamp policy drops only the rolling part |
+| `--timestamp-level word` | one segment per word on whisper.cpp-native and insanely-fast-native; the diarization backend keeps engine segments and warns |
+
+`FW_TEMP_FALLBACK` / `FW_TEMP_BEST_OF` / `FW_BEAM_SIZE` remain the process-wide
+operator hatches (`FW_TEMP_FALLBACK` only applies when the request makes no
+explicit choice). Flags the engine cannot honor — `--temperature > 0` (the
+first pass is greedy), `--word-threshold`, `--suppress-regex` — are reported
+as run warnings (`native engine ignored
+unsupported option ...`) instead of being dropped silently. The CLI rejects non-finite thresholds, a negative
+`--temperature`, a `--temperature-increment` outside [0, 1], and `--best-of 0`.
+
 ## 7. Implementation Guidance
 
 ### 7.1 File Organization
@@ -372,15 +400,16 @@ Set `FRANKEN_WHISPER_PERF_SPANS=1` to emit per-stage timing spans
 `version_tag`, …) on stderr as NDJSON, for the profile-driven optimization
 loop. Off by default (zero overhead — a single `OnceLock`-cached env read).
 
-### 8.3 Tail-truncation kill switch
+### 8.3 Tail-truncation opt-in
 
-`FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE=0` (or `false`, read once via
-`OnceLock`) disables the default-on tail-window encoder-context truncation,
-restoring exact full-pad (3000-frame / 1500-ctx) behavior — verified
-byte-identical to the goldens for both tiny.en and large-v3-turbo. The
-lever mirrors whisper.cpp's sanctioned `audio_ctx` / `-ac` optimization,
-never touches the content-bearing first window, and confines its output
-divergence to spurious trailing-silence hallucinations on tail windows.
+Tail-window encoder-context truncation is **off by default**: every window,
+including a file's short final window, runs the full-pad (3000-frame /
+1500-ctx) encoder pass exactly like whisper.cpp's default. Setting
+`FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE` to any value other than `0`/`false`
+(read once via `OnceLock`) opts in to the `audio_ctx`-style truncation of
+non-first partial windows — faster, but measured to hallucinate repeated
+content in short final windows and to stretch final end timestamps, so it
+is not transcript-equivalent.
 Full accuracy/precision analysis: `DISCREPANCIES.md` **DISC-004**.
 
 ### 8.4 Promotion-criteria status (RTF gate)
@@ -401,7 +430,12 @@ stable `schema_version` string (`SCHEMA_VERSION` in
 `src/backend/whisper_cpp_native.rs`, currently **`native-v2`**). Agents key off
 `schema_version` first; unknown values should be treated as forward-incompatible.
 Bump the version only on a breaking field change (rename/removal/semantic shift),
-never on additive fields.
+never on additive fields. bd-nt0d stayed on `native-v2`: `encoder_execution`
+is additive, and `encoder_route` keeps its name, type and values. It now
+describes the run rather than the process (the same value whenever one run is
+in flight, which is every CLI single-input run), and it is omitted where one
+value would be false (no forward, or several routes), as other fields already
+are on the silence path.
 
 ### 9.1 Full result (model was run)
 
@@ -415,22 +449,71 @@ never on additive fields.
 | `model` | string | Model spec as requested (e.g. `tiny.en`). |
 | `model_path` | string | Resolved on-disk ggml path. |
 | `model_version_tag` | string | `fw-native-v1+sha256:<12 hex>` content hash of the model file (replay identity). |
-| `encoder_int8_policy` | object | The calibrated encoder-quantization decision (see §9.2). |
+| `encoder_int8_policy` | object | The calibrated encoder-quantization decision (see §9.2). A decision, not a record of what ran. |
+| `encoder_execution` | array | What this run's encoder forwards ran (see §9.2a): one entry per distinct route and arithmetic. Empty when the request ran no encoder forward (a transcription-cache hit, or a follower of an identical batch job). |
+| `encoder_route` | string *(optional)* | The route every encoder forward of **this run** took: `"gpu_fused_stem"` / `"gpu_fused"` (macOS Metal) or `"cpu:<reason the GPU route was declined>"`. Absent when no forward ran or the forwards took different routes (`encoder_execution` then lists each). |
 | `windows` | array | Per-decode-window stats (see §9.3). |
 | `dropped_windows` | array | Long-form windows discarded with no transcript output (see §9.4, bd-nqzf). Empty on healthy runs. |
 | `decode_work` | object | Recovery counters: `prompt_reset_retries`, `temperature_fallback_retries`. |
 | `word_timestamps` | string | `"dtw"` (real cross-attention DTW alignment, bd-rjsx), `"interpolated"` (segment-proportional), or `"none"`. |
-| `audio_window` | object *(optional)* | Present only on `--offset-ms`/`--duration-ms` runs: `offset_ms`, `duration_ms`, `timebase: "source"` (bd-vgod). Timestamps stay in the source-file timebase. |
+| `audio_window` | object *(optional)* | Present only on `--offset-ms`/`--duration-ms` runs: `offset_ms`, `duration_ms`, `timebase: "source"` (bd-vgod). Timestamps stay in the source-file timebase. All three native backends honor the window. |
+| `diarization_word_units` | object *(optional)* | Present when DTW word units were produced only for native diarization (no word-level output requested): `units` and, per engine segment, `unit_start`/`unit_end`/`start_sec`/`end_sec`/`text`. After diarization the orchestrator collapses the units back into the engine's segments, split only where the attributed speaker changes (event `orchestration.segments_regrouped`); `projection_timeline.output_segments` then counts the regrouped segments. |
 
 ### 9.2 `encoder_int8_policy` object
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `action` | string | `"f32"` (full-precision encoder) or `"quality_safe_int8"` (calibrated int8). |
-| `reason` | string | Human-readable rationale for the chosen action. |
-| `calibration_id` | string | Identifier of the calibration record that gated the int8 decision. |
-| `corpus_wer_delta_budget` | number | WER-delta budget the calibration was admitted under. |
+| `action` | string | `"f32"` (full-precision encoder, the default) or `"quality_safe_int8"` (int8 encoder). |
+| `reason` | string | Why: `"calibration_wer_budget_exceeded"` (calibrated model whose measured delta is over budget; the current default for `tiny.en` and `large-v3-turbo` on x86_64 AVX2), `"calibrated_model_budget_pass"` (measured delta within budget), `"uncalibrated_model_fallback"`, `"cpu_feature_fallback"` (the AVX2 int8 kernels are not compiled: non-AVX2 and non-x86 builds; `FW_ENC_ATTN_OUT_I8I32=1` still runs the int8 arm there through the portable scalar kernels), `"operator_forced_quality_safe_int8"` (`FW_ENC_ATTN_OUT_I8I32=1`) or `"operator_f32_kill_switch"` (`=0`). |
+| `calibration_id` | string | Identifier of the calibration record behind the default (`docs/PERF_LEDGER.md`). |
+| `corpus_wer_delta_budget` | number | Largest corpus WER delta (int8 minus f32) that admits the int8 default. |
+| `measured_corpus_wer_delta` | number or null | The calibration's measured delta for this model; `null` for an uncalibrated shape. |
 | `quant_rel_rmse_budget` | number | Relative-RMSE budget for the quantized weights. |
+
+The default is the f32 encoder on every target; the int8 encoder is an
+operator opt-in (`docs/planning/DISCREPANCIES.md` DISC-010). The decision
+selects the CPU encoder's weights, and the older owner gates
+(`FRANKEN_WHISPER_ENC_INT8`, `FW_ENC_INT8_ATTN_IN`, and `FW_ENC_INT8_FC1`
+when the decision is f32) override it. The macOS Metal encoder, used for
+models of width ≥ 1024 when available, never runs the int8 kernels, whatever
+`action` says: its matmuls take the checkpoint's f16 weights and f16-rounded
+activations with f32 accumulation (whisper.cpp's Metal GEMM precision), its
+attention rounds keys and values to f16, and layer norm and GELU run in f32.
+`encoder_execution` records what actually ran.
+`fw capabilities --json` reports the same per-model defaults, the process
+override and the Metal encoder's arithmetic under
+`native_compute.encoder_precision`.
+
+### 9.2a `encoder_execution[]` element (bd-nt0d)
+
+Each encoder forward returns what computed it; the run's record counts them,
+so concurrent runs in one process (batch lanes, `listen` sessions, library
+callers) never report each other's route. The insanely-fast backend merges
+the records of its parallel ranges.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `route` | string | `"gpu_fused_stem"`, `"gpu_fused"` or `"cpu:<reason>"`, as for `encoder_route`. |
+| `encoder_calls` | integer | Forwards of this run that took this route and arithmetic. |
+| `precision` | object | The arithmetic of each GEMM family: `conv_stem`, `attn_qkv`, `attention` (the `Q·Kᵀ` and `·V` products), `attn_out`, `mlp_fc1`, `mlp_fc2`. |
+| `precision_source` | string | What chose `precision`: `"metal_encoder"` on the Metal routes, else the gate that picked the CPU weights: `"encoder_int8_policy"`, `"FRANKEN_WHISPER_ENC_INT8"`, `"FW_ENC_INT8_ATTN_IN"` or `"FW_ENC_INT8_FC1"`. |
+
+`precision` values: `"f32"` (f32 operands and accumulation; on the CPU the
+attention softmax of large-v3-turbo uses the polynomial `exp`,
+`FW_SDPA_POLY_EXP`); `"i7"` (7-bit integer weights, u8-quantized activations,
+i32 accumulation); `"i8"` (8-bit integer weights, i8-quantized activations,
+i32 accumulation; the quality-safe `attn_out`); `"f16"` (f16 weights and
+f16-rounded activations, f32 accumulation; the Metal encoder's simdgroup
+GEMM); `"f16_weights"` (f16 weights, f32 activations, f32 accumulation; the
+wasm32/iOS f16-resident arm, and the Metal encoder under
+`FT_METAL_SG_GEMM=0`); `"q8_0_weights"` (q8_0 block weights dequantized to
+f32; wasm32/iOS); `"f16_kv"` (attention only: f32 queries, f16-rounded keys
+and values, f32 softmax and accumulation; the Metal FlashAttention kernel,
+`"f32"` under `FT_METAL_FLASH_V1=1`); `"mixed"` (the layers of one family
+differ). The Metal values mirror the kernel switches ft-kernel-metal reads at
+dispatch. The feasibility harnesses `FW_ENC_WEIGHT_ROUNDTRIP` and
+`FW_ENC_ACT_ROUNDTRIP` (f32 GEMMs over int8-rounded values) are not
+distinguished from `"f32"`.
 
 ### 9.3 `windows[]` element
 
@@ -471,9 +554,10 @@ empty `windows` array, and `word_timestamps: "none"`, plus two silence-only fiel
 | `duration_ms` | integer | Clip duration measured by the pre-gate. |
 
 Because no model was loaded, the silence variant **omits** `model_path`,
-`model_version_tag`, `encoder_int8_policy`, and (on the model-resolution-failure
-path) may also omit them. Consumers must treat those three as optional and gate on
-`model_loaded` / `silence` before reading them.
+`model_version_tag`, `encoder_int8_policy`, `encoder_execution` and
+`encoder_route`, and (on the model-resolution-failure path) may also omit them.
+Consumers must treat those fields as optional and gate on `model_loaded` /
+`silence` before reading them.
 
 ## 10. References
 

@@ -19,9 +19,9 @@
 //! # yt-dlp CLI contract (agent-verified cheat-sheet, see the bd-27v1 epic)
 //!
 //! - probe:    `--version`                (prints `YYYY.MM.DD`)
-//! - expand:   `--flat-playlist --dump-json --no-warnings URL`
-//! - metadata: `-j --no-simulate --no-playlist --no-warnings URL`
-//! - download: `-f ba --no-playlist --no-warnings --no-progress`
+//! - expand:   `--flat-playlist --dump-json --simulate --no-warnings URL`
+//! - metadata: `-j --simulate --no-playlist --no-warnings URL`
+//! - download: `-f bestaudio/best --no-playlist --no-warnings --no-progress`
 //!   `-o '<dest>/%(id)s.%(ext)s' --print after_move:filepath`
 //!   `--sleep-interval 2 --max-sleep-interval 5 --retries 10 URL`
 //!
@@ -55,6 +55,10 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(120);
 const EXPAND_TIMEOUT: Duration = Duration::from_secs(300);
 /// Downloads can legitimately run long (politeness sleeps + retries).
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3600);
+/// Defensive upper bound for a projected video id. Real YouTube ids are much
+/// shorter; this keeps malformed external-tool metadata from defeating the
+/// artifact filename component budget.
+const MAX_VIDEO_ID_BYTES: usize = 128;
 
 /// Resolved `yt-dlp` tool: absolute path, parsed version, staleness flag.
 ///
@@ -96,10 +100,216 @@ pub struct VideoRef {
     pub duration_sec: Option<f64>,
 }
 
+/// One curated result from `fw youtube search` / `fw youtube enrich`
+/// (bd-j2lh / bd-m7fv): the retained subset of yt-dlp's object that an agent
+/// needs to triage a video without a second fetch. Serialized as JSON on
+/// stdout; `None`-valued optional fields are omitted so agents never parse
+/// null placeholders.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SearchHit {
+    /// Stable YouTube video id.
+    pub id: String,
+    /// Video title (may be empty for restricted entries).
+    pub title: String,
+    /// Canonical watch URL.
+    pub url: String,
+    /// Duration in seconds, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_sec: Option<f64>,
+    /// Channel name, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// View count, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_count: Option<u64>,
+    /// Upload date in `YYYYMMDD` form, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_date: Option<String>,
+}
+
+/// Projected subset parsed from one yt-dlp search line. Works for BOTH the
+/// enriched per-video dump and the flat-playlist dump — every field except
+/// the id is optional.
+#[derive(serde::Deserialize)]
+struct ProjectedSearchEntry {
+    #[serde(default)]
+    id: serde_json::Value,
+    #[serde(default)]
+    title: serde_json::Value,
+    #[serde(default)]
+    url: serde_json::Value,
+    #[serde(default)]
+    webpage_url: serde_json::Value,
+    #[serde(default)]
+    duration: serde_json::Value,
+    #[serde(default)]
+    channel: serde_json::Value,
+    #[serde(default)]
+    view_count: serde_json::Value,
+    #[serde(default)]
+    upload_date: serde_json::Value,
+}
+
+fn search_hit_from_entry(entry: &ProjectedSearchEntry) -> Option<SearchHit> {
+    let id = non_empty_json_string(entry.id.clone())?;
+    let url = non_empty_json_string(entry.webpage_url.clone())
+        .or_else(|| non_empty_json_string(entry.url.clone()))
+        .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
+    Some(SearchHit {
+        title: non_empty_json_string(entry.title.clone()).unwrap_or_default(),
+        url,
+        duration_sec: entry.duration.as_f64(),
+        channel: non_empty_json_string(entry.channel.clone()),
+        view_count: entry.view_count.as_u64(),
+        upload_date: non_empty_json_string(entry.upload_date.clone()),
+        id,
+    })
+}
+
+/// Search YouTube through the probed yt-dlp binary: `ytsearch{limit}:query`
+/// dumped as per-result JSON lines with explicit `--simulate`, so a user
+/// configuration containing `--no-simulate` cannot turn this metadata-only
+/// operation into a media download. Enriched mode (default) retains the
+/// curated [`SearchHit`] field set; `--flat` keeps the flat-playlist subset.
+/// Hits are deduplicated by id preserving first-seen order, capped at `limit`.
+///
+/// # Errors
+///
+/// Propagates [`run_ytdlp`] errors (including the capture-cap too-large
+/// mapping shared with [`expand_playlist`]); per-line parse failures are
+/// skipped with a warning, never fatal.
+pub fn search(
+    info: &YtdlpInfo,
+    query: &str,
+    limit: usize,
+    flat: bool,
+    token: &CancellationToken,
+) -> FwResult<Vec<SearchHit>> {
+    if query.trim().is_empty() {
+        return Err(FwError::InvalidRequest("empty search query".to_owned()));
+    }
+    if limit == 0 {
+        return Err(FwError::InvalidRequest(
+            "--limit must be at least 1".to_owned(),
+        ));
+    }
+    let target = format!("ytsearch{limit}:{query}");
+    let mut args = vec![
+        "--dump-json".to_owned(),
+        "--simulate".to_owned(),
+        "--no-warnings".to_owned(),
+        "--".to_owned(),
+        target,
+    ];
+    if flat {
+        args.insert(0, "--flat-playlist".to_owned());
+    }
+    let output = run_ytdlp(info, &args, token, EXPAND_TIMEOUT)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut hits = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match serde_json::from_str::<ProjectedSearchEntry>(line) {
+            Ok(entry) => {
+                if let Some(hit) = search_hit_from_entry(&entry)
+                    && seen.insert(hit.id.clone())
+                {
+                    hits.push(hit);
+                    if hits.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "skipping unparseable search line ({err}): {}",
+                    truncate_for_log(line)
+                );
+            }
+        }
+    }
+    Ok(hits)
+}
+
+/// Enrich specific video URLs or ids with full metadata via repeated
+/// [`fetch_metadata`] calls, returning deduplicated [`SearchHit`]s in
+/// first-seen order. Playlist URLs are rejected with an actionable error —
+/// ingest playlists through `fw youtube run` instead.
+///
+/// # Errors
+///
+/// Propagates the first [`fetch_metadata`] error; playlist inputs yield
+/// [`FwError::InvalidRequest`].
+pub fn enrich(
+    info: &YtdlpInfo,
+    targets: &[String],
+    token: &CancellationToken,
+) -> FwResult<Vec<SearchHit>> {
+    let mut hits = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for target in targets {
+        let trimmed = target.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // A bare 11-char video id is accepted and canonicalized into a watch
+        // URL (yt-dlp itself only understands URLs). 11 chars of
+        // [A-Za-z0-9_-] is exactly YouTube's id alphabet; anything else is
+        // left for classify_url to accept or reject as a URL.
+        let target_owned;
+        let target_ref: &str = {
+            let is_bare_id = trimmed.len() == 11
+                && trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                && classify_url(&format!("https://www.youtube.com/watch?v={trimmed}")).is_ok();
+            if is_bare_id {
+                target_owned = format!("https://www.youtube.com/watch?v={trimmed}");
+                target_owned.as_str()
+            } else {
+                trimmed
+            }
+        };
+        match classify_url(target_ref)? {
+            UrlKind::Video | UrlKind::Ambiguous => {
+                let meta = fetch_metadata(info, target_ref, token)?;
+                if seen.insert(meta.id.clone()) {
+                    hits.push(SearchHit {
+                        id: meta.id.clone(),
+                        title: meta.title.clone(),
+                        url: meta.webpage_url.clone(),
+                        duration_sec: meta.duration_sec,
+                        channel: meta.channel.clone(),
+                        view_count: None,
+                        upload_date: meta.upload_date.clone(),
+                    });
+                }
+            }
+            UrlKind::Playlist => {
+                return Err(FwError::InvalidRequest(format!(
+                    "`{target_ref}` classified as Playlist; enrich takes individual video \
+                     URLs or ids — ingest playlists through `fw youtube run` instead"
+                )));
+            }
+        }
+    }
+    Ok(hits)
+}
+
+/// Deduplicate hits by id preserving first-seen order (shared by CLI merge
+/// paths that combine search + enrich streams).
+#[must_use]
+pub fn dedup_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    let mut seen = std::collections::HashSet::new();
+    hits.into_iter()
+        .filter(|hit| seen.insert(hit.id.clone()))
+        .collect()
+}
+
 /// Full per-video metadata fetched via `yt-dlp -j`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VideoMeta {
-    /// Stable YouTube video id.
+    /// Stable YouTube video id, validated as bounded ASCII `[A-Za-z0-9_-]`.
     pub id: String,
     /// Video title.
     pub title: String,
@@ -233,7 +443,7 @@ pub fn is_stale(version_date: NaiveDate, today: NaiveDate) -> bool {
 /// Recognized YouTube forms:
 /// - `watch?v=ID`                  -> [`UrlKind::Video`]
 /// - `youtu.be/ID`                 -> [`UrlKind::Video`]
-/// - `shorts/ID`, `live/ID`        -> [`UrlKind::Video`]
+/// - `shorts/ID`, `live/ID`, `embed/ID` -> [`UrlKind::Video`]
 /// - `playlist?list=ID`            -> [`UrlKind::Playlist`]
 /// - `watch?v=X&list=Y`            -> [`UrlKind::Ambiguous`] (treated as Video)
 ///
@@ -250,8 +460,12 @@ pub fn classify_url(url: &str) -> FwResult<UrlKind> {
             "empty URL; expected a YouTube video or playlist URL".to_owned(),
         ));
     }
+    // A URL fragment is client-side navigation metadata, never part of a
+    // YouTube video or playlist identifier. Strip it before parsing while
+    // retaining the original input in diagnostics.
+    let parsed = strip_url_fragment(trimmed);
 
-    let (host, rest) = split_host_and_rest(trimmed).ok_or_else(|| {
+    let (host, rest) = split_host_and_rest(parsed).ok_or_else(|| {
         FwError::InvalidRequest(format!(
             "not a recognized URL: `{trimmed}`; expected a YouTube video or playlist URL"
         ))
@@ -284,10 +498,11 @@ pub fn classify_url(url: &str) -> FwResult<UrlKind> {
     };
     let path = path.trim_start_matches('/');
 
-    // /shorts/ID and /live/ID are always single videos.
+    // /shorts/ID, /live/ID, and /embed/ID are always single videos.
     if let Some(id) = path
         .strip_prefix("shorts/")
         .or_else(|| path.strip_prefix("live/"))
+        .or_else(|| path.strip_prefix("embed/"))
     {
         let id = id.split('/').next().unwrap_or_default();
         if id.is_empty() {
@@ -340,7 +555,7 @@ pub fn classify_url(url: &str) -> FwResult<UrlKind> {
 
     Err(FwError::InvalidRequest(format!(
         "unrecognized YouTube URL shape: `{trimmed}`; \
-         expected watch?v=, youtu.be/, shorts/, live/, or playlist?list="
+         expected watch?v=, youtu.be/, shorts/, live/, embed/, or playlist?list="
     )))
 }
 
@@ -357,24 +572,26 @@ pub fn classify_url(url: &str) -> FwResult<UrlKind> {
 /// - `youtu.be/ID` (with an optional `?t=`/`&`/trailing-path tail)
 /// - `shorts/ID`, `live/ID`, `embed/ID`
 ///
-/// Returns `None` for playlist URLs, non-YouTube hosts, or any shape without a
-/// recoverable id. Callers that already classified a URL as `Video`/`Ambiguous`
-/// can treat `None` as a (should-not-happen) signal to fall back to a single
-/// metadata fetch for correctness.
+/// Percent-encoded ASCII id characters are decoded before the id is returned,
+/// so equivalent raw and encoded URLs share one deduplication / manifest key.
+/// Returns `None` for playlist URLs, non-YouTube hosts, or any shape whose id
+/// cannot be recovered as YouTube's ASCII `[A-Za-z0-9_-]+` alphabet. Callers
+/// that already classified a URL as `Video`/`Ambiguous` must fall back to a
+/// single metadata fetch when this returns `None`.
 #[must_use]
 pub fn extract_video_id(url: &str) -> Option<String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let (host, rest) = split_host_and_rest(trimmed)?;
+    let (host, rest) = split_host_and_rest(strip_url_fragment(trimmed))?;
     let host = host.to_ascii_lowercase();
 
     // youtu.be/ID short links: the first path segment is the id.
     if host == "youtu.be" {
         let id = rest.trim_start_matches('/');
         let id = id.split(['?', '&', '/']).next().unwrap_or_default();
-        return non_empty_id(id);
+        return canonical_video_id_component(id);
     }
 
     if !is_youtube_host(&host) {
@@ -394,26 +611,64 @@ pub fn extract_video_id(url: &str) -> Option<String> {
         .or_else(|| path.strip_prefix("embed/"))
     {
         let id = id.split('/').next().unwrap_or_default();
-        return non_empty_id(id);
+        return canonical_video_id_component(id);
     }
 
     // /watch?v=ID (&list=Y): the `v=` param is the single video, per
     // --no-playlist. A bare /watch?list= with no v= is a playlist -> None.
     if path == "watch" {
-        return query_param_value(query, "v").and_then(non_empty_id);
+        return query_param_value(query, "v").and_then(canonical_video_id_component);
     }
 
     // Any other path: accept a `v=` query if present (mirrors classify_url's
     // permissive tail), otherwise no id.
-    query_param_value(query, "v").and_then(non_empty_id)
+    query_param_value(query, "v").and_then(canonical_video_id_component)
 }
 
-/// Return `Some(id)` when `id` is non-empty, else `None`.
-fn non_empty_id(id: &str) -> Option<String> {
+/// Remove the client-side fragment from a URL before classifying or
+/// extracting server-side YouTube identifiers.
+fn strip_url_fragment(url: &str) -> &str {
+    url.split_once('#').map_or(url, |(base, _)| base)
+}
+
+/// Decode a syntactically recoverable YouTube id component into the canonical
+/// ASCII alphabet used by metadata and download filenames. Restricting percent
+/// escapes to that alphabet prevents encoded path/query delimiters from being
+/// mistaken for part of an id; those inputs take the authoritative metadata
+/// fallback instead.
+fn canonical_video_id_component(id: &str) -> Option<String> {
     if id.is_empty() {
-        None
-    } else {
-        Some(id.to_owned())
+        return None;
+    }
+
+    let bytes = id.as_bytes();
+    let mut canonical = String::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let value = if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            index += 3;
+            (hex_nibble(high)? << 4) | hex_nibble(low)?
+        } else {
+            let value = bytes[index];
+            index += 1;
+            value
+        };
+        if !(value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-')) {
+            return None;
+        }
+        canonical.push(char::from(value));
+    }
+    Some(canonical)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -429,12 +684,20 @@ fn query_param_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-/// Split a URL into `(host, rest)` where `rest` is everything after the host
-/// (path + query). Tolerates a missing scheme. Returns `None` when no host can
-/// be isolated.
+/// Split an HTTP(S) or scheme-less URL into `(host, rest)` where `rest` is
+/// everything after the host (path + query). Returns `None` for unsupported
+/// explicit schemes or when no host can be isolated.
 fn split_host_and_rest(url: &str) -> Option<(&str, &str)> {
-    // Strip scheme if present.
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let after_scheme = match url.split_once("://") {
+        Some((scheme, _)) if !has_explicit_scheme_syntax(scheme) => url,
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            rest
+        }
+        Some(_) => return None,
+        None => url,
+    };
     if after_scheme.is_empty() {
         return None;
     }
@@ -446,6 +709,12 @@ fn split_host_and_rest(url: &str) -> Option<(&str, &str)> {
     }
     let rest = &after_scheme[host_end..];
     Some((host, rest))
+}
+
+fn has_explicit_scheme_syntax(prefix: &str) -> bool {
+    let mut bytes = prefix.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
 /// Return `true` when `host` is a YouTube web host (ignoring a `www.`/`m.`
@@ -471,9 +740,11 @@ fn query_has_nonempty_param(query: &str, name: &str) -> bool {
 
 /// Expand a playlist URL into its constituent [`VideoRef`]s.
 ///
-/// Runs `yt-dlp --flat-playlist --dump-json --no-warnings URL` and parses the
-/// JSON-lines output. Lines that fail to parse (or lack an `id`) are skipped
-/// with a warning rather than failing the whole expansion.
+/// Runs `yt-dlp --flat-playlist --dump-json --simulate --no-warnings URL` and
+/// parses the JSON-lines output. Explicit simulation prevents a user config
+/// from turning playlist discovery into a media download. Lines that fail to
+/// parse (or lack an `id`) are skipped with a warning rather than failing the
+/// whole expansion.
 ///
 /// # Errors
 ///
@@ -487,6 +758,7 @@ pub fn expand_playlist(
     let args = vec![
         "--flat-playlist".to_owned(),
         "--dump-json".to_owned(),
+        "--simulate".to_owned(),
         "--no-warnings".to_owned(),
         // `--` stops yt-dlp option parsing: a hostile URL (e.g. a
         // playlist-entry `url` field starting with `-`) can never be read as a
@@ -589,6 +861,25 @@ fn non_empty_json_string(value: serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(value) if !value.is_empty() => Some(value),
         _ => None,
+    }
+}
+
+/// Validate a full-metadata video id before it can reach download templates or
+/// artifact naming. The renderer appends this value to a path component, so
+/// accepting separators, controls, whitespace, or an unbounded string here
+/// would violate the path-ownership contract downstream.
+fn validate_video_id(id: String) -> FwResult<String> {
+    if !id.is_empty()
+        && id.len() <= MAX_VIDEO_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        Ok(id)
+    } else {
+        Err(FwError::InvalidRequest(format!(
+            "yt-dlp metadata contains an invalid video id; expected 1..={MAX_VIDEO_ID_BYTES} ASCII characters from [A-Za-z0-9_-]"
+        )))
     }
 }
 
@@ -744,7 +1035,7 @@ impl<'de> serde::Deserialize<'de> for ProjectedVideoMetadata {
 
 /// Fetch full metadata for a single video via `yt-dlp -j`.
 ///
-/// Runs `yt-dlp -j --no-simulate --no-playlist --no-warnings URL`. Live and
+/// Runs `yt-dlp -j --simulate --no-playlist --no-warnings URL`. Live and
 /// upcoming streams are rejected with a clear [`FwError::Unsupported`] because
 /// they cannot be transcribed as a finished recording.
 ///
@@ -759,7 +1050,11 @@ pub fn fetch_metadata(
 ) -> FwResult<VideoMeta> {
     let args = vec![
         "-j".to_owned(),
-        "--no-simulate".to_owned(),
+        // Keep this explicit even though `-j` normally implies simulation.
+        // `--no-simulate` reverses that implication and downloads media while
+        // printing metadata, leaking an unowned artifact into the caller's
+        // working directory before the pipeline's owned download step.
+        "--simulate".to_owned(),
         "--no-playlist".to_owned(),
         "--no-warnings".to_owned(),
         // `--` stops yt-dlp option parsing: a hostile URL (e.g. a
@@ -799,6 +1094,7 @@ fn parse_video_meta(line: &str) -> FwResult<VideoMeta> {
     let id = non_empty_json_string(metadata.id).ok_or_else(|| {
         FwError::InvalidRequest("yt-dlp metadata is missing an `id` field".to_owned())
     })?;
+    let id = validate_video_id(id)?;
     let title = non_empty_json_string(metadata.title).unwrap_or_default();
     let webpage_url = non_empty_json_string(metadata.webpage_url)
         .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
@@ -823,6 +1119,7 @@ fn video_meta_from_json(value: &serde_json::Value) -> FwResult<VideoMeta> {
     let id = string_field(value, "id").ok_or_else(|| {
         FwError::InvalidRequest("yt-dlp metadata is missing an `id` field".to_owned())
     })?;
+    let id = validate_video_id(id)?;
     let title = string_field(value, "title").unwrap_or_default();
     let webpage_url = string_field(value, "webpage_url")
         .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
@@ -849,7 +1146,7 @@ fn video_meta_from_json(value: &serde_json::Value) -> FwResult<VideoMeta> {
 /// path to the downloaded file.
 ///
 /// Runs:
-/// `yt-dlp -f ba --no-playlist --no-warnings --no-progress`
+/// `yt-dlp -f bestaudio/best --no-playlist --no-warnings --no-progress`
 /// `-o '<dest_dir>/%(id)s.%(ext)s' --print after_move:filepath`
 /// `--sleep-interval 2 --max-sleep-interval 5 --retries 10 URL`
 ///
@@ -859,12 +1156,15 @@ fn video_meta_from_json(value: &serde_json::Value) -> FwResult<VideoMeta> {
 /// # Cancellation
 ///
 /// Execution flows through [`run_command_cancellable`], which polls `token` on
-/// every iteration and kills the child process when the token fires. For
-/// best-audio (`-f ba`) downloads yt-dlp does **not** normally spawn an
-/// `ffmpeg` child (no `-x` re-encode is requested). Cancellation currently
-/// guarantees termination and reaping of the direct yt-dlp process only;
-/// process-tree termination for an unexpectedly inherited descendant remains
-/// a separate contract gap. A token firing maps to [`FwError::Cancelled`].
+/// every iteration. Ordinary CLI invocations launch yt-dlp in a fresh
+/// caller-owned process group (or Windows Job Object) and terminate that tree
+/// when the token fires. A Unix worker that already belongs to an externally
+/// owned process tree instead keeps nested descendants in the outer group,
+/// reaps the direct yt-dlp child locally, and leaves recursive termination to
+/// that outer owner. Unsupported bounded-tree platforms fail before launch.
+/// After successful cleanup, a token firing maps to [`FwError::Cancelled`]; a
+/// cleanup-certification failure instead surfaces as
+/// [`FwError::ContractViolation`].
 ///
 /// # Errors
 ///
@@ -917,7 +1217,7 @@ pub fn download_audio(
         .filter(|line| !line.is_empty())
         .rev()
         .map(PathBuf::from)
-        .find(|candidate| candidate.is_file());
+        .find(|candidate| is_reusable_download_path(candidate, dest_dir, &meta.id));
 
     if let Some(path) = printed {
         return Ok(path);
@@ -936,15 +1236,63 @@ pub fn download_audio(
 
 /// Scan `dest_dir` for a file whose stem equals `id` (the template names
 /// downloads `<id>.<ext>`).
-fn find_downloaded_by_id(dest_dir: &Path, id: &str) -> Option<PathBuf> {
+pub(crate) fn find_downloaded_by_id(dest_dir: &Path, id: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dest_dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() && path.file_stem().and_then(|s| s.to_str()) == Some(id) {
+        if is_reusable_download_path(&path, dest_dir, id) {
             return Some(path);
         }
     }
     None
+}
+
+/// Whether `path` is a completed, regular download owned by `dest_dir` for
+/// this exact video id. Partial yt-dlp artifacts and symlinks are never resume
+/// inputs.
+pub(crate) fn is_reusable_download_path(path: &Path, dest_dir: &Path, id: &str) -> bool {
+    // Keep this aligned with yt-dlp's audio/video `MEDIA_EXTENSIONS`. The
+    // `bestaudio/best` fallback can legitimately return a video container
+    // (including legacy `.flv`) when no audio-only stream exists, and ffmpeg
+    // normalization handles those containers. Manifests, subtitles,
+    // thumbnails, and partial-download suffixes are intentionally absent.
+    const REUSABLE_MEDIA_EXTENSIONS: &[&str] = &[
+        "3g2", "3gp", "aac", "aif", "aiff", "alac", "ape", "asf", "avi", "divx", "f4a", "f4b",
+        "f4v", "flac", "flv", "m4a", "m4b", "m4r", "m4v", "mka", "mk3d", "mkv", "mov", "mp3",
+        "mp4", "mpg", "oga", "ogg", "ogv", "ogx", "opus", "spx", "vorbis", "wav", "weba", "webm",
+        "wma", "wmv", "wv",
+    ];
+
+    if !is_completed_owned_download_path(path, dest_dir, id) {
+        return false;
+    }
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    REUSABLE_MEDIA_EXTENSIONS
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+}
+
+/// Validate the ownership and completed-file portion of the reusable-download
+/// contract. Callers additionally classify the extension before accepting the
+/// path as media, so first-run and resume behavior cannot diverge.
+fn is_completed_owned_download_path(path: &Path, dest_dir: &Path, id: &str) -> bool {
+    if !is_owned_download_path(path, dest_dir, id) {
+        return false;
+    }
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() > 0)
+}
+
+/// Whether `path` is lexically owned by this downloader invocation. Unlike
+/// [`is_reusable_download_path`], this does not require the file to exist: a
+/// durable cleanup intent must validate an already-deleted target before
+/// treating `NotFound` as success.
+pub(crate) fn is_owned_download_path(path: &Path, dest_dir: &Path, id: &str) -> bool {
+    path.parent() == Some(dest_dir)
+        && path.file_stem().and_then(|value| value.to_str()) == Some(id)
+        && path.extension().is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,6 +1574,21 @@ mod tests {
     }
 
     #[test]
+    fn classify_embed_with_or_without_fragment() {
+        for url in [
+            "https://www.youtube.com/embed/abc123XYZ_-",
+            "https://www.youtube.com/embed/abc123XYZ_-#player",
+        ] {
+            assert_eq!(classify_url(url).unwrap(), UrlKind::Video, "{url}");
+            assert_eq!(
+                extract_video_id(url).as_deref(),
+                Some("abc123XYZ_-"),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
     fn classify_playlist() {
         assert_eq!(
             classify_url("https://www.youtube.com/playlist?list=PL1234567890").unwrap(),
@@ -1276,6 +1639,14 @@ mod tests {
             UrlKind::Video
         );
         assert_eq!(classify_url("youtu.be/abc").unwrap(), UrlKind::Video);
+        assert_eq!(
+            classify_url("youtube.com/watch?v=abc&next=https://example.test").unwrap(),
+            UrlKind::Video
+        );
+        assert_eq!(
+            extract_video_id("youtube.com/watch?v=abc&next=https://example.test").as_deref(),
+            Some("abc")
+        );
     }
 
     #[test]
@@ -1284,6 +1655,25 @@ mod tests {
         assert!(matches!(err, FwError::InvalidRequest(_)));
         let text = err.to_string();
         assert!(text.contains("YouTube"), "actionable message: {text}");
+    }
+
+    #[test]
+    fn classify_non_web_schemes_rejected() {
+        for url in [
+            "file://youtube.com/watch?v=abc",
+            "ftp://youtu.be/abc",
+            "javascript://youtube.com/watch?v=abc",
+        ] {
+            assert!(
+                matches!(classify_url(url), Err(FwError::InvalidRequest(_))),
+                "unsupported explicit scheme must be rejected: {url}"
+            );
+            assert_eq!(
+                extract_video_id(url),
+                None,
+                "extractor must share the classifier's scheme gate: {url}"
+            );
+        }
     }
 
     #[test]
@@ -1314,6 +1704,10 @@ mod tests {
     fn classify_youtu_be_no_id_rejected() {
         assert!(matches!(
             classify_url("https://youtu.be/"),
+            Err(FwError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            classify_url("https://youtu.be/#t=42"),
             Err(FwError::InvalidRequest(_))
         ));
     }
@@ -1381,6 +1775,65 @@ mod tests {
     }
 
     #[test]
+    fn extract_id_strips_url_fragments_from_every_video_form() {
+        for (url, expected) in [
+            ("https://www.youtube.com/watch?v=watch123#t=42", "watch123"),
+            ("https://youtu.be/short123#t=42", "short123"),
+            (
+                "https://www.youtube.com/shorts/shorts123#comments",
+                "shorts123",
+            ),
+            ("https://www.youtube.com/live/live123#t=1", "live123"),
+            ("https://www.youtube.com/embed/embed123#player", "embed123"),
+        ] {
+            assert_eq!(
+                extract_video_id(url).as_deref(),
+                Some(expected),
+                "fragment must not become part of the id for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_id_canonicalizes_percent_encoded_ascii_id_bytes() {
+        for url in [
+            "https://www.youtube.com/watch?v=abc%2D123%5fXYZ",
+            "https://youtu.be/abc%2d123%5FXYZ",
+            "https://www.youtube.com/shorts/%61bc-123_XYZ",
+            "https://www.youtube.com/live/abc-123_%58YZ",
+            "https://www.youtube.com/embed/abc-123_XY%5a",
+        ] {
+            assert_eq!(
+                extract_video_id(url).as_deref(),
+                Some("abc-123_XYZ"),
+                "encoded and raw forms must share one canonical id: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_id_defers_noncanonical_components_to_metadata() {
+        for url in [
+            "https://www.youtube.com/watch?v=abc%2",
+            "https://www.youtube.com/watch?v=abc%GG",
+            "https://www.youtube.com/watch?v=abc%2Fdef",
+            "https://www.youtube.com/watch?v=abc+def",
+            "https://youtu.be/abc%3Fdef",
+            "https://www.youtube.com/shorts/abc.def",
+        ] {
+            assert!(
+                matches!(classify_url(url), Ok(UrlKind::Video)),
+                "the URL shape remains a video and can take the metadata fallback: {url}"
+            );
+            assert_eq!(
+                extract_video_id(url),
+                None,
+                "unsafe local identity must defer to authoritative metadata: {url}"
+            );
+        }
+    }
+
+    #[test]
     fn extract_id_mobile_music_nocookie_hosts() {
         assert_eq!(
             extract_video_id("https://m.youtube.com/watch?v=abc").as_deref(),
@@ -1420,6 +1873,7 @@ mod tests {
         assert_eq!(extract_video_id("https://vimeo.com/12345"), None);
         // youtu.be with no id.
         assert_eq!(extract_video_id("https://youtu.be/"), None);
+        assert_eq!(extract_video_id("https://youtu.be/#t=42"), None);
         // Empty / garbage.
         assert_eq!(extract_video_id("   "), None);
         assert_eq!(extract_video_id("not even a url"), None);
@@ -1437,6 +1891,8 @@ mod tests {
             "https://youtu.be/dQw4w9WgXcQ?t=42",
             "https://www.youtube.com/shorts/abc123XYZ_-",
             "https://www.youtube.com/live/abc123XYZ_-",
+            "https://www.youtube.com/embed/embedID0001",
+            "https://www.youtube.com/embed/embedID0001#player",
             "https://www.youtube.com/watch?v=abc&list=PL123",
             "https://www.youtube.com/watch?list=PL123&v=abc",
             "https://m.youtube.com/watch?v=abc",
@@ -1459,19 +1915,29 @@ mod tests {
 
     // ---- expand_playlist scale measurement -------------------------------
 
-    /// Build a synthetic stub that emits `n` *realistic* flat-playlist JSON
-    /// lines (yt-dlp `--flat-playlist --dump-json` lines are NOT ~150 bytes —
-    /// they carry a thumbnails array, channel/uploader block, description, etc.,
-    /// landing around 1.5–3 KB each). Returns `(tempdir, info, approx_line_len)`.
+    /// Materialize `n` *realistic* flat-playlist JSON lines (yt-dlp
+    /// `--flat-playlist --dump-json` lines are NOT ~150 bytes — they carry a
+    /// thumbnails array, channel/uploader block, description, etc., landing
+    /// around 1.5–3 KB each) and return the tracked stub plus a playlist URL
+    /// whose `fw_stub_flat_lines=` query makes the stub print them verbatim.
+    /// Returns `(tempdir, info, url, approx_line_len)`.
     ///
-    /// The generated script ALSO honors `--version` (so it can be probed) and
-    /// prints the lines verbatim, exercising the real `run_command_cancellable`
-    /// capture path — including the 4 MiB `MAX_CAPTURED_OUTPUT_BYTES` cap that
+    /// The stub prints through the real `run_command_cancellable` capture path —
+    /// including the 4 MiB `MAX_CAPTURED_OUTPUT_BYTES` cap that
     /// `expand_playlist`'s stdout flows through. This lets the measurement prove
     /// whether a large playlist's flat-JSON gets silently truncated.
-    fn synthetic_flat_playlist_info(n: usize) -> (tempfile::TempDir, YtdlpInfo, usize) {
+    ///
+    /// Only the DATA file is written here; the executable is the tracked stub.
+    /// Writing a per-test script and exec'ing it raced with every other test
+    /// thread's spawns (bd-vfo5): a child forked while `std::fs::write` held
+    /// the script open inherits that write descriptor and keeps it until the
+    /// child itself execs, so the test's own execve of the script could fail
+    /// with ETXTBSY ("Text file busy") even though the test had closed its copy.
+    fn synthetic_flat_playlist(
+        n: usize,
+        playlist_id: &str,
+    ) -> (tempfile::TempDir, YtdlpInfo, String, usize) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let script_path = dir.path().join("flat_stub.sh");
         // A representative flat-playlist entry template. yt-dlp emits a fat
         // object per entry; this mirrors the realistic field set + a thumbnails
         // array so the per-line byte cost is faithful (~1.6 KB here).
@@ -1503,8 +1969,7 @@ mod tests {
             .to_string()
         };
         let approx_line_len = line_template(0).len() + 1; // + newline
-        // Emit all lines from the script via a heredoc-free, fast `cat` of a
-        // pre-materialized data file (keeps the script tiny and the stdout
+        // The stub `cat`s this pre-materialized data file (keeps the stdout
         // generation cost out of the parse-time measurement's critical section).
         let data_path = dir.path().join("flat_lines.jsonl");
         {
@@ -1515,25 +1980,15 @@ mod tests {
             }
             f.flush().unwrap();
         }
-        let script = format!(
-            "#!/usr/bin/env bash\nset -u\nfor a in \"$@\"; do [ \"$a\" = --version ] && \
-             {{ echo 2025.01.01; exit 0; }}; done\ncat {}\n",
-            data_path.display()
+        let data_path = data_path.to_str().expect("utf8 tempdir path");
+        assert!(
+            !data_path.contains('&'),
+            "the stub reads the data path up to the next `&`: {data_path}"
         );
-        std::fs::write(&script_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
-        let info = YtdlpInfo {
-            path: script_path,
-            version: "2025.01.01".to_owned(),
-            stale: false,
-        };
-        (dir, info, approx_line_len)
+        let url = format!(
+            "https://www.youtube.com/playlist?list={playlist_id}&fw_stub_flat_lines={data_path}"
+        );
+        (dir, stub_info(), url, approx_line_len)
     }
 
     /// MEASURE: time `expand_playlist` parsing for a large synthetic playlist
@@ -1543,12 +1998,11 @@ mod tests {
     #[test]
     fn expand_playlist_scale_2000_is_linear_and_within_cap() {
         const N: usize = 2000;
-        let (_dir, info, line_len) = synthetic_flat_playlist_info(N);
+        let (_dir, info, url, line_len) = synthetic_flat_playlist(N, "PLbig");
         let token = CancellationToken::unbounded();
 
         let t = std::time::Instant::now();
-        let refs =
-            expand_playlist(&info, "https://www.youtube.com/playlist?list=PLbig", &token).unwrap();
+        let refs = expand_playlist(&info, &url, &token).unwrap();
         let elapsed = t.elapsed();
 
         let total_bytes = line_len * N;
@@ -1576,18 +2030,14 @@ mod tests {
     fn expand_playlist_truncation_is_now_detected() {
         // ~1.6 KB/line × 4000 ≈ 6.4 MB > 4 MiB cap → capture is truncated.
         const N: usize = 4000;
-        let (_dir, info, line_len) = synthetic_flat_playlist_info(N);
+        let (_dir, info, url, line_len) = synthetic_flat_playlist(N, "PLhuge");
         let token = CancellationToken::unbounded();
         let total = line_len * N;
         assert!(
             total > 4 * 1024 * 1024,
             "test precondition: {total} B must exceed the 4 MiB cap"
         );
-        let result = expand_playlist(
-            &info,
-            "https://www.youtube.com/playlist?list=PLhuge",
-            &token,
-        );
+        let result = expand_playlist(&info, &url, &token);
         match result {
             Err(FwError::InvalidRequest(msg)) => {
                 assert!(
@@ -1641,6 +2091,108 @@ mod tests {
             }
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
+    }
+
+    // ---- search / enrich (via stub, bd-m7fv) -----------------------------
+
+    #[test]
+    fn search_enriched_dedupes_and_retains_curated_fields() {
+        let token = CancellationToken::unbounded();
+        let hits = search(&stub_info(), "rust livestream", 10, false, &token)
+            .expect("enriched search should succeed");
+        assert_eq!(
+            hits.len(),
+            2,
+            "duplicate third line must be deduped: {hits:?}"
+        );
+        assert_eq!(hits[0].id, "srchenr0001");
+        assert_eq!(hits[0].title, "Enriched Search Hit One");
+        assert_eq!(hits[0].url, "https://www.youtube.com/watch?v=srchenr0001");
+        assert_eq!(hits[0].channel.as_deref(), Some("Search Channel"));
+        assert_eq!(hits[0].view_count, Some(4242));
+        assert_eq!(hits[0].upload_date.as_deref(), Some("20250301"));
+        assert_eq!(hits[0].duration_sec, Some(187.5));
+        // Second hit exercises the webpage_url fallback for the canonical URL
+        // and omits fields the fixture does not carry.
+        assert_eq!(hits[1].id, "srchenr0002");
+        assert_eq!(hits[1].channel.as_deref(), Some("Other Channel"));
+        assert_eq!(hits[1].view_count, None);
+        assert_eq!(hits[1].upload_date, None);
+    }
+
+    #[test]
+    fn search_flat_keeps_flat_subset() {
+        let token = CancellationToken::unbounded();
+        let hits = search(&stub_info(), "cheap sweep", 10, true, &token)
+            .expect("flat search should succeed");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "srchflat0001");
+        assert_eq!(hits[0].duration_sec, Some(95.0));
+        assert_eq!(hits[1].id, "srchflat0002");
+        // webpage_url fallback supplies the canonical URL in the flat dump.
+        assert_eq!(hits[1].url, "https://www.youtube.com/watch?v=srchflat0002");
+    }
+
+    #[test]
+    fn search_respects_limit_cap() {
+        let token = CancellationToken::unbounded();
+        let hits = search(&stub_info(), "anything", 1, false, &token)
+            .expect("limited search should succeed");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "srchenr0001");
+    }
+
+    #[test]
+    fn search_rejects_empty_query_and_zero_limit() {
+        let token = CancellationToken::unbounded();
+        let err = search(&stub_info(), "   ", 10, false, &token).unwrap_err();
+        assert!(matches!(err, FwError::InvalidRequest(_)));
+        let err = search(&stub_info(), "query", 0, false, &token).unwrap_err();
+        assert!(matches!(err, FwError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn enrich_dedupes_targets_and_maps_metadata() {
+        let token = CancellationToken::unbounded();
+        let targets = vec![
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+            "dQw4w9WgXcQ".to_owned(),
+        ];
+        let hits = enrich(&stub_info(), &targets, &token).expect("enrich should succeed");
+        assert_eq!(hits.len(), 1, "same id twice must collapse to one hit");
+        assert_eq!(hits[0].id, "dQw4w9WgXcQ");
+        assert_eq!(hits[0].channel.as_deref(), Some("Stub Channel"));
+        assert_eq!(hits[0].upload_date.as_deref(), Some("20240115"));
+        assert_eq!(hits[0].duration_sec, Some(212.0));
+    }
+
+    #[test]
+    fn enrich_rejects_playlist_urls_actionably() {
+        let token = CancellationToken::unbounded();
+        let targets = vec!["https://www.youtube.com/playlist?list=PL123".to_owned()];
+        let err = enrich(&stub_info(), &targets, &token).unwrap_err();
+        match err {
+            FwError::InvalidRequest(msg) => {
+                assert!(msg.contains("Playlist") && msg.contains("individual video"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dedup_hits_preserves_first_seen_order() {
+        let hit = |id: &str| SearchHit {
+            id: id.to_owned(),
+            title: String::new(),
+            url: format!("https://www.youtube.com/watch?v={id}"),
+            duration_sec: None,
+            channel: None,
+            view_count: None,
+            upload_date: None,
+        };
+        let merged = dedup_hits(vec![hit("a"), hit("b"), hit("a"), hit("c"), hit("b")]);
+        let ids: Vec<&str> = merged.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
     }
 
     // ---- expand_playlist (via stub) --------------------------------------
@@ -1755,7 +2307,7 @@ mod tests {
     // ---- fetch_metadata (via stub) ---------------------------------------
 
     #[test]
-    fn fetch_metadata_parses_full_object() {
+    fn fetch_metadata_is_explicitly_non_downloading_and_parses_full_object() {
         let token = CancellationToken::unbounded();
         let meta = fetch_metadata(&stub_info(), "https://youtu.be/dQw4w9WgXcQ", &token)
             .expect("metadata should parse");
@@ -1768,6 +2320,11 @@ mod tests {
         assert_eq!(meta.availability.as_deref(), Some("public"));
         assert_eq!(meta.live_status.as_deref(), Some("not_live"));
         assert!(meta.description.is_some());
+
+        let fragmented =
+            fetch_metadata(&stub_info(), "youtube.com/watch?v=fragment123#t=42", &token)
+                .expect("fragmented metadata URL should parse");
+        assert_eq!(fragmented.id, "fragment123");
     }
 
     #[test]
@@ -1799,6 +2356,27 @@ mod tests {
             video_meta_from_json(&no_id),
             Err(FwError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn video_meta_rejects_path_unsafe_ids() {
+        for id in ["../escape", "nested/name", r"nested\name", "id with space"] {
+            let value = serde_json::json!({"id": id, "title": "T"});
+            let line = serde_json::to_string(&value).expect("serialize metadata fixture");
+
+            let projected = parse_video_meta(&line).expect_err("unsafe id must be rejected");
+            let dom = video_meta_from_json(&value).expect_err("unsafe id must be rejected");
+            assert!(projected.to_string().contains("invalid video id"));
+            assert!(dom.to_string().contains("invalid video id"));
+        }
+    }
+
+    #[test]
+    fn video_meta_rejects_overlong_id() {
+        let id = "a".repeat(MAX_VIDEO_ID_BYTES + 1);
+        let line = serde_json::json!({"id": id, "title": "T"}).to_string();
+        let error = parse_video_meta(&line).expect_err("overlong id must be rejected");
+        assert!(error.to_string().contains("invalid video id"));
     }
 
     #[test]
@@ -1857,9 +2435,107 @@ mod tests {
             Some("dQw4w9WgXcQ.wav")
         );
         assert!(path.starts_with(dir.path()));
-        // The copied file should be non-empty (the jfk.wav fixture).
-        let len = std::fs::metadata(&path).unwrap().len();
-        assert!(len > 0, "downloaded file should be non-empty");
+        let downloaded = std::fs::read(&path).expect("read stub download");
+        let tracked_fixture = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/native/jfk_cut8.bin"
+        ));
+        assert_eq!(downloaded.as_slice(), tracked_fixture);
+    }
+
+    #[test]
+    fn download_audio_rejects_existing_printed_path_for_a_different_video_id() {
+        let token = CancellationToken::unbounded();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut meta = meta_for_download();
+        meta.id = "EXPECTED001".to_owned();
+        meta.webpage_url = "https://www.youtube.com/watch?v=WRONGPATH01".to_owned();
+
+        let error = download_audio(&stub_info(), &meta, dir.path(), &token)
+            .expect_err("yt-dlp's existing wrong-id printed path must be rejected");
+        assert!(matches!(
+            error,
+            FwError::MissingArtifact(path)
+                if path == dir.path().join("EXPECTED001.<ext>")
+        ));
+        assert!(
+            dir.path().join("WRONGPATH01.wav").is_file(),
+            "the rejected printed path must exist so a bare is_file check would false-green"
+        );
+    }
+
+    #[test]
+    fn download_audio_rejects_authoritative_non_media_printed_path() {
+        let token = CancellationToken::unbounded();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut meta = meta_for_download();
+        meta.webpage_url.push_str("&fw_stub_ext=json");
+
+        let error = download_audio(&stub_info(), &meta, dir.path(), &token)
+            .expect_err("a printed non-media sidecar must not become downloaded audio");
+        assert!(matches!(
+            error,
+            FwError::MissingArtifact(path)
+                if path == dir.path().join("dQw4w9WgXcQ.<ext>")
+        ));
+        let sidecar = dir.path().join("dQw4w9WgXcQ.json");
+        assert!(
+            sidecar.is_file(),
+            "the rejected path must exist so file ownership alone would false-green"
+        );
+        assert!(!is_reusable_download_path(&sidecar, dir.path(), &meta.id));
+    }
+
+    #[test]
+    fn download_audio_accepts_authoritative_owned_legacy_container() {
+        let token = CancellationToken::unbounded();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut meta = meta_for_download();
+        meta.webpage_url.push_str("&fw_stub_ext=flv");
+
+        let path = download_audio(&stub_info(), &meta, dir.path(), &token)
+            .expect("yt-dlp's authoritative legacy-container path should succeed");
+        assert_eq!(path, dir.path().join("dQw4w9WgXcQ.flv"));
+        assert!(path.is_file(), "returned legacy container must exist");
+        assert!(
+            is_reusable_download_path(&path, dir.path(), &meta.id),
+            "an authoritative completed legacy container must be reusable"
+        );
+        assert_eq!(
+            find_downloaded_by_id(dir.path(), &meta.id),
+            Some(path),
+            "resume scanning must find the same completed legacy container"
+        );
+    }
+
+    #[test]
+    fn downloaded_scan_accepts_only_nonempty_owned_media_for_exact_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for extension in ["part", "tmp", "ytdl", "json", "jpg", "vtt", "description"] {
+            std::fs::write(
+                dir.path().join(format!("video123.{extension}")),
+                b"not reusable media",
+            )
+            .expect("non-media artifact");
+        }
+        std::fs::write(dir.path().join("video123.webm"), b"").expect("empty media artifact");
+        std::fs::write(dir.path().join("different.wav"), b"wrong id")
+            .expect("wrong-id media artifact");
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("symlink-target.wav");
+            std::fs::write(&target, b"symlink target").expect("symlink target");
+            std::os::unix::fs::symlink(&target, dir.path().join("video123.mp3"))
+                .expect("symlink media artifact");
+        }
+        assert_eq!(find_downloaded_by_id(dir.path(), "video123"), None);
+
+        let completed = dir.path().join("video123.wav");
+        std::fs::write(&completed, b"complete").expect("completed artifact");
+        assert_eq!(
+            find_downloaded_by_id(dir.path(), "video123"),
+            Some(completed)
+        );
     }
 
     // ---- error mapping ---------------------------------------------------
@@ -2012,6 +2688,11 @@ mod tests {
             split_host_and_rest("https://youtu.be/x"),
             Some(("youtu.be", "/x"))
         );
+        assert_eq!(
+            split_host_and_rest("HTTPS://youtu.be/x"),
+            Some(("youtu.be", "/x"))
+        );
+        assert_eq!(split_host_and_rest("file://youtu.be/x"), None);
     }
 
     #[test]

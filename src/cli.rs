@@ -41,6 +41,24 @@ struct SpeakerHintsDocument {
     known_intervals: Vec<KnownSpeakerInterval>,
 }
 
+/// Default state root: `$FRANKEN_WHISPER_STATE_DIR` when set and non-blank
+/// (the same rule the pipeline uses for its work directories), else
+/// `.franken_whisper` under the current directory.
+#[must_use]
+pub fn default_state_root() -> PathBuf {
+    std::env::var_os("FRANKEN_WHISPER_STATE_DIR")
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map_or_else(|| PathBuf::from(".franken_whisper"), PathBuf::from)
+}
+
+/// Default run-history database: `storage.sqlite3` under
+/// [`default_state_root`]. `--db` and `FRANKEN_WHISPER_DB` take precedence
+/// (declared on each `--db` argument).
+#[must_use]
+pub fn default_db_path() -> PathBuf {
+    default_state_root().join("storage.sqlite3")
+}
+
 fn parse_speaker_hints(bytes: &[u8]) -> FwResult<Vec<KnownSpeakerInterval>> {
     let parsed: SpeakerHintsFile = serde_json::from_slice(bytes).map_err(|_| {
         FwError::InvalidRequest(
@@ -144,18 +162,16 @@ fn read_speaker_hints(path: &Path) -> FwResult<Vec<KnownSpeakerInterval>> {
 }
 
 fn metadata_is_indirection(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
 
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        metadata.file_type().is_symlink()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
-    false
+    metadata.file_type().is_symlink()
 }
 
 fn parse_speaker_count_range(value: &str) -> FwResult<(u32, u32)> {
@@ -363,11 +379,17 @@ pub enum Command {
     /// Internal process-tree cancellation probe. This is intentionally absent from help.
     #[command(name = "__comparison-cancel-probe", hide = true)]
     ComparisonCancelProbe(ComparisonCancelProbeArgs),
-    /// Launch the optional human-oriented terminal interface.
-    Tui,
+    /// Launch the optional human-oriented terminal interface (run history
+    /// browser; `tui listen` shows a live transcription session).
+    Tui {
+        #[command(subcommand)]
+        command: Option<TuiCommand>,
+    },
     /// Download YouTube audio (videos / playlists / a URL file) and
-    /// transcribe each into a markdown + JSON pair.
-    Youtube(Box<YoutubeArgs>),
+    /// transcribe each into a markdown + JSON pair; or search / enrich the
+    /// YouTube catalog as deduped agent-curated JSON.
+    #[command(subcommand)]
+    Youtube(YoutubeCommand),
     /// Describe stable commands, schemas, features, and error recovery as JSON.
     Capabilities(CapabilitiesArgs),
     /// Report built-in and cached model readiness without downloading.
@@ -418,6 +440,11 @@ pub enum PullModelArg {
     All,
     Whisper,
     Sortformer,
+    /// Fast-lane streaming package for `fw robot listen` (English-only).
+    TinyEn,
+    /// Fast-lane streaming package for `fw robot listen` (multilingual;
+    /// the default fast model when `--language` is unset or non-English).
+    Tiny,
 }
 
 /// Explicit model-download controls. No other command performs network access.
@@ -437,7 +464,7 @@ pub struct PullArgs {
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
     /// Path to the frankensqlite database file to inspect.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Emit one JSON object with no terminal decoration.
@@ -865,6 +892,97 @@ impl fmt::Debug for ConfidentialEvaluationArgs {
     }
 }
 
+/// `fw youtube` modes: the ingestion pipeline, or catalog search / enrich.
+#[derive(Debug, Subcommand)]
+pub enum YoutubeCommand {
+    /// Download YouTube audio (videos / playlists / a URL file) and
+    /// transcribe each into a markdown + JSON pair.
+    Run(Box<YoutubeArgs>),
+    /// Search YouTube via yt-dlp and emit deduplicated JSON hits on stdout
+    /// (bd-m7fv). Enriched per-video metadata by default; `--flat` keeps the
+    /// flat-playlist subset for cheap large sweeps.
+    Search(YoutubeSearchArgs),
+    /// Enrich specific video URLs or ids into deduplicated JSON hits
+    /// (bd-m7fv). Playlist inputs are rejected — ingest those through
+    /// `youtube run`.
+    Enrich(YoutubeEnrichArgs),
+}
+
+/// Arguments for `fw youtube search`.
+#[derive(Debug, Args)]
+pub struct YoutubeSearchArgs {
+    /// Free-text search query.
+    #[arg(value_name = "QUERY")]
+    pub query: String,
+
+    /// Maximum number of results to return.
+    #[arg(long, default_value_t = 10)]
+    pub limit: usize,
+
+    /// Keep only the flat-playlist field subset (cheaper large sweeps).
+    #[arg(long)]
+    pub flat: bool,
+
+    /// Explicit yt-dlp binary override (same resolution as ingestion).
+    #[arg(long)]
+    pub ytdlp: Option<PathBuf>,
+}
+
+/// Arguments for `fw youtube enrich`.
+#[derive(Debug, Args)]
+pub struct YoutubeEnrichArgs {
+    /// Video URLs or ids to enrich (positional; duplicates are dropped).
+    #[arg(value_name = "URL_OR_ID")]
+    pub targets: Vec<String>,
+
+    /// Explicit yt-dlp binary override (same resolution as ingestion).
+    #[arg(long)]
+    pub ytdlp: Option<PathBuf>,
+}
+
+/// Run `fw youtube search`: probe yt-dlp, run the query, print deduped hits
+/// as a JSON array on stdout. Deterministic: first-seen order, no decoration.
+///
+/// # Errors
+///
+/// Propagates the yt-dlp probe and search errors.
+pub fn run_youtube_search(args: &YoutubeSearchArgs) -> FwResult<()> {
+    let info = match args.ytdlp.as_deref() {
+        Some(path) => {
+            crate::youtube::ytdlp::probe_with_path(path, chrono::Utc::now().date_naive())?
+        }
+        None => crate::youtube::ytdlp::probe()?,
+    };
+    let token = crate::orchestrator::CancellationToken::unbounded();
+    let hits = crate::youtube::ytdlp::search(&info, &args.query, args.limit, args.flat, &token)?;
+    println!("{}", serde_json::to_string_pretty(&hits)?);
+    Ok(())
+}
+
+/// Run `fw youtube enrich`: probe yt-dlp, fetch each target's metadata, and
+/// print the deduplicated hits as a JSON array on stdout.
+///
+/// # Errors
+///
+/// Propagates the yt-dlp probe, classification, and fetch errors.
+pub fn run_youtube_enrich(args: &YoutubeEnrichArgs) -> FwResult<()> {
+    if args.targets.is_empty() {
+        return Err(FwError::InvalidRequest(
+            "no targets: pass one or more video URLs or ids".to_owned(),
+        ));
+    }
+    let info = match args.ytdlp.as_deref() {
+        Some(path) => {
+            crate::youtube::ytdlp::probe_with_path(path, chrono::Utc::now().date_naive())?
+        }
+        None => crate::youtube::ytdlp::probe()?,
+    };
+    let token = crate::orchestrator::CancellationToken::unbounded();
+    let hits = crate::youtube::ytdlp::enrich(&info, &args.targets, &token)?;
+    println!("{}", serde_json::to_string_pretty(&hits)?);
+    Ok(())
+}
+
 /// Arguments for the `youtube` subcommand.
 #[derive(Debug, Args)]
 pub struct YoutubeArgs {
@@ -916,13 +1034,50 @@ pub struct YoutubeArgs {
     #[arg(long)]
     pub no_retry: bool,
 
-    /// Stop the whole run on the first per-video failure.
+    /// Stop scheduling later waves after a per-video failure.
     #[arg(long)]
     pub abort_on_error: bool,
 
     /// Emit the final run summary as JSON on stdout (for scripting).
     #[arg(long)]
     pub json_summary: bool,
+
+    /// bd-lun9 batch-wave size: download in waves of this many videos so
+    /// untranscribed audio cannot pile up on disk. 0 = all at once.
+    #[arg(long, default_value_t = 0)]
+    pub batch_size: usize,
+
+    /// Filename style for emitted artifacts (bd-tchp default: slug).
+    #[arg(long, value_enum, default_value_t = YoutubeNamingStyleArg::Slug)]
+    pub naming_style: YoutubeNamingStyleArg,
+
+    /// Stream per-video NDJSON robot events on stdout (schema 1.1.0,
+    /// terminal `youtube.run_complete`). Mutually exclusive with
+    /// `--json-summary`: the stream replaces the single-blob output.
+    #[arg(long, conflicts_with = "json_summary")]
+    pub robot: bool,
+}
+
+/// CLI-facing naming style selector (maps onto
+/// [`franken_whisper::youtube::naming::NamingStyle`]; kept separate so the
+/// library module stays clap-free).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum YoutubeNamingStyleArg {
+    /// Lowercase underscore slug (default): `20240115_my_title_dQw4w9WgXcQ`.
+    Slug,
+    /// Human-readable `{date} - {title} [{id}]`, non-ASCII kept.
+    Pretty,
+    /// Human-readable with non-ASCII folded to `_`.
+    Ascii,
+}
+impl From<YoutubeNamingStyleArg> for crate::youtube::naming::NamingStyle {
+    fn from(value: YoutubeNamingStyleArg) -> Self {
+        match value {
+            YoutubeNamingStyleArg::Slug => crate::youtube::naming::NamingStyle::Slug,
+            YoutubeNamingStyleArg::Pretty => crate::youtube::naming::NamingStyle::Pretty,
+            YoutubeNamingStyleArg::Ascii => crate::youtube::naming::NamingStyle::Ascii,
+        }
+    }
 }
 
 impl YoutubeArgs {
@@ -953,6 +1108,13 @@ impl YoutubeArgs {
             keep_audio: !self.no_keep_audio,
             retry_failed: !self.no_retry,
             abort_on_error: self.abort_on_error,
+            naming_style: self.naming_style.into(),
+            batch_size: self.batch_size,
+            robot_events: if self.robot {
+                crate::youtube::pipeline::YoutubeRobotEvents::Stdout
+            } else {
+                crate::youtube::pipeline::YoutubeRobotEvents::Off
+            },
         })
     }
 }
@@ -971,12 +1133,15 @@ pub enum RobotCommand {
     Triage(HealthArgs),
     /// Query persisted adaptive-routing decisions as NDJSON.
     RoutingHistory(RoutingHistoryArgs),
+    /// Live microphone/pipe transcription: continuous NDJSON session events
+    /// (schema 1.1.0 listen family). See docs/realtime-streaming.md.
+    Listen(Box<ListenArgs>),
 }
 
 #[derive(Debug, Args)]
 pub struct HealthArgs {
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Exit non-zero when the report is not fully healthy.
@@ -987,7 +1152,7 @@ pub struct HealthArgs {
 #[derive(Debug, Args)]
 pub struct RoutingHistoryArgs {
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Filter to a specific run by ID.
@@ -999,33 +1164,344 @@ pub struct RoutingHistoryArgs {
     pub limit: usize,
 }
 
+/// Audio source for `fw robot listen`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ListenSourceArg {
+    /// Live microphone (cpal primary, ffmpeg fallback).
+    Mic,
+    /// Raw PCM piped on stdin (`ffmpeg -i X -f s16le - | fw robot listen --source stdin-pcm`).
+    StdinPcm,
+    /// Replay an audio file (WAV in v1), optionally paced to real time.
+    FileReplay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CaptureBackendArg {
+    Auto,
+    Cpal,
+    Ffmpeg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ListenPolicyArg {
+    /// AlignAtt (default): attention-gated incremental commits — deltas
+    /// stream mid-utterance as soon as the decoder's alignment heads stop
+    /// attending near the live audio edge (bd-rt-alignatt-fry9).
+    Alignatt,
+    /// Bootstrap baseline: partials every step, one committed delta at
+    /// utterance close.
+    EndpointCommit,
+    /// Fallback (bd-rt-local-agreement-l5x8): commit only what two
+    /// consecutive decodes agree on. Model-agnostic insurance baseline;
+    /// never the default.
+    LocalAgreement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum StdinFormatArg {
+    S16le,
+    F32le,
+}
+
+/// Live listen session controls (bd-rt-listen-cmd-i48i). The consolidated
+/// flag list lives on the driver bead; `--quality-model`/confirm controls
+/// landed with bd-rt-confirm-lane-3okr; `--db` lands with the persistence
+/// bead (bd-rt-persist-a66y).
+#[derive(Debug, Args)]
+pub struct ListenArgs {
+    /// Audio source.
+    #[arg(long, value_enum, default_value_t = ListenSourceArg::Mic)]
+    pub source: ListenSourceArg,
+
+    /// Input file for `--source file-replay`.
+    #[arg(long)]
+    pub input: Option<PathBuf>,
+
+    /// Pace file-replay at real time (default: as fast as possible).
+    #[arg(long)]
+    pub realtime_pace: bool,
+
+    /// Capture backend for `--source mic`.
+    #[arg(long, value_enum, default_value_t = CaptureBackendArg::Auto)]
+    pub capture_backend: CaptureBackendArg,
+
+    /// Input device name (default: system default input).
+    #[arg(long)]
+    pub mic_device: Option<String>,
+
+    /// Fast-lane model override (default: tiny.en for --language en,
+    /// multilingual tiny otherwise; missing packages fall back to turbo
+    /// with a warning).
+    #[arg(long)]
+    pub fast_model: Option<String>,
+
+    /// Emission policy.
+    #[arg(long, value_enum, default_value_t = ListenPolicyArg::Alignatt)]
+    pub policy: ListenPolicyArg,
+
+    /// AlignAtt holdback: how far (ms) the decoder's attention must sit
+    /// behind the live audio edge before text commits. Lower = faster,
+    /// riskier; higher = safer, laggier.
+    #[arg(long, default_value_t = 200)]
+    pub alignatt_holdback_ms: u64,
+
+    /// Step decode cadence in milliseconds.
+    #[arg(long, default_value_t = 300)]
+    pub step_ms: u64,
+
+    /// bd-rt-adaptive-contract-yw68: enable the two adaptive controllers
+    /// (step cadence + AlignAtt holdback) under the alien-artifact
+    /// contract. Default OFF; each adapts only its one knob, Brier-gated,
+    /// with deterministic fallback to these configured values.
+    #[arg(long)]
+    pub adaptive: bool,
+
+    /// Rolling session buffer cap in seconds.
+    #[arg(long, default_value_t = 12.0)]
+    pub max_buffer_sec: f64,
+
+    /// Language hint (ISO 639-1); unset = detect on first speech and pin.
+    #[arg(long)]
+    pub language: Option<String>,
+
+    /// End the session after listening for this many seconds, counted from
+    /// when capture starts (model loading excluded; 0 = unbounded).
+    #[arg(long, default_value_t = 0.0)]
+    pub max_seconds: f64,
+
+    /// Force-close an utterance after this many seconds of open speech.
+    #[arg(long, default_value_t = 90.0)]
+    pub max_utterance_sec: f64,
+
+    /// Suppress mutable transcript.partial previews (committed deltas and
+    /// lifecycle events are unaffected; the first remedy for slow consumers).
+    #[arg(long)]
+    pub no_partials: bool,
+
+    /// Periodic session_stats heartbeat interval (0 = final only).
+    #[arg(long, default_value_t = 30.0)]
+    pub stats_interval_sec: f64,
+
+    /// Disable cross-trim/cross-utterance prompt carry.
+    #[arg(long)]
+    pub no_context: bool,
+
+    /// Capture ring capacity in seconds (absorbs slow-consumer stalls).
+    #[arg(long, default_value_t = 30.0)]
+    pub capture_buffer_sec: f64,
+
+    /// stdin-pcm sample rate in Hz.
+    #[arg(long, default_value_t = 16_000)]
+    pub stdin_rate: u32,
+
+    /// stdin-pcm channel count.
+    #[arg(long, default_value_t = 1)]
+    pub stdin_channels: u16,
+
+    /// stdin-pcm sample format.
+    #[arg(long, value_enum, default_value_t = StdinFormatArg::S16le)]
+    pub stdin_format: StdinFormatArg,
+
+    /// Disable VAD gating: one continuous utterance split only by
+    /// --max-utterance-sec (harness baselines, known-continuous feeds).
+    #[arg(long)]
+    pub no_vad: bool,
+
+    /// Energy gate above the running noise floor, in dB.
+    #[arg(long, default_value_t = 9.0)]
+    pub vad_gate_db: f64,
+
+    /// Voiced audio required before an utterance opens (ms), counted within
+    /// a window twice as long.
+    #[arg(long, default_value_t = 250)]
+    pub vad_min_speech_ms: u64,
+
+    /// Sustained silence that closes an utterance (ms).
+    #[arg(long, default_value_t = 600)]
+    pub vad_endpoint_ms: u64,
+
+    /// Confirm-lane quality model (bd-rt-confirm-lane-3okr): `auto`
+    /// (default; large-v3-turbo when its package is installed, lane off
+    /// otherwise), `none` (disable), or an explicit model spec.
+    #[arg(long, default_value = "auto")]
+    pub quality_model: String,
+
+    /// Seconds the session end waits for in-flight quality confirms before
+    /// abandoning them with a `confirm_drain_timeout` warning. An unpaced
+    /// file replay that ends on its own drains every confirm instead; this
+    /// cap then applies only when it is interrupted.
+    #[arg(long, default_value_t = 10.0)]
+    pub confirm_drain_sec: f64,
+
+    /// Max unconfirmed utterances in the confirm queue before the oldest is
+    /// dropped (`confirm_lag` warning). The live lane never blocks; an
+    /// unpaced file replay waits for a free slot instead of dropping.
+    #[arg(long, default_value_t = 4)]
+    pub confirm_queue_bound: usize,
+
+    /// Persist the session to SQLite at utterance granularity
+    /// (bd-rt-persist-a66y, crash-durable). Disabled by `--no-persist`.
+    #[arg(long)]
+    pub no_persist: bool,
+
+    /// Database file for run history (same store as batch runs).
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
+    pub db: PathBuf,
+
+    /// List input devices as NDJSON and exit (no session).
+    #[arg(long)]
+    pub list_devices: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TuiCommand {
+    /// Watch a live listen session (same flags as `robot listen`): committed
+    /// text, in-place partials, utterance boundaries, confirm-lane verdicts,
+    /// warnings, and session stats. The robot NDJSON contract is unaffected.
+    Listen(Box<ListenArgs>),
+}
+
+impl ListenArgs {
+    /// Build the live-session configuration these flags describe; shared by
+    /// `robot listen` and `tui listen` so both drive the identical session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FwError::InvalidRequest`] when `--source file-replay` lacks
+    /// `--input`. Numeric validation happens in the session itself.
+    pub fn to_listen_config(&self) -> FwResult<crate::listen::ListenConfig> {
+        use crate::capture::PcmFormat;
+        use crate::listen::{
+            CaptureBackend, ListenConfig, ListenPolicy, ListenSource, QualityModelSetting,
+            SessionBufferConfig, StreamingVadConfig,
+        };
+
+        let source = match self.source {
+            ListenSourceArg::Mic => ListenSource::Mic {
+                device: self.mic_device.clone(),
+                backend: match self.capture_backend {
+                    CaptureBackendArg::Auto => CaptureBackend::Auto,
+                    CaptureBackendArg::Cpal => CaptureBackend::Cpal,
+                    CaptureBackendArg::Ffmpeg => CaptureBackend::Ffmpeg,
+                },
+            },
+            ListenSourceArg::StdinPcm => ListenSource::StdinPcm {
+                format: match self.stdin_format {
+                    StdinFormatArg::S16le => PcmFormat::S16le,
+                    StdinFormatArg::F32le => PcmFormat::F32le,
+                },
+                sample_rate: self.stdin_rate,
+                channels: self.stdin_channels,
+            },
+            ListenSourceArg::FileReplay => {
+                let Some(path) = self.input.clone() else {
+                    return Err(FwError::InvalidRequest(
+                        "--source file-replay requires --input PATH".to_owned(),
+                    ));
+                };
+                ListenSource::FileReplay {
+                    path,
+                    realtime_pace: self.realtime_pace,
+                }
+            }
+        };
+        let policy = match self.policy {
+            ListenPolicyArg::Alignatt => ListenPolicy::AlignAtt,
+            ListenPolicyArg::EndpointCommit => ListenPolicy::EndpointCommit,
+            ListenPolicyArg::LocalAgreement => ListenPolicy::LocalAgreement,
+        };
+        let mut buffer = SessionBufferConfig {
+            max_buffer_sec: self.max_buffer_sec,
+            ..SessionBufferConfig::default()
+        };
+        buffer.prompt_carry = !self.no_context;
+        let vad = StreamingVadConfig {
+            gate_db: self.vad_gate_db,
+            min_speech_ms: self.vad_min_speech_ms,
+            endpoint_ms: self.vad_endpoint_ms,
+            ..StreamingVadConfig::default()
+        };
+        Ok(ListenConfig {
+            source,
+            fast_model: self.fast_model.clone(),
+            language: self.language.clone(),
+            step_ms: self.step_ms,
+            buffer,
+            vad,
+            vad_enabled: !self.no_vad,
+            max_seconds: self.max_seconds,
+            max_utterance_sec: self.max_utterance_sec,
+            emit_partials: !self.no_partials,
+            stats_interval_sec: self.stats_interval_sec,
+            capture_buffer_sec: self.capture_buffer_sec,
+            policy,
+            alignatt_holdback_ms: self.alignatt_holdback_ms,
+            adaptive_controllers: self.adaptive,
+            quality_model: match self.quality_model.as_str() {
+                "auto" => QualityModelSetting::Auto,
+                "none" => QualityModelSetting::Disabled,
+                spec => QualityModelSetting::Explicit(spec.to_owned()),
+            },
+            confirm_queue_bound: self.confirm_queue_bound,
+            confirm_drain_sec: self.confirm_drain_sec,
+            persist: !self.no_persist,
+            db_path: self.db.clone(),
+        })
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum SyncCommand {
     #[command(name = "export-jsonl")]
     Export(SyncExportArgs),
     #[command(name = "import-jsonl")]
     Import(SyncImportArgs),
+    /// Compare a database against a full JSONL snapshot without importing.
+    #[command(name = "validate-jsonl")]
+    Validate(SyncValidateArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct SyncExportArgs {
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Output directory for JSONL snapshot.
     #[arg(long)]
     pub output: PathBuf,
 
-    /// State root for lock files.
-    #[arg(long, default_value = ".franken_whisper")]
+    /// State root for lock files (and `sync_cursor.json` with --incremental).
+    #[arg(long, default_value_os_t = default_state_root())]
     pub state_root: PathBuf,
+
+    /// Export only run aggregates changed since the cursor in
+    /// `<state-root>/sync_cursor.json` (all runs on first use), plus an
+    /// explicit deleted-run channel; the cursor advances after publication.
+    #[arg(long)]
+    pub incremental: bool,
+
+    /// Gzip the JSONL files (`*.jsonl.gz`); import reads them transparently
+    /// and manifest checksums cover the uncompressed bytes.
+    #[arg(long)]
+    pub gzip: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SyncValidateArgs {
+    /// Path to frankensqlite database file.
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
+    pub db: PathBuf,
+
+    /// Directory containing a full JSONL snapshot.
+    #[arg(long)]
+    pub input: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct SyncImportArgs {
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Directory containing JSONL snapshot to import.
@@ -1033,7 +1509,7 @@ pub struct SyncImportArgs {
     pub input: PathBuf,
 
     /// State root for lock files.
-    #[arg(long, default_value = ".franken_whisper")]
+    #[arg(long, default_value_os_t = default_state_root())]
     pub state_root: PathBuf,
 
     /// Conflict resolution policy.
@@ -1043,9 +1519,21 @@ pub struct SyncImportArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct TranscribeArgs {
-    /// Path to input audio/video file.
-    #[arg(long)]
-    pub input: Option<PathBuf>,
+    /// Path to input audio/video file. Repeat it to transcribe several files in
+    /// one process (batch mode: the native model loads once).
+    #[arg(long, value_name = "PATH")]
+    pub input: Vec<PathBuf>,
+
+    /// Batch mode: read input paths from FILE, one per line (`-` reads stdin).
+    ///
+    /// Lines are taken verbatim apart from the line terminator (no trimming,
+    /// no comment syntax; a leading UTF-8 BOM is ignored); blank lines are
+    /// skipped, and a relative path resolves against the current directory,
+    /// not the list's. Inputs run in order: every `--input`, then each listed
+    /// path. With `--json`, output is one NDJSON record per input (see
+    /// `fw robot-docs guide`).
+    #[arg(long, value_name = "FILE")]
+    pub inputs_from: Option<PathBuf>,
 
     /// Read audio bytes from stdin.
     #[arg(long)]
@@ -1120,19 +1608,21 @@ pub struct TranscribeArgs {
 
     /// Record consent for future reusable-profile persistence.
     ///
-    /// Schema v5 stores privacy-safe summaries only, never raw acoustic vectors.
+    /// Schema v6 stores privacy-safe summaries only, never raw acoustic vectors.
     #[arg(long)]
     pub persist_speaker_profiles: bool,
 
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Disable persistence in frankensqlite.
     #[arg(long)]
     pub no_persist: bool,
 
-    /// Pipeline timeout in seconds.
+    /// Pipeline timeout in seconds. In batch mode it bounds each input
+    /// separately (an input past it fails alone; the batch goes on), not the
+    /// whole batch.
     #[arg(long)]
     pub timeout: Option<u64>,
 
@@ -1178,7 +1668,9 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub split_on_word: bool,
 
-    /// Best-of sampling count (whisper.cpp).
+    /// Sampling candidates per temperature-fallback rung (whisper.cpp
+    /// `--best-of`, default 5). On the native engine, passing it enables the
+    /// quality-gated fallback for this run.
     #[arg(long)]
     pub best_of: Option<u32>,
 
@@ -1194,23 +1686,30 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub max_segment_length: Option<u32>,
 
-    /// Sampling temperature (whisper.cpp).
+    /// Initial sampling temperature (whisper.cpp bridge only; the native
+    /// engine's first pass is greedy and reports a warning when this is > 0).
     #[arg(long)]
     pub temperature: Option<f32>,
 
-    /// Temperature increment on fallback (whisper.cpp).
+    /// Temperature step of the fallback ladder, within [0, 1] (whisper.cpp
+    /// default 0.2; 0 = no retries). On the native engine, passing it enables
+    /// the quality-gated fallback for this run.
     #[arg(long)]
     pub temperature_increment: Option<f32>,
 
-    /// Entropy threshold for decoder (whisper.cpp).
+    /// Token-entropy threshold below which a window is a repetition loop and
+    /// is retried (default 2.4). On the native engine, passing it enables the
+    /// fallback for this run.
     #[arg(long)]
     pub entropy_threshold: Option<f32>,
 
-    /// Log-prob threshold for decoder (whisper.cpp).
+    /// Average log-prob threshold below which a window is retried (default
+    /// -1.0). On the native engine, passing it enables the fallback for this run.
     #[arg(long)]
     pub logprob_threshold: Option<f32>,
 
-    /// No-speech probability threshold (whisper.cpp).
+    /// No-speech probability threshold for treating a low-confidence window
+    /// as silence (default 0.6).
     #[arg(long)]
     pub no_speech_threshold: Option<f32>,
 
@@ -1268,7 +1767,8 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub carry_initial_prompt: bool,
 
-    /// Disable temperature fallback during decoding (whisper.cpp).
+    /// Disable temperature fallback during decoding (whisper.cpp; on the
+    /// native engine it overrides every flag that would enable it).
     #[arg(long)]
     pub no_fallback: bool,
 
@@ -1294,7 +1794,8 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub duration_ms: Option<u64>,
 
-    /// Audio context size, 0 = all (whisper.cpp).
+    /// Encoder audio context in frames, 0 = full 30 s window (whisper.cpp;
+    /// the native engine maps N > 0 to a fixed encoder context).
     #[arg(long)]
     pub audio_ctx: Option<i32>,
 
@@ -1407,7 +1908,7 @@ pub struct TranscribeArgs {
 #[derive(Debug, Args)]
 pub struct RunsArgs {
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Fetch a specific run by ID (prints full JSON details).
@@ -1561,7 +2062,161 @@ pub enum TtyAudioControlCommand {
     },
 }
 
+/// A parsed batch (bd-batch-transcribe-rraf): the ordered inputs and the
+/// request they all share.
+#[derive(Debug, Clone)]
+pub struct TranscribeBatch {
+    /// Input files in processing (and output) order.
+    pub inputs: Vec<PathBuf>,
+    template: TranscribeRequest,
+}
+
+impl TranscribeBatch {
+    /// The request for one input: the shared request with `path` as its file.
+    #[must_use]
+    pub fn request_for(&self, path: &Path) -> TranscribeRequest {
+        let mut request = self.template.clone();
+        request.input = InputSource::File {
+            path: path.to_path_buf(),
+        };
+        request
+    }
+}
+
+/// Parse an `--inputs-from` list: one path per line, taken verbatim apart
+/// from its `\n` / `\r\n` terminator; blank (or whitespace-only) lines are
+/// skipped and order is preserved. A leading UTF-8 byte order mark (Windows
+/// editors write one) is an encoding marker, not part of the first path.
+#[must_use]
+pub fn parse_input_list(text: &str) -> Vec<PathBuf> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    text.split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .filter(|line| !line.trim().is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Read and parse an `--inputs-from` list; `-` reads it from stdin.
+fn read_input_list(list: &Path) -> FwResult<Vec<PathBuf>> {
+    let text = if list.as_os_str() == "-" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|error| {
+                FwError::InvalidRequest(format!(
+                    "cannot read the --inputs-from list from stdin: {error}"
+                ))
+            })?;
+        text
+    } else {
+        std::fs::read_to_string(list).map_err(|error| {
+            FwError::InvalidRequest(format!(
+                "cannot read the --inputs-from list `{}`: {error}",
+                list.display()
+            ))
+        })?
+    };
+    Ok(parse_input_list(&text))
+}
+
+/// `--output-*` files land in the current directory as `<input stem>.<ext>`
+/// (`orchestrator::artifact_output_prefix`), so two different batch inputs
+/// with one stem (`day1/part1.wav`, `day2/part1.mp3`) would overwrite each
+/// other's files and leave the earlier record's `artifact_paths` naming the
+/// later input's transcript. Such a batch is rejected before any work.
+///
+/// Stems are compared case-insensitively (bd-batch-output-case-collision-8y2r):
+/// on a case-insensitive file system (the macOS and Windows defaults)
+/// `Talk.srt` and `talk.srt` are one file. Folding case on every OS keeps a
+/// batch valid or invalid the same way everywhere. One file named twice
+/// (`a.wav`, `./a.wav`) rewrites identical files and is allowed: inputs are
+/// identified by their canonical path when it resolves.
+fn reject_shared_artifact_prefixes(inputs: &[PathBuf]) -> FwResult<()> {
+    use std::collections::hash_map::{Entry, HashMap};
+    use std::ffi::OsString;
+
+    struct Owner<'a> {
+        input: &'a Path,
+        file: PathBuf,
+        prefix: PathBuf,
+    }
+    // A missing input keeps its spelling; it fails on its own when it runs.
+    let file_of = |input: &Path| std::fs::canonicalize(input).unwrap_or_else(|_| input.to_owned());
+    let mut owners: HashMap<OsString, Owner<'_>> = HashMap::new();
+    for input in inputs {
+        let prefix = crate::orchestrator::artifact_output_prefix(
+            &InputSource::File {
+                path: input.clone(),
+            },
+            Path::new(""),
+        );
+        // Non-UTF-8 stems stay byte-exact; a lowercased UTF-8 key can never
+        // equal one of them.
+        let key = prefix.to_str().map_or_else(
+            || prefix.clone().into_os_string(),
+            |stem| OsString::from(stem.to_lowercase()),
+        );
+        match owners.entry(key) {
+            Entry::Occupied(owner) => {
+                let owner = owner.get();
+                if owner.file != file_of(input) {
+                    return Err(FwError::InvalidRequest(format!(
+                        "batch inputs `{}` and `{}` would write the same --output-* files \
+                         (`{}.*` in the current directory; file names are compared \
+                         ignoring case); rename one or run them in separate batches",
+                        owner.input.display(),
+                        input.display(),
+                        owner.prefix.display()
+                    )));
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(Owner {
+                    input,
+                    file: file_of(input),
+                    prefix,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 impl TranscribeArgs {
+    /// Reject decoding flags no engine can honor before any work starts: a NaN
+    /// threshold would silently disable its gate (every comparison is false),
+    /// and the native engine maps these values per request (bd-6goy).
+    fn validate_decoding_flags(&self) -> FwResult<()> {
+        let invalid = |message: String| Err(FwError::InvalidRequest(message));
+        for (flag, value) in [
+            ("--temperature", self.temperature),
+            ("--temperature-increment", self.temperature_increment),
+            ("--entropy-threshold", self.entropy_threshold),
+            ("--logprob-threshold", self.logprob_threshold),
+            ("--no-speech-threshold", self.no_speech_threshold),
+        ] {
+            if let Some(value) = value
+                && !value.is_finite()
+            {
+                return invalid(format!("{flag} must be a finite number, got {value}"));
+            }
+        }
+        if self.temperature.is_some_and(|t| t < 0.0) {
+            return invalid("--temperature must be >= 0".to_owned());
+        }
+        if self
+            .temperature_increment
+            .is_some_and(|inc| !(0.0..=1.0).contains(&inc))
+        {
+            return invalid("--temperature-increment must be within [0, 1]".to_owned());
+        }
+        if self.best_of == Some(0) {
+            return invalid("--best-of must be at least 1".to_owned());
+        }
+        Ok(())
+    }
+
     /// Build a request while retaining these CLI arguments.
     ///
     /// Terminal production call sites should prefer [`Self::into_request`] so
@@ -1574,9 +2229,16 @@ impl TranscribeArgs {
     /// strings and paths instead of cloning them immediately before the CLI
     /// object is discarded.
     pub fn into_request(mut self) -> FwResult<TranscribeRequest> {
-        let effective_diarize = self.diarize || !self.no_diarize;
+        self.validate_decoding_flags()?;
+        if self.is_batch() {
+            return Err(FwError::InvalidRequest(
+                "several inputs select batch mode, which yields one request per input; \
+                 build them with `into_batch`"
+                    .to_owned(),
+            ));
+        }
         let mut mode_count = 0usize;
-        if self.input.is_some() {
+        if !self.input.is_empty() {
             mode_count += 1;
         }
         if self.stdin {
@@ -1596,21 +2258,8 @@ impl TranscribeArgs {
                 "--input, --stdin, and --mic are mutually exclusive".to_owned(),
             ));
         }
-        if !effective_diarize
-            && (self.speaker_hints.is_some()
-                || self.persist_speaker_profiles
-                || self.diarization_engine != DiarizationEngine::Auto
-                || self.diarization_fallback != DiarizationFallbackPolicy::Acoustic
-                || self.speaker_count_hard.is_some()
-                || self.speaker_count_range.is_some()
-                || self.speaker_count_prior.is_some())
-        {
-            return Err(FwError::InvalidRequest(
-                "diarization controls cannot be combined with --no-diarize".to_owned(),
-            ));
-        }
 
-        let input = if let Some(path) = self.input.take() {
+        let input = if let Some(path) = self.input.pop() {
             InputSource::File { path }
         } else if self.stdin {
             InputSource::Stdin {
@@ -1624,6 +2273,77 @@ impl TranscribeArgs {
                 ffmpeg_source: self.mic_ffmpeg_source.take(),
             }
         };
+        self.into_request_for(input)
+    }
+
+    /// Whether these arguments select batch mode: more than one `--input`, or
+    /// any `--inputs-from` list (even one naming zero or one path).
+    #[must_use]
+    pub fn is_batch(&self) -> bool {
+        self.input.len() > 1 || self.inputs_from.is_some()
+    }
+
+    /// Consume batch-mode arguments into the ordered input list plus the
+    /// request every input shares, reading the `--inputs-from` list (stdin for
+    /// `-`). Inputs keep their order: every `--input`, then each listed path.
+    ///
+    /// # Errors
+    ///
+    /// [`FwError::InvalidRequest`] for flags that cannot apply to a batch
+    /// (`--stdin`, `--mic`, one recording's `--speaker-hints`, one output
+    /// file's `--transcript-path`), an unreadable or non-UTF-8 list, two
+    /// different inputs whose `--output-*` files would overwrite each other
+    /// (same file stem), and every error a single request reports for the
+    /// shared flags.
+    pub fn into_batch(mut self) -> FwResult<TranscribeBatch> {
+        self.validate_decoding_flags()?;
+        if self.stdin || self.mic {
+            return Err(FwError::InvalidRequest(
+                "batch mode (repeated --input or --inputs-from) transcribes files; \
+                 it cannot be combined with --stdin or --mic"
+                    .to_owned(),
+            ));
+        }
+        if self.speaker_hints.is_some() {
+            return Err(FwError::InvalidRequest(
+                "--speaker-hints describes one recording and cannot apply to a batch".to_owned(),
+            ));
+        }
+        if self.transcript_path.is_some() {
+            return Err(FwError::InvalidRequest(
+                "--transcript-path names one output file and cannot be shared by a batch"
+                    .to_owned(),
+            ));
+        }
+        let mut inputs = std::mem::take(&mut self.input);
+        if let Some(list) = self.inputs_from.take() {
+            inputs.extend(read_input_list(&list)?);
+        }
+        let template = self.into_request_for(InputSource::File {
+            path: PathBuf::new(),
+        })?;
+        if !template.backend_params.output_formats.is_empty() {
+            reject_shared_artifact_prefixes(&inputs)?;
+        }
+        Ok(TranscribeBatch { inputs, template })
+    }
+
+    /// Build the request for `input` from every non-input flag.
+    fn into_request_for(mut self, input: InputSource) -> FwResult<TranscribeRequest> {
+        let effective_diarize = self.diarize || !self.no_diarize;
+        if !effective_diarize
+            && (self.speaker_hints.is_some()
+                || self.persist_speaker_profiles
+                || self.diarization_engine != DiarizationEngine::Auto
+                || self.diarization_fallback != DiarizationFallbackPolicy::Acoustic
+                || self.speaker_count_hard.is_some()
+                || self.speaker_count_range.is_some()
+                || self.speaker_count_prior.is_some())
+        {
+            return Err(FwError::InvalidRequest(
+                "diarization controls cannot be combined with --no-diarize".to_owned(),
+            ));
+        }
 
         // Build output format list from individual flags.
         let mut output_formats = Vec::new();
@@ -1725,7 +2445,7 @@ impl TranscribeArgs {
 
         let fast_model = self.fast_model.take();
         let quality_model = self.quality_model.take();
-        let speculative = self.speculative_request_with_models(fast_model, quality_model);
+        let speculative = self.speculative_request_with_models(fast_model, quality_model)?;
 
         let backend_params = BackendParams {
             output_formats,
@@ -1836,17 +2556,17 @@ impl TranscribeArgs {
 
     /// Build a `SpeculativeConfig` from CLI arguments.
     /// Returns `None` if `--speculative` is not set.
-    #[must_use]
-    pub fn to_speculative_config(&self) -> Option<crate::streaming::SpeculativeConfig> {
-        if !self.speculative {
-            return None;
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FwError::InvalidRequest`] when the configured window geometry
+    /// cannot make forward progress.
+    pub fn to_speculative_config(&self) -> FwResult<Option<crate::streaming::SpeculativeConfig>> {
+        let Some((window_size_ms, overlap_ms)) = self.speculative_window_geometry()? else {
+            return Ok(None);
+        };
 
-        let window_size_ms = self.speculative_window_ms.unwrap_or(3000);
-        let raw_overlap_ms = self.speculative_overlap_ms.unwrap_or(500);
-        let overlap_ms = raw_overlap_ms.min(window_size_ms.saturating_sub(1));
-
-        Some(crate::streaming::SpeculativeConfig {
+        Ok(Some(crate::streaming::SpeculativeConfig {
             window_size_ms,
             overlap_ms,
             fast_model_name: self
@@ -1864,7 +2584,7 @@ impl TranscribeArgs {
             },
             adaptive: !self.no_adaptive,
             emit_events: true,
-        })
+        }))
     }
 
     /// Build a serde-friendly [`SpeculativeRequest`] for storage in
@@ -1873,23 +2593,47 @@ impl TranscribeArgs {
     /// The orchestrator converts this into a
     /// [`crate::streaming::SpeculativeConfig`] at dispatch time, keeping
     /// `model.rs` free of any dependency on `streaming.rs`.
-    #[must_use]
-    pub fn to_speculative_request(&self) -> Option<crate::model::SpeculativeRequest> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FwError::InvalidRequest`] when the configured window geometry
+    /// cannot make forward progress.
+    pub fn to_speculative_request(&self) -> FwResult<Option<crate::model::SpeculativeRequest>> {
         self.speculative_request_with_models(self.fast_model.clone(), self.quality_model.clone())
+    }
+
+    fn speculative_window_geometry(&self) -> FwResult<Option<(u64, u64)>> {
+        if !self.speculative {
+            return Ok(None);
+        }
+
+        let window_size_ms = self.speculative_window_ms.unwrap_or(3000);
+        let overlap_ms = self.speculative_overlap_ms.unwrap_or(500);
+        if window_size_ms == 0 {
+            return Err(FwError::InvalidRequest(
+                "--speculative-window-ms must be greater than zero".to_owned(),
+            ));
+        }
+        if overlap_ms >= window_size_ms {
+            return Err(FwError::InvalidRequest(format!(
+                "--speculative-overlap-ms ({overlap_ms}) must be less than --speculative-window-ms ({window_size_ms})"
+            )));
+        }
+        if let Some(max_wer) = self.correction_tolerance_wer {
+            crate::speculation::CorrectionTolerance::validate_max_wer(max_wer)?;
+        }
+        Ok(Some((window_size_ms, overlap_ms)))
     }
 
     fn speculative_request_with_models(
         &self,
         fast_model: Option<String>,
         quality_model: Option<String>,
-    ) -> Option<crate::model::SpeculativeRequest> {
-        if !self.speculative {
-            return None;
-        }
-        let window_size_ms = self.speculative_window_ms.unwrap_or(3000);
-        let raw_overlap_ms = self.speculative_overlap_ms.unwrap_or(500);
-        let overlap_ms = raw_overlap_ms.min(window_size_ms.saturating_sub(1));
-        Some(crate::model::SpeculativeRequest {
+    ) -> FwResult<Option<crate::model::SpeculativeRequest>> {
+        let Some((window_size_ms, overlap_ms)) = self.speculative_window_geometry()? else {
+            return Ok(None);
+        };
+        Ok(Some(crate::model::SpeculativeRequest {
             window_size_ms,
             overlap_ms,
             fast_model_name: fast_model.unwrap_or_else(|| "auto-fast".to_owned()),
@@ -1897,7 +2641,7 @@ impl TranscribeArgs {
             max_wer_tolerance: self.correction_tolerance_wer,
             adaptive: !self.no_adaptive,
             always_correct: self.always_correct,
-        })
+        }))
     }
 }
 
@@ -1907,7 +2651,8 @@ mod tests {
 
     fn minimal_args() -> TranscribeArgs {
         TranscribeArgs {
-            input: Some(PathBuf::from("test.wav")),
+            input: vec![PathBuf::from("test.wav")],
+            inputs_from: None,
             stdin: false,
             mic: false,
             mic_seconds: 15,
@@ -1996,7 +2741,7 @@ mod tests {
     #[test]
     fn consuming_request_is_byte_identical_to_borrowed_request() {
         let mut args = minimal_args();
-        args.input = Some(PathBuf::from("audio/naïve input.wav"));
+        args.input = vec![PathBuf::from("audio/naïve input.wav")];
         args.model = Some("models/large-v3-turbo".to_owned());
         args.language = Some("日本語".to_owned());
         args.db = PathBuf::from("state/telemetry.sqlite3");
@@ -2022,9 +2767,227 @@ mod tests {
     }
 
     #[test]
+    fn input_list_keeps_order_and_verbatim_paths_and_skips_blank_lines() {
+        let list = "b.wav\r\n\n  \nsub dir/a b.wav\n c.wav \nlast.wav";
+        assert_eq!(
+            parse_input_list(list),
+            vec![
+                PathBuf::from("b.wav"),
+                PathBuf::from("sub dir/a b.wav"),
+                PathBuf::from(" c.wav "),
+                PathBuf::from("last.wav"),
+            ]
+        );
+        assert!(parse_input_list("").is_empty());
+        assert!(parse_input_list("\n\r\n \t\n").is_empty());
+    }
+
+    #[test]
+    fn input_list_ignores_a_leading_utf8_byte_order_mark() {
+        // Windows editors save UTF-8 lists with a BOM; it is an encoding
+        // marker, not part of the first path, which would otherwise fail as
+        // a missing file. Only a leading BOM is dropped.
+        assert_eq!(
+            parse_input_list("\u{feff}a.wav\r\nb.wav\r\n"),
+            vec![PathBuf::from("a.wav"), PathBuf::from("b.wav")]
+        );
+        assert!(parse_input_list("\u{feff}").is_empty());
+        assert_eq!(
+            parse_input_list("a.wav\n\u{feff}b.wav"),
+            vec![PathBuf::from("a.wav"), PathBuf::from("\u{feff}b.wav")]
+        );
+    }
+
+    #[test]
+    fn batch_mode_is_selected_by_repeated_input_or_any_input_list() {
+        let mut args = minimal_args();
+        assert!(!args.is_batch(), "one --input stays a single run");
+        args.input.push(PathBuf::from("second.wav"));
+        assert!(args.is_batch());
+        let mut listed = minimal_args();
+        listed.input.clear();
+        listed.inputs_from = Some(PathBuf::from("list.txt"));
+        assert!(
+            listed.is_batch(),
+            "--inputs-from is batch even for one path"
+        );
+
+        let error = args
+            .into_request()
+            .expect_err("a batch is not one request")
+            .to_string();
+        assert!(error.contains("batch mode"), "{error}");
+    }
+
+    #[test]
+    fn batch_requests_are_byte_identical_to_single_input_requests() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let list = dir.path().join("inputs.txt");
+        std::fs::write(&list, "listed one.wav\nlisted-two.wav\n").expect("write list");
+        let mut args = minimal_args();
+        args.input = vec![PathBuf::from("first.wav"), PathBuf::from("second.wav")];
+        args.inputs_from = Some(list);
+        args.language = Some("en".to_owned());
+        args.no_diarize = true;
+        args.no_persist = true;
+        args.max_segment_length = Some(1);
+        args.split_on_word = true;
+
+        let batch = args.clone().into_batch().expect("batch");
+        assert_eq!(
+            batch.inputs,
+            vec![
+                PathBuf::from("first.wav"),
+                PathBuf::from("second.wav"),
+                PathBuf::from("listed one.wav"),
+                PathBuf::from("listed-two.wav"),
+            ],
+            "every --input first, then the list, each in order"
+        );
+        for path in &batch.inputs {
+            let mut single = args.clone();
+            single.input = vec![path.clone()];
+            single.inputs_from = None;
+            let single = single.into_request().expect("single request");
+            assert_eq!(
+                serde_json::to_vec(&batch.request_for(path)).expect("serialize batch request"),
+                serde_json::to_vec(&single).expect("serialize single request"),
+                "batch input {} must run exactly the single-input request",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn batch_rejects_flags_that_cannot_apply_to_many_inputs() {
+        let batch_args = || {
+            let mut args = minimal_args();
+            args.input.push(PathBuf::from("second.wav"));
+            args
+        };
+        let mut with_stdin = batch_args();
+        with_stdin.stdin = true;
+        let mut with_mic = batch_args();
+        with_mic.mic = true;
+        let mut with_hints = batch_args();
+        with_hints.speaker_hints = Some(PathBuf::from("hints.json"));
+        let mut with_transcript_path = batch_args();
+        with_transcript_path.transcript_path = Some(PathBuf::from("out.json"));
+        let mut unreadable_list = batch_args();
+        unreadable_list.inputs_from = Some(PathBuf::from("/nonexistent/fw-batch-list.txt"));
+        for (args, needle) in [
+            (with_stdin, "--stdin or --mic"),
+            (with_mic, "--stdin or --mic"),
+            (with_hints, "--speaker-hints"),
+            (with_transcript_path, "--transcript-path"),
+            (unreadable_list, "--inputs-from list"),
+        ] {
+            let error = args.into_batch().expect_err("rejected batch").to_string();
+            assert!(error.contains(needle), "`{error}` should mention {needle}");
+        }
+    }
+
+    #[test]
+    fn empty_input_list_is_a_valid_empty_batch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let list = dir.path().join("empty.txt");
+        std::fs::write(&list, "\n\n").expect("write list");
+        let mut args = minimal_args();
+        args.input.clear();
+        args.inputs_from = Some(list);
+        let batch = args.into_batch().expect("empty batch");
+        assert!(batch.inputs.is_empty());
+    }
+
+    #[test]
+    fn batch_rejects_inputs_whose_output_files_would_collide() {
+        // `--output-*` files go to `./<input stem>.<ext>`: two inputs with one
+        // stem would overwrite each other's files, and the earlier record's
+        // artifact_paths would name the later input's transcript.
+        let batch_args = |inputs: &[&str], output_srt: bool| {
+            let mut args = minimal_args();
+            args.input = inputs.iter().map(PathBuf::from).collect();
+            args.output_srt = output_srt;
+            args
+        };
+        let error = batch_args(
+            &["day1/part1.wav", "day2/notes.wav", "day2/part1.mp3"],
+            true,
+        )
+        .into_batch()
+        .expect_err("colliding output prefixes")
+        .to_string();
+        assert!(
+            error.contains("day1/part1.wav")
+                && error.contains("day2/part1.mp3")
+                && error.contains("--output-*"),
+            "{error}"
+        );
+
+        // Without output files nothing is written, so the same stems are fine;
+        // the same path twice rewrites identical files.
+        for (inputs, output_srt) in [
+            (&["day1/part1.wav", "day2/part1.mp3"][..], false),
+            (&["day1/part1.wav", "day1/part1.wav"][..], true),
+            (&["day1/part1.wav", "day2/part2.wav"][..], true),
+        ] {
+            let batch = batch_args(inputs, output_srt)
+                .into_batch()
+                .unwrap_or_else(|error| panic!("{inputs:?} (srt {output_srt}): {error}"));
+            assert_eq!(batch.inputs.len(), inputs.len());
+        }
+    }
+
+    #[test]
+    fn batch_output_collisions_fold_case_and_follow_the_file_not_its_spelling() {
+        // bd-batch-output-case-collision-8y2r: on a case-insensitive file
+        // system (the macOS and Windows defaults) `./Talk.srt` and
+        // `./talk.srt` are one file, so stems that differ only in case
+        // collide. One file named two ways is still one input repeated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        for sub in ["day1", "day2"] {
+            std::fs::create_dir_all(dir.path().join(sub)).expect("mkdir");
+        }
+        let upper = dir.path().join("day1").join("Talk.wav");
+        let lower = dir.path().join("day2").join("talk.mp3");
+        for file in [&upper, &lower] {
+            std::fs::write(file, b"not audio").expect("write input");
+        }
+        let batch_args = |inputs: &[&Path]| {
+            let mut args = minimal_args();
+            args.input = inputs.iter().map(|path| path.to_path_buf()).collect();
+            args.output_srt = true;
+            args
+        };
+
+        let error = batch_args(&[&upper, &lower])
+            .into_batch()
+            .expect_err("stems differing only in case share ./talk.srt")
+            .to_string();
+        assert!(
+            error.contains("Talk.wav") && error.contains("talk.mp3"),
+            "{error}"
+        );
+
+        // `day1/../day1/Talk.wav` is a different spelling (Path equality
+        // keeps `..`) of the same file: it rewrites identical files.
+        let respelled = dir
+            .path()
+            .join("day1")
+            .join("..")
+            .join("day1")
+            .join("Talk.wav");
+        assert_ne!(respelled, upper);
+        let batch = batch_args(&[&upper, &respelled])
+            .into_batch()
+            .unwrap_or_else(|error| panic!("one file named twice: {error}"));
+        assert_eq!(batch.inputs, vec![upper.clone(), respelled]);
+    }
+
+    #[test]
     fn consuming_request_preserves_validation_errors() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         let retained = args
             .to_request()
             .expect_err("retained no-input error")
@@ -2051,7 +3014,7 @@ mod tests {
     #[test]
     fn no_input_specified_returns_error() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         let err = args.to_request().expect_err("should fail with no input");
         let text = err.to_string();
         assert!(
@@ -2082,7 +3045,7 @@ mod tests {
     #[test]
     fn stdin_input_produces_stdin_variant() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         args.stdin = true;
         let request = args.to_request().expect("should succeed");
         assert!(matches!(request.input, InputSource::Stdin { .. }));
@@ -2091,7 +3054,7 @@ mod tests {
     #[test]
     fn mic_input_produces_microphone_variant() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         args.mic = true;
         args.mic_seconds = 30;
         args.mic_device = Some("hw:1".to_owned());
@@ -2611,6 +3574,44 @@ mod tests {
     }
 
     #[test]
+    fn decoding_flags_reject_values_that_would_disable_their_gate() {
+        let rejects = |mutate: fn(&mut TranscribeArgs), needle: &str| {
+            let mut args = minimal_args();
+            mutate(&mut args);
+            let error = args.to_request().expect_err("invalid decoding flag");
+            assert!(error.to_string().contains(needle), "{error}");
+        };
+        rejects(
+            |a| a.logprob_threshold = Some(f32::NAN),
+            "--logprob-threshold",
+        );
+        rejects(
+            |a| a.entropy_threshold = Some(f32::INFINITY),
+            "--entropy-threshold",
+        );
+        rejects(
+            |a| a.no_speech_threshold = Some(f32::NEG_INFINITY),
+            "--no-speech-threshold",
+        );
+        rejects(|a| a.temperature = Some(-0.1), "--temperature");
+        rejects(
+            |a| a.temperature_increment = Some(1.5),
+            "--temperature-increment",
+        );
+        rejects(
+            |a| a.temperature_increment = Some(-0.2),
+            "--temperature-increment",
+        );
+        rejects(|a| a.best_of = Some(0), "--best-of");
+
+        let mut args = minimal_args();
+        args.temperature_increment = Some(0.0);
+        args.best_of = Some(1);
+        args.logprob_threshold = Some(-2.5);
+        args.to_request().expect("boundary values are valid");
+    }
+
+    #[test]
     fn decoding_params_built_from_all_fields() {
         let mut args = minimal_args();
         args.best_of = Some(3);
@@ -2724,7 +3725,7 @@ mod tests {
     #[test]
     fn mic_with_ffmpeg_overrides_produces_microphone_variant() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         args.mic = true;
         args.mic_seconds = 60;
         args.mic_ffmpeg_format = Some("pulse".to_owned());
@@ -2999,7 +4000,7 @@ mod tests {
     #[test]
     fn stdin_and_mic_returns_error() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         args.stdin = true;
         args.mic = true;
         let err = args.to_request().expect_err("should fail");
@@ -3100,7 +4101,7 @@ mod tests {
     #[test]
     fn mic_default_seconds_used_when_not_overridden() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         args.mic = true;
         // mic_seconds stays at default 15
         let request = args.to_request().expect("should succeed");
@@ -3123,7 +4124,7 @@ mod tests {
     #[test]
     fn stdin_hint_extension_is_none() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         args.stdin = true;
         let request = args.to_request().expect("should succeed");
         match &request.input {
@@ -3509,14 +4510,21 @@ mod tests {
     fn speculative_default_is_false() {
         let args = minimal_args();
         assert!(!args.speculative);
-        assert!(args.to_speculative_config().is_none());
+        assert!(
+            args.to_speculative_config()
+                .expect("disabled speculative config is valid")
+                .is_none()
+        );
     }
 
     #[test]
     fn speculative_config_built_when_flag_set() {
         let mut args = minimal_args();
         args.speculative = true;
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert_eq!(config.window_size_ms, 3000);
         assert_eq!(config.overlap_ms, 500);
         assert!(config.adaptive);
@@ -3529,7 +4537,10 @@ mod tests {
         args.speculative = true;
         args.speculative_window_ms = Some(5000);
         args.speculative_overlap_ms = Some(1000);
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert_eq!(config.window_size_ms, 5000);
         assert_eq!(config.overlap_ms, 1000);
     }
@@ -3540,7 +4551,10 @@ mod tests {
         args.speculative = true;
         args.fast_model = Some("whisper-tiny".to_owned());
         args.quality_model = Some("whisper-large".to_owned());
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert_eq!(config.fast_model_name, "whisper-tiny");
         assert_eq!(config.quality_model_name, "whisper-large");
     }
@@ -3550,7 +4564,10 @@ mod tests {
         let mut args = minimal_args();
         args.speculative = true;
         args.no_adaptive = true;
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert!(!config.adaptive);
     }
 
@@ -3559,7 +4576,10 @@ mod tests {
         let mut args = minimal_args();
         args.speculative = true;
         args.always_correct = true;
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert!(config.tolerance.always_correct);
     }
 
@@ -3568,8 +4588,49 @@ mod tests {
         let mut args = minimal_args();
         args.speculative = true;
         args.correction_tolerance_wer = Some(0.25);
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert!((config.tolerance.max_wer - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn speculative_config_and_request_reject_invalid_wer_tolerances() {
+        for max_wer in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            let mut args = minimal_args();
+            args.speculative = true;
+            args.correction_tolerance_wer = Some(max_wer);
+
+            assert!(
+                matches!(args.to_speculative_config(), Err(FwError::InvalidRequest(message)) if message.contains("WER tolerance")),
+                "config must reject invalid WER tolerance {max_wer}"
+            );
+            assert!(
+                matches!(args.to_speculative_request(), Err(FwError::InvalidRequest(message)) if message.contains("WER tolerance")),
+                "request must reject invalid WER tolerance {max_wer}"
+            );
+        }
+    }
+
+    #[test]
+    fn speculative_config_accepts_wer_tolerance_boundaries() {
+        for max_wer in [0.0, 1.0] {
+            let mut args = minimal_args();
+            args.speculative = true;
+            args.correction_tolerance_wer = Some(max_wer);
+
+            let config = args
+                .to_speculative_config()
+                .expect("boundary tolerance should be valid")
+                .expect("speculative config");
+            let request = args
+                .to_speculative_request()
+                .expect("boundary tolerance should be valid")
+                .expect("speculative request");
+            assert_eq!(config.tolerance.max_wer, max_wer);
+            assert_eq!(request.max_wer_tolerance, Some(max_wer));
+        }
     }
 
     #[test]
@@ -3629,7 +4690,10 @@ mod tests {
     fn speculative_config_default_model_names_are_auto_sentinels() {
         let mut args = minimal_args();
         args.speculative = true;
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert_eq!(config.fast_model_name, "auto-fast");
         assert_eq!(config.quality_model_name, "auto-quality");
         assert!(config.emit_events);
@@ -3681,16 +4745,44 @@ mod tests {
     }
 
     #[test]
-    fn to_request_speculative_overlap_is_clamped_below_window_size() {
+    fn to_request_rejects_speculative_overlap_without_forward_progress() {
         let mut args = minimal_args();
         args.speculative = true;
-        // overlap > window: must clamp to window - 1 (matches to_speculative_config behavior).
         args.speculative_window_ms = Some(1_000);
         args.speculative_overlap_ms = Some(5_000);
-        let request = args.to_request().expect("should build");
+
+        let result = args.to_request();
+        assert!(
+            matches!(result, Err(FwError::InvalidRequest(message)) if message.contains("--speculative-overlap-ms")),
+            "oversized overlap must be rejected instead of normalized to a 1 ms step"
+        );
+    }
+
+    #[test]
+    fn to_request_accepts_speculative_overlap_with_one_ms_step() {
+        let mut args = minimal_args();
+        args.speculative = true;
+        args.speculative_window_ms = Some(1_000);
+        args.speculative_overlap_ms = Some(999);
+
+        let request = args.to_request().expect("positive step should be valid");
         let spec = request.backend_params.speculative.as_ref().expect("set");
         assert_eq!(spec.window_size_ms, 1_000);
         assert_eq!(spec.overlap_ms, 999);
+    }
+
+    #[test]
+    fn to_request_rejects_zero_speculative_window() {
+        let mut args = minimal_args();
+        args.speculative = true;
+        args.speculative_window_ms = Some(0);
+        args.speculative_overlap_ms = Some(0);
+
+        let result = args.to_request();
+        assert!(
+            matches!(result, Err(FwError::InvalidRequest(message)) if message.contains("--speculative-window-ms")),
+            "zero-sized speculative window must be rejected"
+        );
     }
 
     #[test]
@@ -3717,8 +4809,14 @@ mod tests {
         args.no_adaptive = false;
         args.always_correct = false;
 
-        let request_form = args.to_speculative_request().expect("request form");
-        let config_form = args.to_speculative_config().expect("config form");
+        let request_form = args
+            .to_speculative_request()
+            .expect("request geometry")
+            .expect("request form");
+        let config_form = args
+            .to_speculative_config()
+            .expect("config geometry")
+            .expect("config form");
         assert_eq!(request_form.fast_model_name, config_form.fast_model_name);
         assert_eq!(
             request_form.quality_model_name,
@@ -4111,6 +5209,117 @@ mod tests {
     }
 
     #[test]
+    fn robot_listen_parses_defaults_and_full_flag_set() {
+        // Defaults (bd-rt-listen-cmd-i48i consolidated flag list).
+        let cli = Cli::try_parse_from(["fw", "robot", "listen"]).expect("bare listen");
+        let Command::Robot {
+            command: RobotCommand::Listen(args),
+        } = cli.command
+        else {
+            panic!("expected robot listen");
+        };
+        assert!(matches!(args.source, ListenSourceArg::Mic));
+        assert!(matches!(args.capture_backend, CaptureBackendArg::Auto));
+        assert!(matches!(args.policy, ListenPolicyArg::Alignatt));
+        assert_eq!(args.alignatt_holdback_ms, 200);
+        assert_eq!(args.step_ms, 300);
+        assert_eq!(args.max_buffer_sec, 12.0);
+        assert_eq!(args.max_utterance_sec, 90.0);
+        assert_eq!(args.stats_interval_sec, 30.0);
+        assert_eq!(args.capture_buffer_sec, 30.0);
+        assert_eq!(args.stdin_rate, 16_000);
+        assert_eq!(args.stdin_channels, 1);
+        assert!(matches!(args.stdin_format, StdinFormatArg::S16le));
+        assert_eq!(args.vad_gate_db, 9.0);
+        assert_eq!(args.vad_min_speech_ms, 250);
+        assert_eq!(args.vad_endpoint_ms, 600);
+        assert!(!args.no_partials && !args.no_vad && !args.no_context);
+        assert!(!args.list_devices && !args.realtime_pace);
+        assert!(args.language.is_none() && args.fast_model.is_none());
+
+        // Full flag exercise.
+        let cli = Cli::try_parse_from([
+            "fw",
+            "robot",
+            "listen",
+            "--source",
+            "file-replay",
+            "--input",
+            "/tmp/a.wav",
+            "--realtime-pace",
+            "--fast-model",
+            "tiny",
+            "--language",
+            "de",
+            "--step-ms",
+            "500",
+            "--max-buffer-sec",
+            "8",
+            "--max-seconds",
+            "60",
+            "--max-utterance-sec",
+            "30",
+            "--no-partials",
+            "--stats-interval-sec",
+            "5",
+            "--no-context",
+            "--capture-buffer-sec",
+            "10",
+            "--vad-gate-db",
+            "6",
+            "--vad-min-speech-ms",
+            "200",
+            "--vad-endpoint-ms",
+            "800",
+        ])
+        .expect("full listen flags");
+        let Command::Robot {
+            command: RobotCommand::Listen(args),
+        } = cli.command
+        else {
+            panic!("expected robot listen");
+        };
+        assert!(matches!(args.source, ListenSourceArg::FileReplay));
+        assert_eq!(
+            args.input.as_deref(),
+            Some(std::path::Path::new("/tmp/a.wav"))
+        );
+        assert!(args.realtime_pace && args.no_partials && args.no_context);
+        assert_eq!(args.language.as_deref(), Some("de"));
+        assert_eq!(args.step_ms, 500);
+        assert_eq!(args.vad_endpoint_ms, 800);
+
+        // stdin-pcm variants.
+        let cli = Cli::try_parse_from([
+            "fw",
+            "robot",
+            "listen",
+            "--source",
+            "stdin-pcm",
+            "--stdin-rate",
+            "48000",
+            "--stdin-channels",
+            "2",
+            "--stdin-format",
+            "f32le",
+        ])
+        .expect("stdin listen");
+        let Command::Robot {
+            command: RobotCommand::Listen(args),
+        } = cli.command
+        else {
+            panic!("expected robot listen");
+        };
+        assert!(matches!(args.source, ListenSourceArg::StdinPcm));
+        assert_eq!((args.stdin_rate, args.stdin_channels), (48_000, 2));
+        assert!(matches!(args.stdin_format, StdinFormatArg::F32le));
+
+        // Unknown policy value is a parse error (robot syntax contract:
+        // the binary wrapper turns this into one JSON envelope + exit 2).
+        assert!(Cli::try_parse_from(["fw", "robot", "listen", "--policy", "nonsense"]).is_err());
+    }
+
+    #[test]
     fn agent_discovery_commands_parse_with_stable_shapes() {
         let capabilities =
             Cli::try_parse_from(["fw", "capabilities", "--json"]).expect("capabilities command");
@@ -4135,6 +5344,20 @@ mod tests {
             })
         ));
 
+        for (arg, expected) in [
+            ("tiny-en", PullModelArg::TinyEn),
+            ("tiny", PullModelArg::Tiny),
+        ] {
+            let parsed = Cli::try_parse_from(["fw", "pull", arg, "--json"])
+                .unwrap_or_else(|e| panic!("pull {arg} must parse: {e}"));
+            match parsed.command {
+                Command::Pull(args) => {
+                    assert_eq!(args.model, expected, "pull {arg} target");
+                    assert!(args.json);
+                }
+                other => panic!("pull {arg} parsed to {other:?}"),
+            }
+        }
         let pull_default = Cli::try_parse_from(["fw", "pull"]).expect("default pull command");
         assert!(matches!(
             pull_default.command,

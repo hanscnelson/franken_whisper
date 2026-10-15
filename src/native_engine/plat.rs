@@ -1,8 +1,18 @@
-//! Platform seams for wasm32 portability (bd-m2jm, W1).
+//! Platform seams for wasm32 portability (bd-m2jm, W1) and for the engine's
+//! bounded compute pool (bd-threads-flag-unbounded-f4pq).
 //!
-//! On native targets every item is a pure re-export of the `std` original, so
-//! the native build is byte-for-byte the same code it was before this module
-//! existed. On `wasm32` the same names resolve to browser-safe shims:
+//! On native targets [`Instant`] and [`available_parallelism`] are pure
+//! re-exports of the `std` originals. [`scope`] is NOT `std::thread::scope`
+//! on native: it is a fork-join scope whose spawned closures run on the
+//! current rayon pool (see `native_pool`), so a kernel's band split never
+//! creates an OS thread and the run's `--threads` pool bounds it. The band
+//! partition every caller computes is unchanged, and each band is the same
+//! closure on the same inputs, so outputs are byte-identical to the old
+//! per-call OS threads at any pool width. [`thread_scope`] is the real
+//! `std::thread::scope` for the one caller whose spawned closure must run
+//! concurrently with the scope body (the window-pipelining encoder thread).
+//!
+//! On `wasm32` the same names resolve to browser-safe shims:
 //!
 //! - [`Instant`]: `std::time::Instant::now()` is an opaque trap on
 //!   `wasm32-unknown-unknown`. The shim reads a host-fed monotonic clock that
@@ -19,14 +29,143 @@
 //!   within a scope). `available_parallelism` reports 1.
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use std::thread::{Scope, ScopedJoinHandle, available_parallelism, scope};
+pub use native_pool::{Scope, ScopedJoinHandle, scope};
+#[cfg(not(target_arch = "wasm32"))]
+pub use std::thread::available_parallelism;
+#[cfg(not(target_arch = "wasm32"))]
+pub use std::thread::scope as thread_scope;
 #[cfg(not(target_arch = "wasm32"))]
 pub use std::time::Instant;
 
+/// Fork-join scope over the current rayon pool (native targets).
+///
+/// Deferred-batch semantics, the same contract the wasm threaded lane below
+/// already runs every engine scope under: `spawn` banks the closure and
+/// returns a handle; the first `join` — or scope exit, for handles never
+/// joined — runs every banked closure through `rayon::in_place_scope`, so
+/// they execute on the pool the caller is running in (the global pool from a
+/// non-pool thread). The pool's own latch does the waiting: a pool worker
+/// keeps stealing while it waits, a non-pool caller blocks without spinning.
+/// Every spawned closure has completed by the time its `join` returns, and
+/// all of them by the time `scope` returns.
+///
+/// What this deliberately does NOT support is a spawn that must run
+/// CONCURRENTLY with the scope body (a producer/consumer pair over a
+/// channel): the banked closure would never start and the body would wait
+/// forever. Use [`thread_scope`] for that shape.
+///
+/// A panicking closure is caught and returned as `Err` from its `join`, like
+/// `std::thread::ScopedJoinHandle::join`; a panic nobody joined is re-raised
+/// when the scope returns, like `std::thread::scope`.
+#[cfg(not(target_arch = "wasm32"))]
+mod native_pool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    type Banked<'env> = Box<dyn FnOnce() + Send + 'env>;
+    type Slot<T> = Arc<Mutex<Option<std::thread::Result<T>>>>;
+
+    /// Banked closures of one fork-join scope (see the module docs).
+    pub struct Scope<'env> {
+        banked: Mutex<Vec<Banked<'env>>>,
+        /// Closures that panicked and whose `Err` no `join` has taken yet.
+        unobserved_panics: Arc<AtomicUsize>,
+    }
+
+    /// Handle to one banked closure's result.
+    pub struct ScopedJoinHandle<'scope, 'env, T> {
+        scope: &'scope Scope<'env>,
+        slot: Slot<T>,
+    }
+
+    impl<'env> Scope<'env> {
+        /// Bank `f`; it runs at the first `join` on this scope, or at scope
+        /// exit.
+        pub fn spawn<'scope, F, T>(&'scope self, f: F) -> ScopedJoinHandle<'scope, 'env, T>
+        where
+            F: FnOnce() -> T + Send + 'env,
+            T: Send + 'env,
+        {
+            let slot: Slot<T> = Arc::new(Mutex::new(None));
+            let job_slot = Arc::clone(&slot);
+            let panics = Arc::clone(&self.unobserved_panics);
+            self.banked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Box::new(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+                    if result.is_err() {
+                        panics.fetch_add(1, Ordering::AcqRel);
+                    }
+                    *job_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+                }));
+            ScopedJoinHandle { scope: self, slot }
+        }
+
+        /// Run every banked closure on the current rayon pool and wait for
+        /// all of them. A pool-worker caller executes closures itself while
+        /// it waits; a non-pool caller only waits, so the closures never run
+        /// on more threads than the pool has.
+        fn run_banked(&self) {
+            let jobs =
+                std::mem::take(&mut *self.banked.lock().unwrap_or_else(PoisonError::into_inner));
+            if jobs.is_empty() {
+                return;
+            }
+            rayon::in_place_scope(|pool_scope| {
+                for job in jobs {
+                    pool_scope.spawn(move |_| job());
+                }
+            });
+        }
+    }
+
+    impl<T> ScopedJoinHandle<'_, '_, T> {
+        /// Run the scope's banked closures if they have not run yet, then
+        /// take this closure's result (`Err` = it panicked).
+        #[allow(clippy::missing_errors_doc)]
+        pub fn join(self) -> std::thread::Result<T> {
+            self.scope.run_banked();
+            let result = self
+                .slot
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .expect("a banked scope closure always fills its slot before run_banked returns");
+            if result.is_err() {
+                self.scope.unobserved_panics.fetch_sub(1, Ordering::AcqRel);
+            }
+            result
+        }
+    }
+
+    /// Fork-join scope over the current rayon pool (see the module docs).
+    pub fn scope<'env, F, T>(f: F) -> T
+    where
+        F: for<'scope> FnOnce(&'scope Scope<'env>) -> T,
+    {
+        let scope = Scope {
+            banked: Mutex::new(Vec::new()),
+            unobserved_panics: Arc::new(AtomicUsize::new(0)),
+        };
+        let result = f(&scope);
+        scope.run_banked();
+        assert!(
+            scope.unobserved_panics.load(Ordering::Acquire) == 0,
+            "a scoped compute closure panicked"
+        );
+        result
+    }
+}
+
+/// wasm32 has no OS threads to give the pipelining encoder, so its "thread"
+/// scope is the same shim as [`scope`] (unchanged wasm behavior).
+#[cfg(target_arch = "wasm32")]
+pub use wasm_impl::scope as thread_scope;
 #[cfg(target_arch = "wasm32")]
 pub use wasm_impl::{
     Instant, Scope, ScopedJoinHandle, available_parallelism, emit_partial_segments, emit_span,
-    scope, set_now_micros, set_segment_hook, set_span_hook,
+    scope, segment_hook_active, set_now_micros, set_segment_hook, set_span_hook,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -264,23 +403,24 @@ mod wasm_impl {
     /// [`super::super::perf_span`] measurement is forwarded to it — the
     /// engine's progress heartbeat for the page (window counts, tick counts).
     /// Unregistered = the forward is a cheap lock + None check.
-    static SPAN_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&str, f64) + Send + Sync>>> =
-        std::sync::Mutex::new(None);
+    type SpanHook = std::sync::Arc<dyn Fn(&str, f64) + Send + Sync>;
+    static SPAN_HOOK: std::sync::Mutex<Option<SpanHook>> = std::sync::Mutex::new(None);
 
     /// Register the host span hook (replaces any previous hook).
     pub fn set_span_hook(hook: Box<dyn Fn(&str, f64) + Send + Sync>) {
         *SPAN_HOOK
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::from(hook));
     }
 
     /// Forward one span to the registered hook, if any.
     pub fn emit_span(span: &str, ms: f64) {
-        if let Some(hook) = SPAN_HOOK
+        let hook = SPAN_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-        {
+            .map(std::sync::Arc::clone);
+        if let Some(hook) = hook {
             hook(span, ms);
         }
     }
@@ -288,30 +428,95 @@ mod wasm_impl {
     /// Host partial-transcript hook: the decode loop feeds each finished
     /// window's segments (as JSON) to the page while the run is still going,
     /// so the transcript renders live instead of appearing all at once.
-    static SEGMENT_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>> =
-        std::sync::Mutex::new(None);
+    type SegmentHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+    static SEGMENT_HOOK: std::sync::Mutex<Option<SegmentHook>> = std::sync::Mutex::new(None);
 
     /// Register the host partial-transcript hook (replaces any previous).
     pub fn set_segment_hook(hook: Box<dyn Fn(&str) + Send + Sync>) {
         *SEGMENT_HOOK
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::from(hook));
+    }
+
+    /// Whether a hook is registered (decode-loop serialization guard).
+    pub fn segment_hook_active() -> bool {
+        SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
     }
 
     /// Forward one window's segments (JSON array) to the registered hook.
     pub fn emit_partial_segments(json: &str) {
-        if let Some(hook) = SEGMENT_HOOK
+        let hook = SEGMENT_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-        {
+            .map(std::sync::Arc::clone);
+        if let Some(hook) = hook {
             hook(json);
         }
     }
 }
 
 #[cfg(all(not(target_arch = "wasm32"), target_os = "ios"))]
-pub use ios_hooks::{emit_partial_segments, emit_span, set_segment_hook, set_span_hook};
+pub use ios_hooks::{
+    emit_partial_segments, emit_span, segment_hook_active, set_segment_hook, set_span_hook,
+};
+
+/// Desktop twin of the wasm/iOS live-transcript hook registry
+/// (bd-rt-segment-hook-vo6p): the per-window partial-segment feed was
+/// compiled away on macOS/Linux, which is why a long batch transcription
+/// emitted nothing until the very end. Same shape and semantics as the
+/// wasm/iOS modules above; the confirm lane and batch progressive output
+/// are the desktop consumers. The hook fires on the decode thread, after
+/// timestamp rules, before the next window's encode; segment times are
+/// window-relative and the caller re-bases them. A panicking hook
+/// propagates (it runs on the caller's own decode call stack — a hook
+/// panic is a caller bug, not engine state corruption; the transcription
+/// cache is only written after a fully successful decode).
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+mod desktop_hooks {
+    type SegmentHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+    static SEGMENT_HOOK: std::sync::Mutex<Option<SegmentHook>> = std::sync::Mutex::new(None);
+
+    /// Register the process-wide partial-transcript hook (replaces any
+    /// previous). Prefer the scoped per-call hook on
+    /// `transcribe_samples_with_window_hook` for new desktop callers —
+    /// this global exists for wasm/iOS surface parity and single-consumer
+    /// processes.
+    pub fn set_segment_hook(hook: Box<dyn Fn(&str) + Send + Sync>) {
+        *SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::from(hook));
+    }
+
+    /// Whether a hook is registered (lets the decode loop skip JSON
+    /// serialization entirely when nobody is listening — the
+    /// zero-cost-when-off contract).
+    pub fn segment_hook_active() -> bool {
+        SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Forward one window's segments (JSON array) to the registered hook.
+    pub fn emit_partial_segments(json: &str) {
+        let hook = SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(std::sync::Arc::clone);
+        if let Some(hook) = hook {
+            hook(json);
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+pub use desktop_hooks::{emit_partial_segments, segment_hook_active, set_segment_hook};
 
 /// iOS twin of the wasm host hooks (fw-ios, the phone app's FFI crate): the
 /// engine's progress heartbeat (`emit_span`) and live-transcript feed
@@ -325,26 +530,27 @@ pub use ios_hooks::{emit_partial_segments, emit_span, set_segment_hook, set_span
 #[cfg(all(not(target_arch = "wasm32"), target_os = "ios"))]
 mod ios_hooks {
     /// Host span callback: (span name, milliseconds-or-count value).
-    pub type SpanHook = Box<dyn Fn(&str, f64) + Send + Sync>;
+    pub type SpanHook = std::sync::Arc<dyn Fn(&str, f64) + Send + Sync>;
     /// Host partial-transcript callback: one window's segments as JSON.
-    pub type SegmentHook = Box<dyn Fn(&str) + Send + Sync>;
+    pub type SegmentHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
     static SPAN_HOOK: std::sync::Mutex<Option<SpanHook>> = std::sync::Mutex::new(None);
 
     /// Register the host span hook (replaces any previous hook).
-    pub fn set_span_hook(hook: SpanHook) {
+    pub fn set_span_hook(hook: Box<dyn Fn(&str, f64) + Send + Sync>) {
         *SPAN_HOOK
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::from(hook));
     }
 
     /// Forward one span to the registered hook, if any.
     pub fn emit_span(span: &str, ms: f64) {
-        if let Some(hook) = SPAN_HOOK
+        let hook = SPAN_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-        {
+            .map(std::sync::Arc::clone);
+        if let Some(hook) = hook {
             hook(span, ms);
         }
     }
@@ -352,38 +558,167 @@ mod ios_hooks {
     static SEGMENT_HOOK: std::sync::Mutex<Option<SegmentHook>> = std::sync::Mutex::new(None);
 
     /// Register the host partial-transcript hook (replaces any previous).
-    pub fn set_segment_hook(hook: SegmentHook) {
+    pub fn set_segment_hook(hook: Box<dyn Fn(&str) + Send + Sync>) {
         *SEGMENT_HOOK
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::from(hook));
+    }
+
+    /// Whether a hook is registered (lets the decode loop avoid serializing
+    /// segment JSON when the Swift host has not installed a callback).
+    pub fn segment_hook_active() -> bool {
+        SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
     }
 
     /// Forward one window's segments (JSON array) to the registered hook.
     pub fn emit_partial_segments(json: &str) {
-        if let Some(hook) = SEGMENT_HOOK
+        let hook = SEGMENT_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-        {
+            .map(std::sync::Arc::clone);
+        if let Some(hook) = hook {
             hook(json);
         }
     }
 }
 
+#[cfg(test)]
+pub(crate) static SEGMENT_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    /// The seam must be a pure re-export on native: `plat::Instant` and
-    /// `plat::scope` ARE the std items, not lookalikes.
+    /// `plat::Instant` / `plat::available_parallelism` / `plat::thread_scope`
+    /// are the std items on native, not lookalikes.
     #[test]
-    fn native_seam_is_std() {
+    fn native_clock_and_thread_scope_are_std() {
         let t: super::Instant = std::time::Instant::now();
         let _ = t.elapsed();
-        let sum: i64 = super::scope(|s| {
-            let a = s.spawn(|| 1i64);
-            let b = s.spawn(|| 2i64);
-            a.join().unwrap() + b.join().unwrap()
-        });
-        assert_eq!(sum, 3);
+        let caller = std::thread::current().id();
+        let spawned = super::thread_scope(|s| s.spawn(|| std::thread::current().id()).join());
+        assert_ne!(
+            spawned.unwrap(),
+            caller,
+            "thread_scope must spawn a real thread"
+        );
         assert!(super::available_parallelism().unwrap().get() >= 1);
+    }
+
+    /// The pooled scope returns every band's result, in join order, with
+    /// borrowed and mutably-split inputs.
+    #[test]
+    fn pooled_scope_joins_results_and_fills_disjoint_slices() {
+        let input: Vec<i64> = (1..=100).collect();
+        let mut out = vec![0i64; 100];
+        let sums: Vec<i64> = super::scope(|s| {
+            let handles: Vec<_> = input
+                .chunks(13)
+                .zip(out.chunks_mut(13))
+                .map(|(src, dst)| {
+                    s.spawn(move || {
+                        for (d, v) in dst.iter_mut().zip(src) {
+                            *d = v * 2;
+                        }
+                        src.iter().sum::<i64>()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(sums.iter().sum::<i64>(), 5050);
+        assert_eq!(sums.len(), 100usize.div_ceil(13));
+        assert!(out.iter().zip(&input).all(|(o, i)| *o == i * 2));
+        // Unjoined handles still complete before `scope` returns.
+        let mut touched = [false; 4];
+        super::scope(|s| {
+            for slot in &mut touched {
+                s.spawn(move || *slot = true);
+            }
+        });
+        assert!(touched.iter().all(|t| *t));
+    }
+
+    /// The point of the pooled scope (bd-threads-flag-unbounded-f4pq): a
+    /// band split inside a 2-thread pool runs on that pool's two workers and
+    /// creates no thread of its own, however many bands it spawns. The old
+    /// `std::thread::scope` seam ran each band on a fresh OS thread, which
+    /// this test rejects (distinct non-pool thread ids).
+    #[test]
+    fn pooled_scope_runs_on_the_current_pool_and_spawns_no_thread() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("2-thread test pool");
+        let ran_on: Vec<(std::thread::ThreadId, Option<usize>)> = pool.install(|| {
+            super::scope(|s| {
+                let handles: Vec<_> = (0..16)
+                    .map(|_| {
+                        s.spawn(|| {
+                            // Long enough that a fresh-thread-per-band seam
+                            // would show 16 distinct threads.
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            (std::thread::current().id(), rayon::current_thread_index())
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            })
+        });
+        assert_eq!(ran_on.len(), 16);
+        assert!(
+            ran_on.iter().all(|(_, index)| index.is_some_and(|i| i < 2)),
+            "every band must run on a worker of the installing 2-thread pool: {ran_on:?}"
+        );
+        let distinct: std::collections::BTreeSet<_> =
+            ran_on.iter().map(|(id, _)| format!("{id:?}")).collect();
+        assert!(
+            distinct.len() <= 2,
+            "bands ran on {} threads",
+            distinct.len()
+        );
+    }
+
+    /// A band panic surfaces as `Err` from its `join` (like
+    /// `std::thread::ScopedJoinHandle::join`) and does not poison the scope.
+    #[test]
+    fn pooled_scope_join_reports_a_band_panic() {
+        let (ok, err) = super::scope(|s| {
+            let good = s.spawn(|| 7);
+            let bad = s.spawn(|| -> i32 { panic!("band failed") });
+            (good.join(), bad.join())
+        });
+        assert_eq!(ok.unwrap(), 7);
+        assert!(err.is_err());
+    }
+
+    /// A panic nobody joined is re-raised when the scope returns (like
+    /// `std::thread::scope`), after every band has finished.
+    #[test]
+    #[should_panic(expected = "a scoped compute closure panicked")]
+    fn pooled_scope_reraises_an_unjoined_panic() {
+        super::scope(|s| {
+            s.spawn(|| panic!("unjoined band failed"));
+        });
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn segment_hook_can_replace_itself_without_deadlocking() {
+        let _guard = super::SEGMENT_HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..10 {
+            let calls = std::sync::Arc::clone(&calls);
+            super::set_segment_hook(Box::new(move |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::set_segment_hook(Box::new(|_| {}));
+            }));
+            super::emit_partial_segments("[]");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 10);
     }
 }

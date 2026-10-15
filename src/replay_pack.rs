@@ -59,7 +59,12 @@ pub struct ToleranceManifest {
     pub timestamp_tolerance_sec: f64,
     pub require_text_exact: bool,
     pub require_speaker_exact: bool,
-    pub native_rollout_stage: String,
+    /// Canonical native rollout stage observed in the run evidence.
+    ///
+    /// `None` means the report did not contain a valid rollout-stage event;
+    /// replay artifacts must not invent a stage for legacy or non-native runs.
+    #[serde(default)]
+    pub native_rollout_stage: Option<String>,
     pub segment_count: usize,
     pub event_count: usize,
 }
@@ -113,25 +118,23 @@ fn latest_event_payload_value<'a>(
         .and_then(|event| event.payload.get(key))
 }
 
-fn rollout_stage_from_report(report: &RunReport) -> String {
-    latest_event_payload_value(report, "backend.ok", "native_rollout_stage")
-        .or_else(|| {
-            latest_event_payload_value(
-                report,
-                "backend.routing.decision_contract",
-                "native_rollout_stage",
-            )
-        })
+fn rollout_stage_for_event(report: &RunReport, code: &str) -> Option<String> {
+    latest_event_payload_value(report, code, "native_rollout_stage")
         .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| NativeEngineRolloutStage::Primary.as_str().to_owned())
+        .and_then(NativeEngineRolloutStage::parse)
+        .map(|stage| stage.as_str().to_owned())
+}
+
+fn rollout_stage_from_report(report: &RunReport) -> Option<String> {
+    rollout_stage_for_event(report, "backend.ok")
+        .or_else(|| rollout_stage_for_event(report, "backend.routing.decision_contract"))
 }
 
 /// Build the tolerance manifest from a completed report.
 pub fn build_tolerance_manifest(report: &RunReport) -> ToleranceManifest {
     let tolerance = SegmentCompatibilityTolerance::default();
     ToleranceManifest {
-        schema_version: "tolerance-manifest-v1".to_owned(),
+        schema_version: "tolerance-manifest-v2".to_owned(),
         timestamp_tolerance_sec: tolerance.timestamp_tolerance_sec,
         require_text_exact: tolerance.require_text_exact,
         require_speaker_exact: tolerance.require_speaker_exact,
@@ -150,21 +153,20 @@ pub fn write_replay_pack(report: &RunReport, output_dir: &Path) -> FwResult<()> 
     let repro_lock = build_repro_lock(report);
     let tolerance_manifest = build_tolerance_manifest(report);
 
-    std::fs::write(
-        output_dir.join("env.json"),
-        serde_json::to_string_pretty(&env_snapshot)?,
-    )?;
-    std::fs::write(
-        output_dir.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest)?,
-    )?;
-    std::fs::write(
-        output_dir.join("repro.lock"),
-        serde_json::to_string_pretty(&repro_lock)?,
-    )?;
-    std::fs::write(
+    // Serialize the complete generation before publishing any member. Each
+    // file then uses the repository's same-directory fsync+rename helper, so a
+    // serialization or short-write failure cannot tear an existing artifact.
+    let env_json = serde_json::to_string_pretty(&env_snapshot)?;
+    let manifest_json = serde_json::to_string_pretty(&manifest)?;
+    let repro_json = serde_json::to_string_pretty(&repro_lock)?;
+    let tolerance_json = serde_json::to_string_pretty(&tolerance_manifest)?;
+
+    crate::youtube::render::write_atomic(output_dir.join("env.json"), &env_json)?;
+    crate::youtube::render::write_atomic(output_dir.join("manifest.json"), &manifest_json)?;
+    crate::youtube::render::write_atomic(output_dir.join("repro.lock"), &repro_json)?;
+    crate::youtube::render::write_atomic(
         output_dir.join("tolerance_manifest.json"),
-        serde_json::to_string_pretty(&tolerance_manifest)?,
+        &tolerance_json,
     )?;
 
     Ok(())
@@ -241,6 +243,8 @@ mod tests {
                 backend_identity: Some("whisper-cli".to_owned()),
                 backend_version: Some("whisper 1.7.2".to_owned()),
                 output_payload_hash: Some("output-sha256".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         }
     }
@@ -766,11 +770,11 @@ mod tests {
     }
 
     #[test]
-    fn tolerance_manifest_defaults_to_primary_rollout_stage_when_absent() {
+    fn tolerance_manifest_does_not_invent_rollout_stage_when_absent() {
         let report = fixture_report();
         let tolerance = build_tolerance_manifest(&report);
-        assert_eq!(tolerance.native_rollout_stage, "primary");
-        assert_eq!(tolerance.schema_version, "tolerance-manifest-v1");
+        assert_eq!(tolerance.native_rollout_stage, None);
+        assert_eq!(tolerance.schema_version, "tolerance-manifest-v2");
         assert!(tolerance.timestamp_tolerance_sec > 0.0);
         assert!(tolerance.require_text_exact);
     }
@@ -790,7 +794,7 @@ mod tests {
         });
 
         let tolerance = build_tolerance_manifest(&report);
-        assert_eq!(tolerance.native_rollout_stage, "shadow");
+        assert_eq!(tolerance.native_rollout_stage.as_deref(), Some("shadow"));
     }
 
     #[test]
@@ -818,7 +822,7 @@ mod tests {
         ]);
 
         let tolerance = build_tolerance_manifest(&report);
-        assert_eq!(tolerance.native_rollout_stage, "primary");
+        assert_eq!(tolerance.native_rollout_stage.as_deref(), Some("primary"));
     }
 
     #[test]
@@ -848,7 +852,8 @@ mod tests {
 
         let tolerance = build_tolerance_manifest(&report);
         assert_eq!(
-            tolerance.native_rollout_stage, "validated",
+            tolerance.native_rollout_stage.as_deref(),
+            Some("validated"),
             "latest backend.ok by seq should win even when vec order is scrambled"
         );
     }
@@ -911,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn rollout_stage_non_string_value_falls_back_to_primary() {
+    fn rollout_stage_non_string_value_remains_unknown() {
         use crate::model::RunEvent;
 
         let mut report = fixture_report();
@@ -926,8 +931,61 @@ mod tests {
 
         let tolerance = build_tolerance_manifest(&report);
         assert_eq!(
-            tolerance.native_rollout_stage, "primary",
-            "non-string rollout stage should fall back to primary"
+            tolerance.native_rollout_stage, None,
+            "non-string rollout stage must not manufacture primary provenance"
+        );
+    }
+
+    #[test]
+    fn rollout_stage_invalid_string_remains_unknown() {
+        use crate::model::RunEvent;
+
+        let mut report = fixture_report();
+        report.events.push(RunEvent {
+            seq: 1,
+            ts_rfc3339: "2026-01-01T00:00:00Z".to_owned(),
+            stage: "backend_routing".to_owned(),
+            code: "backend.routing.decision_contract".to_owned(),
+            message: "routing".to_owned(),
+            payload: json!({"native_rollout_stage": "not-a-rollout-stage"}),
+        });
+
+        let tolerance = build_tolerance_manifest(&report);
+        assert_eq!(
+            tolerance.native_rollout_stage, None,
+            "unknown strings must not escape the closed rollout state space"
+        );
+    }
+
+    #[test]
+    fn malformed_backend_ok_stage_falls_back_to_valid_routing_decision() {
+        use crate::model::RunEvent;
+
+        let mut report = fixture_report();
+        report.events.extend([
+            RunEvent {
+                seq: 1,
+                ts_rfc3339: "2026-01-01T00:00:00Z".to_owned(),
+                stage: "backend_routing".to_owned(),
+                code: "backend.routing.decision_contract".to_owned(),
+                message: "routing decision".to_owned(),
+                payload: json!({"native_rollout_stage": "fallback"}),
+            },
+            RunEvent {
+                seq: 2,
+                ts_rfc3339: "2026-01-01T00:00:01Z".to_owned(),
+                stage: "backend".to_owned(),
+                code: "backend.ok".to_owned(),
+                message: "backend completed".to_owned(),
+                payload: json!({"native_rollout_stage": 42}),
+            },
+        ]);
+
+        let tolerance = build_tolerance_manifest(&report);
+        assert_eq!(
+            tolerance.native_rollout_stage.as_deref(),
+            Some("fallback"),
+            "a malformed terminal payload must not hide valid routing evidence"
         );
     }
 

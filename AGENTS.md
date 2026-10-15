@@ -62,6 +62,27 @@ parameters explicitly on every row.
 
 ---
 
+## Pstack workflow (always on)
+
+Cursor agents load `.cursor/rules/pstack.mdc` (`alwaysApply: true`). That rule is the task-type decision table. The skills it names are vendored at `.cursor/skills/pstack/`. Read `.cursor/skills/pstack/<name>/SKILL.md` before citing a skill. Cite only what you read. The only supported update path is `scripts/sync-pstack.sh <source-dir>`.
+
+Production images and release builds come only from merged `main`. This repo has no image build. The gate is `scripts/check-build-from-main.sh`, and `.github/workflows/registry-release.yml` runs `check` and `push` before qualification on the preflight, Linux, and macOS jobs. The gate fetches `origin main` and refuses unless `HEAD` is an ancestor of `origin/main`, `git status --porcelain` is empty, free disk is at least `FW_MIN_FREE_MB` (default 2048), and, when `FW_IMAGE_TAG` is set, the tag equals the `Cargo.toml` package version or `v` plus that version. There is no `producer_version` in this repo. On success the gate prints `org.opencontainers.image.revision=<sha>` so the image label can be applied. There is no Dockerfile to attach that label today. `FW_ALLOW_NON_MAIN_IMAGE=1` is a logged override for a local dev image. `scripts/check-build-from-main.sh push` exits non-zero while that override is set, so the image is never pushed.
+
+| Rule | Enforced by | Level |
+|---|---|---|
+| Cloud agents get pstack automatically | vendored `.cursor/skills/pstack` plus `alwaysApply` rule, and CI `pstack-present` | architecture + CI |
+| Production images come only from merged main | build script ancestry check, a SHA label on the image, and branch protection | architecture |
+| Bug fixes land with a failing test first | CI `test-before-fix` | CI test |
+| Every PR carries verification evidence | PR template plus CI `pr-evidence` body check | CI lint |
+| Every delegation names skills, a predicate, and the evidence to return | pstack-always preflight; CAL II rejects returns with no evidence | process (judgment) |
+| Numbers are vetted before reporting | benchmark-checklist named in the contract; return item 3 required | process |
+| No quiet method switches | contract item 5 "deviations", plus a pstack-always hard rule | process |
+| Minimize Hans asks | never-block principle in pstack-always; asks bundled | docs (judgment) |
+| A repeat correction becomes a rule | /correct; a rule with no enforcer that repeats is escalated | process |
+| Parallel agents don't share a branch or disk budget | each Cloud agent gets its own branch; the build script checks free disk before building | architecture |
+
+---
+
 ## Project Mission
 
 `franken_whisper` is a native Rust, memory-safe, high-performance speech system that merges ideas from:
@@ -104,17 +125,17 @@ that checkout is absent). Behavior levers are env-gated `OnceLock` flags
 flip; grep `const DEFAULT_ON`/`get_or_init` before trusting any claim about
 what is on. Perf/behavior changes here require the evidence-ledger discipline
 (`docs/NEGATIVE_EVIDENCE.md` / `docs/PERF_LEDGER.md`) and byte-exactness or an
-explicit `DISCREPANCIES.md` entry.
+explicit `docs/planning/DISCREPANCIES.md` entry.
 
 ---
 
 ## Porting Workflow (Spec-First)
 
 Use this workflow order:
-1. `PLAN_TO_PORT_WHISPER_STACK_TO_RUST.md`
-2. `EXISTING_LEGACY_WHISPER_STRUCTURE.md`
-3. `PROPOSED_ARCHITECTURE.md`
-4. `FEATURE_PARITY.md`
+1. `docs/planning/PLAN_TO_PORT_WHISPER_STACK_TO_RUST.md`
+2. `docs/planning/EXISTING_LEGACY_WHISPER_STRUCTURE.md`
+3. `docs/planning/PROPOSED_ARCHITECTURE.md`
+4. `docs/planning/FEATURE_PARITY.md`
 
 Implementation should follow spec documents, not ad-hoc copying from legacy code.
 
@@ -131,8 +152,8 @@ Hard rules:
 - No two-way magic merge.
 - Maintain explicit version markers.
 - Keep recovery procedures documented in:
-  - `SYNC_STRATEGY.md`
-  - `RECOVERY_RUNBOOK.md`
+  - `docs/operations/SYNC_STRATEGY.md`
+  - `docs/operations/RECOVERY_RUNBOOK.md`
 
 ---
 
@@ -188,7 +209,7 @@ We do not care about backwards compatibility—we're in early development with n
 
 - Rust 2024 edition.
 - Nightly toolchain (`rust-toolchain.toml`).
-- `#![forbid(unsafe_code)]`.
+- `#![deny(unsafe_code)]` (`src/lib.rs`, and `unsafe_code = "deny"` in `[lints.rust]`), not `forbid`: new `unsafe` needs an explicit, reviewed `#[allow(unsafe_code)]` on the smallest item (existing islands: native-engine SIMD kernels and buffers, the fw-ios FFI).
 - Cargo only.
 
 ---
@@ -712,3 +733,5 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 ## Note on Built-in TODO Functionality
 
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
+
+For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "franken_whisper-agent (+https://github.com/Dicklesworthstone/franken_whisper)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.

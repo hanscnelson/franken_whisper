@@ -25,8 +25,10 @@
  * fw_last_error_message reports the calling thread's last error.
  *
  * Callbacks are invoked from whichever thread runs the engine (decode loop /
- * load). They must be thread-safe, non-blocking, and must not call back into
- * the library. Clear a callback (func = NULL) before releasing its ctx.
+ * load). They must be thread-safe and non-blocking. A callback may clear or
+ * replace itself, but must not invoke engine work recursively. Clear a callback
+ * (func = NULL) before releasing its ctx; clearing from another thread waits
+ * for an in-flight callback to return.
  *
  * Cancellation: fw_request_cancel() sets a process-wide flag checked at the
  * engine's cooperative checkpoints; the in-flight call returns code 6. Call
@@ -173,6 +175,32 @@ int32_t fw_stage_pcm(FwEngine *engine,
 int32_t fw_run_prepared(FwEngine *engine,
                         const char *options_json,
                         char **out_json);
+
+/* Decode the currently UNCOMMITTED slice of one live utterance. The host owns
+ * capture, VAD, and its session clock; Rust owns decoding and the exact
+ * AlignAtt durability decision shared with `fw robot listen`.
+ *
+ * options_json (NULL or "" = defaults; unknown keys rejected):
+ *   {"language":null,"initial_prompt":null,"end_of_utterance":false,
+ *    "alignatt_holdback_ms":200,"n_threads":4}
+ *
+ * Mid-utterance calls use dynamic AudioCtx and the real attention tap. The
+ * result separates append-only `commit_text` from mutable `partial_tail` and
+ * reports `commit_through_sec` relative to THIS PCM slice. Endpoint calls use
+ * full encoder context and commit the complete remaining transcript. Result:
+ *   {language, commit_text, commit_through_sec, partial_tail, commit_tokens,
+ *    commit_confidence, holdback, end_of_utterance}
+ *
+ * `alignatt_holdback_ms` is bounded to 0..300000 and 0 retains a one-frame
+ * safety floor, matching the core live driver.
+ *
+ * `pcm` is 16 kHz mono f32. A step requires at least 0.5 seconds; an endpoint
+ * accepts any non-empty remainder. The result string is caller-owned and must
+ * be released with fw_string_free(). */
+int32_t fw_live_decode_pcm(FwEngine *engine,
+                           const float *pcm, size_t len,
+                           const char *options_json,
+                           char **out_json);
 
 /* ── Progress + live transcript ─────────────────────────────────────────── */
 

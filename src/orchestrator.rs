@@ -188,6 +188,7 @@ impl PipelineConfig {
     /// Rules enforced:
     /// - `Normalize` requires `Ingest` before it.
     /// - `Backend` requires `Normalize` before it (which itself requires `Ingest`).
+    /// - `Separate` requires `Normalize` and must precede `Backend` when both run.
     /// - No duplicate stages.
     pub fn validate(&self) -> FwResult<()> {
         let mut positions = [None; DEFAULT_STAGES.len()];
@@ -272,6 +273,13 @@ impl PipelineConfig {
                         "Separate stage requires Normalize before it".to_owned(),
                     ));
                 }
+            }
+            if let Some(backend_pos) = pos(PipelineStage::Backend)
+                && sep_pos >= backend_pos
+            {
+                return Err(FwError::InvalidRequest(
+                    "Separate stage must precede Backend when both stages are present".to_owned(),
+                ));
             }
         }
 
@@ -385,6 +393,9 @@ pub(crate) struct PipelineCx {
     budget: Budget,
     evidence: Vec<Value>,
     finalizers: FinalizerRegistry,
+    /// The caller's handle for cancelling this run (batch mode), copied into
+    /// every token this context hands out.
+    run_cancel: Option<RunCancel>,
 }
 
 impl PipelineCx {
@@ -412,6 +423,7 @@ impl PipelineCx {
             budget,
             evidence: Vec::new(),
             finalizers: FinalizerRegistry::new(),
+            run_cancel: None,
         }
     }
 
@@ -420,6 +432,9 @@ impl PipelineCx {
             return Err(FwError::Cancelled(
                 "pipeline cancelled via Ctrl+C".to_owned(),
             ));
+        }
+        if self.run_cancel.is_some_and(RunCancel::is_cancelled) {
+            return Err(RunCancel::error());
         }
         if let Some(deadline) = self.deadline
             && Utc::now() >= deadline
@@ -494,6 +509,8 @@ impl PipelineCx {
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         CancellationToken {
             deadline: self.deadline,
+            deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: self.run_cancel,
         }
     }
 
@@ -511,7 +528,25 @@ impl PipelineCx {
             Some(pipeline_deadline) => Some(pipeline_deadline.min(stage_deadline)),
             None => Some(stage_deadline),
         };
-        CancellationToken { deadline }
+        CancellationToken {
+            deadline,
+            deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: self.run_cancel,
+        }
+    }
+
+    /// Produce a stage token whose deadline error preserves whether the
+    /// pipeline deadline or the named per-stage budget expires first.
+    fn named_stage_token(&self, stage: &'static str, stage_budget_ms: u64) -> CancellationToken {
+        let now = Utc::now();
+        let clamped = stage_budget_ms.min(i64::MAX as u64);
+        let stage_deadline = now
+            .checked_add_signed(chrono::Duration::milliseconds(clamped as i64))
+            .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
+        CancellationToken {
+            run_cancel: self.run_cancel,
+            ..named_stage_token_for_deadlines(self.deadline, stage_deadline, stage, stage_budget_ms)
+        }
     }
 
     /// Register a cleanup action to be run when the pipeline shuts down.
@@ -538,21 +573,127 @@ impl PipelineCx {
 /// Lightweight, `Send + Sync + Clone` handle that backends use to check the
 /// pipeline deadline without needing the full `PipelineCx`.
 #[derive(Debug, Clone, Copy)]
+enum DeadlineFailure {
+    Cancelled,
+    StageTimeout { stage: &'static str, budget_ms: u64 },
+}
+
+fn named_stage_token_for_deadlines(
+    pipeline_deadline: Option<chrono::DateTime<Utc>>,
+    stage_deadline: chrono::DateTime<Utc>,
+    stage: &'static str,
+    stage_budget_ms: u64,
+) -> CancellationToken {
+    // Strict precedence is intentional: an exact tie is a stage timeout so
+    // the worker checkpoint and token-budget receiver agree.
+    if pipeline_deadline.is_some_and(|deadline| deadline < stage_deadline) {
+        CancellationToken {
+            deadline: pipeline_deadline,
+            deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
+        }
+    } else {
+        CancellationToken {
+            deadline: Some(stage_deadline),
+            deadline_failure: DeadlineFailure::StageTimeout {
+                stage,
+                budget_ms: stage_budget_ms,
+            },
+            run_cancel: None,
+        }
+    }
+}
+
+/// The caller's handle for cancelling a run it drives
+/// (bd-robot-batch-epipe-keeps-running-elf0). [`BatchTranscriber`] hands one
+/// out through [`BatchTranscriber::cancel_handle`].
+///
+/// Cancelling makes every checkpoint of the run in flight fail with
+/// [`FwError::Cancelled`], the cooperative path Ctrl+C takes: stage workers,
+/// backend subprocesses and the native decoder stop at their next checkpoint,
+/// and the persist stage, which checks its token before committing, writes
+/// nothing. Unlike `ShutdownController`, it leaves the process-wide shutdown
+/// state alone, so the caller decides the exit status. Cancelling is final:
+/// every later run of the same transcriber fails before it starts.
+///
+/// `Copy`, like the tokens that carry it: the flag lives for the rest of the
+/// process (one small allocation per [`BatchTranscriber`]).
+#[derive(Debug, Clone, Copy)]
+pub struct RunCancel {
+    flag: &'static std::sync::atomic::AtomicBool,
+}
+
+impl RunCancel {
+    fn new() -> Self {
+        Self {
+            flag: Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false))),
+        }
+    }
+
+    /// Cancel the run in flight and every later one.
+    pub fn cancel(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::cancel`] has been called.
+    #[must_use]
+    pub fn is_cancelled(self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn error() -> FwError {
+        FwError::Cancelled("run cancelled by its caller".to_owned())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct CancellationToken {
     deadline: Option<chrono::DateTime<Utc>>,
+    deadline_failure: DeadlineFailure,
+    run_cancel: Option<RunCancel>,
 }
 
 impl CancellationToken {
+    fn expiration_error(&self) -> FwError {
+        if crate::cli::ShutdownController::is_shutting_down() {
+            return FwError::Cancelled("pipeline cancelled via Ctrl+C".to_owned());
+        }
+        if self.run_cancel.is_some_and(RunCancel::is_cancelled) {
+            return RunCancel::error();
+        }
+        match self.deadline_failure {
+            DeadlineFailure::Cancelled => {
+                FwError::Cancelled("pipeline deadline exceeded".to_owned())
+            }
+            DeadlineFailure::StageTimeout { stage, budget_ms } => FwError::StageTimeout {
+                stage: stage.to_owned(),
+                budget_ms,
+            },
+        }
+    }
+
+    fn remaining(&self) -> Option<Duration> {
+        self.deadline.map(|deadline| {
+            deadline
+                .signed_duration_since(Utc::now())
+                .to_std()
+                .unwrap_or(Duration::ZERO)
+        })
+    }
+
     pub fn checkpoint(&self) -> FwResult<()> {
         if crate::cli::ShutdownController::is_shutting_down() {
             return Err(FwError::Cancelled(
                 "pipeline cancelled via Ctrl+C".to_owned(),
             ));
         }
+        if self.run_cancel.is_some_and(RunCancel::is_cancelled) {
+            return Err(RunCancel::error());
+        }
         if let Some(deadline) = self.deadline
             && Utc::now() >= deadline
         {
-            return Err(FwError::Cancelled("pipeline deadline exceeded".to_owned()));
+            return Err(self.expiration_error());
         }
         Ok(())
     }
@@ -565,7 +706,11 @@ impl CancellationToken {
     /// added.
     #[must_use]
     pub fn unbounded() -> Self {
-        Self { deadline: None }
+        Self {
+            deadline: None,
+            deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
+        }
     }
 
     /// Create a token with a deadline relative to now.
@@ -575,13 +720,19 @@ impl CancellationToken {
             deadline: Some(
                 Utc::now() + chrono::Duration::milliseconds(duration.as_millis() as i64),
             ),
+            deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
         }
     }
 
     /// Create a token with no deadline (never cancels).
     #[cfg(test)]
     pub(crate) fn no_deadline() -> Self {
-        Self { deadline: None }
+        Self {
+            deadline: None,
+            deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
+        }
     }
 
     /// Returns `true` if the cancellation token has been triggered (deadline
@@ -598,6 +749,8 @@ impl CancellationToken {
     pub(crate) fn already_expired() -> Self {
         Self {
             deadline: Some(chrono::DateTime::<Utc>::MIN_UTC),
+            deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
         }
     }
 }
@@ -1356,25 +1509,214 @@ fn checkpoint_or_emit(
     }
 }
 
+/// Stack budget for pipeline stage threads (bd-4gtx).
+///
+/// Storage stages drive fsqlite statement futures through
+/// [`crate::storage::block_on`]. Those futures nest deeply (statement dispatch
+/// → DML → triggers → nested execution — see `storage::block_on` docs) and in
+/// DEBUG builds their state machines overflow the 2 MiB default thread stack,
+/// aborting the whole process mid-run. `.cargo/config.toml` raises
+/// `RUST_MIN_STACK` for cargo-driven test runs, but a directly executed debug
+/// binary spawns stage threads without that env. 64 MiB matches the config
+/// value; the reservation is virtual and only committed lazily. Release builds
+/// measured comfortable headroom at the default size.
+#[must_use]
+pub(crate) const fn stage_thread_stack_bytes() -> usize {
+    if cfg!(debug_assertions) {
+        64 * 1024 * 1024
+    } else {
+        2 * 1024 * 1024
+    }
+}
+
+/// [`run_stage_with_budget`] for a stage that runs native compute kernels
+/// (acoustic diarization): the operation computes on the run's `--threads`
+/// pool, the same pool the native backends use
+/// (bd-threads-flag-unbounded-f4pq).
+fn run_compute_stage_with_budget<T, F>(
+    stage: &'static str,
+    budget_ms: u64,
+    compute_threads: usize,
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> FwResult<T> + Send + 'static,
+{
+    run_stage_with_budget(stage, budget_ms, move || {
+        crate::native_engine::with_compute_threads(compute_threads, operation)?
+    })
+}
+
+/// [`run_stage_with_token_budget`] for a stage that runs native compute
+/// kernels (source separation); see [`run_compute_stage_with_budget`].
+fn run_compute_stage_with_token_budget<T, F>(
+    stage: &'static str,
+    budget_ms: u64,
+    token: CancellationToken,
+    compute_threads: usize,
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> FwResult<T> + Send + 'static,
+{
+    run_stage_with_token_budget(stage, budget_ms, token, move || {
+        crate::native_engine::with_compute_threads(compute_threads, operation)?
+    })
+}
+
 fn run_stage_with_budget<T, F>(stage: &'static str, budget_ms: u64, operation: F) -> FwResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> FwResult<T> + Send + 'static,
 {
-    let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = tx.send(operation());
-    });
-
-    match rx.recv_timeout(budget_duration(budget_ms)) {
-        Ok(result) => result,
-        Err(RecvTimeoutError::Timeout) => Err(FwError::StageTimeout {
+    run_stage_with_timeout(
+        stage,
+        budget_duration(budget_ms),
+        move || FwError::StageTimeout {
             stage: stage.to_owned(),
             budget_ms,
-        }),
-        Err(RecvTimeoutError::Disconnected) => Err(FwError::BackendUnavailable(format!(
-            "stage `{stage}` worker exited before returning a result"
-        ))),
+        },
+        operation,
+    )
+}
+
+fn run_stage_with_token_budget<T, F>(
+    stage: &'static str,
+    budget_ms: u64,
+    token: CancellationToken,
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> FwResult<T> + Send + 'static,
+{
+    run_stage_with_token_budget_streaming(stage, budget_ms, token, &mut |_| {}, move |_| {
+        operation()
+    })
+}
+
+/// Like [`run_stage_with_token_budget`], but the operation may publish
+/// [`RunEvent`]s while it runs. Each published event is handed to `on_event`
+/// on the calling thread as soon as it arrives — not after the stage
+/// completes — so stage progress reaches the run's live event stream in real
+/// time (bd-r4dy). Events published before a timeout are still forwarded.
+fn run_stage_with_token_budget_streaming<T, F>(
+    stage: &'static str,
+    budget_ms: u64,
+    token: CancellationToken,
+    on_event: &mut dyn FnMut(RunEvent),
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(StageEventPublisher) -> FwResult<T> + Send + 'static,
+{
+    let timeout = token
+        .remaining()
+        .unwrap_or_else(|| budget_duration(budget_ms));
+    run_stage_with_timeout_streaming(
+        stage,
+        timeout,
+        move || token.expiration_error(),
+        on_event,
+        move |publisher| {
+            let value = operation(publisher)?;
+            // The receiver may be descheduled until the result is already
+            // queued. Fence successful work against the same deadline on the
+            // worker, rather than admitting a late result from a ready channel.
+            token.checkpoint()?;
+            Ok(value)
+        },
+    )
+}
+
+/// Publishes [`RunEvent`]s from a stage worker to the supervising thread.
+pub(crate) type StageEventPublisher = Box<dyn Fn(RunEvent) + Send + Sync>;
+
+enum StageMessage<T> {
+    Event(RunEvent),
+    Finished(FwResult<T>),
+}
+
+fn run_stage_with_timeout<T, F, E>(
+    stage: &'static str,
+    timeout: Duration,
+    timeout_error: E,
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> FwResult<T> + Send + 'static,
+    E: FnOnce() -> FwError,
+{
+    run_stage_with_timeout_streaming(stage, timeout, timeout_error, &mut |_| {}, move |_| {
+        operation()
+    })
+}
+
+fn run_stage_with_timeout_streaming<T, F, E>(
+    stage: &'static str,
+    timeout: Duration,
+    timeout_error: E,
+    on_event: &mut dyn FnMut(RunEvent),
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(StageEventPublisher) -> FwResult<T> + Send + 'static,
+    E: FnOnce() -> FwError,
+{
+    let (tx, rx) = mpsc::channel::<StageMessage<T>>();
+    let event_tx = tx.clone();
+    let publisher: StageEventPublisher = Box::new(move |event| {
+        let _ = event_tx.send(StageMessage::Event(event));
+    });
+    let worker = std::thread::Builder::new()
+        .name(format!("stage-{stage}"))
+        .stack_size(stage_thread_stack_bytes())
+        .spawn(move || {
+            let _ = tx.send(StageMessage::Finished(operation(publisher)));
+        })
+        .map_err(FwError::Io)?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(StageMessage::Event(event)) => on_event(event),
+            Ok(StageMessage::Finished(result)) => {
+                return match worker.join() {
+                    Ok(()) => result,
+                    Err(_) => Err(FwError::BackendUnavailable(format!(
+                        "stage `{stage}` worker panicked after returning a result"
+                    ))),
+                };
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let error = timeout_error();
+                // Stage operations receive a token with the same deadline as this
+                // receiver. Join after expiry so their cooperative checkpoint can
+                // unwind native work before a later stage starts; dropping this
+                // handle would detach CPU, memory, and file I/O past the timeout.
+                let _ = worker.join();
+                // Progress published before the deadline still reaches the
+                // stream; a result that raced the deadline is not admitted.
+                for message in rx.try_iter() {
+                    if let StageMessage::Event(event) = message {
+                        on_event(event);
+                    }
+                }
+                return Err(error);
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = worker.join();
+                return Err(FwError::BackendUnavailable(format!(
+                    "stage `{stage}` worker exited before returning a result"
+                )));
+            }
+        }
     }
 }
 
@@ -1417,7 +1759,7 @@ impl FrankenWhisperEngine {
     }
 
     pub fn transcribe(&self, request: TranscribeRequest) -> FwResult<RunReport> {
-        self.transcribe_internal(request, None)
+        self.transcribe_internal(request, None, None)
     }
 
     pub fn transcribe_with_stream(
@@ -1425,37 +1767,164 @@ impl FrankenWhisperEngine {
         request: TranscribeRequest,
         event_tx: Sender<StreamedRunEvent>,
     ) -> FwResult<RunReport> {
-        self.transcribe_internal(request, Some(event_tx))
+        self.transcribe_internal(request, Some(event_tx), None)
     }
 
     fn transcribe_internal(
         &self,
         request: TranscribeRequest,
         event_tx: Option<Sender<StreamedRunEvent>>,
+        run_cancel: Option<RunCancel>,
     ) -> FwResult<RunReport> {
         let state_root = self.state_root.clone();
         let config = self.pipeline_config.clone();
         let handle = self
             .runtime
             .handle()
-            .spawn(async move { run_pipeline(request, &state_root, event_tx, &config).await });
+            .spawn(crate::with_caller_cx(async move {
+                run_pipeline(request, &state_root, event_tx, &config, run_cancel).await
+            }));
 
         self.runtime.block_on(handle)
     }
 }
 
+/// Transcribes many inputs in one process with one model load
+/// (bd-batch-transcribe-rraf).
+///
+/// Holds one [`FrankenWhisperEngine`] and a
+/// [`crate::native_engine::ModelResidency`] for its whole lifetime, so the
+/// first input authenticates and parses the native models and every later
+/// input reuses them. Each input still runs the complete single-input pipeline,
+/// and the adaptive router is reset before each input so routing cannot learn
+/// across inputs: every input's result equals what a single-input process
+/// produces for the same request. Inputs are independent; a failed input does
+/// not affect the next one, and neither does a panicking one (see
+/// [`Self::transcribe`]).
+pub struct BatchTranscriber {
+    engine: FrankenWhisperEngine,
+    _residency: crate::native_engine::ModelResidency,
+    cancel: RunCancel,
+}
+
+impl BatchTranscriber {
+    /// Create the engine and begin model residency.
+    pub fn new() -> FwResult<Self> {
+        Ok(Self {
+            engine: FrankenWhisperEngine::new()?,
+            _residency: crate::native_engine::ModelResidency::begin(),
+            cancel: RunCancel::new(),
+        })
+    }
+
+    /// The batch's cancellation handle (bd-robot-batch-epipe-keeps-running-elf0).
+    /// Cancelling stops the input in flight at its next checkpoint, and every
+    /// later [`Self::transcribe`] / [`Self::transcribe_with_stream`] call
+    /// fails with [`FwError::Cancelled`] without starting; see [`RunCancel`].
+    #[must_use]
+    pub fn cancel_handle(&self) -> RunCancel {
+        self.cancel
+    }
+
+    /// Transcribe one batch input.
+    ///
+    /// A panic inside the run becomes this input's
+    /// [`FwError::ContractViolation`] (`input run panicked: ...`), so the batch
+    /// goes on with the next input (bd-batch-panic-isolation-p7fa). That takes
+    /// an unwinding build: the shipped release profile sets `panic = "abort"`,
+    /// where a panic still ends the process.
+    pub fn transcribe(&self, request: TranscribeRequest) -> FwResult<RunReport> {
+        self.run(request, None)
+    }
+
+    /// Transcribe one batch input, streaming its stage events to `event_tx`.
+    /// A panic is isolated as in [`Self::transcribe`].
+    pub fn transcribe_with_stream(
+        &self,
+        request: TranscribeRequest,
+        event_tx: Sender<StreamedRunEvent>,
+    ) -> FwResult<RunReport> {
+        self.run(request, Some(event_tx))
+    }
+
+    fn run(
+        &self,
+        request: TranscribeRequest,
+        event_tx: Option<Sender<StreamedRunEvent>>,
+    ) -> FwResult<RunReport> {
+        if self.cancel.is_cancelled() {
+            return Err(RunCancel::error());
+        }
+        backend::reset_router_state();
+        isolate_input_panic(|| {
+            self.engine
+                .transcribe_internal(request, event_tx, Some(self.cancel))
+        })
+    }
+}
+
+/// Run one batch input, returning a panic as that input's error.
+///
+/// Unwind safety: a run's own state (request, event log, temporary directory)
+/// unwinds with it, and the engine keeps none between runs. Every
+/// process-wide mutex a run touches tolerates poisoning (the router and
+/// health caches then read as empty, the model cache and batch residency
+/// recover their contents), so a later input never observes a lock its
+/// panicking predecessor held.
+fn isolate_input_panic(run: impl FnOnce() -> FwResult<RunReport>) -> FwResult<RunReport> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_owned());
+        Err(FwError::ContractViolation(format!(
+            "input run panicked: {detail}"
+        )))
+    })
+}
+
+/// Environment variable naming the input file stem whose run panics, in debug
+/// builds only (bd-batch-panic-isolation-p7fa). Batch tests use it to prove that a
+/// panicking input is isolated; release builds compile the hook out, so no
+/// environment can trigger it in a shipped binary.
+#[cfg(debug_assertions)]
+const TEST_PANIC_INPUT_STEM_ENV: &str = "FRANKEN_WHISPER_TEST_PANIC_INPUT_STEM";
+
+/// Panic inside the pipeline task when the input file's stem equals
+/// [`TEST_PANIC_INPUT_STEM_ENV`]. It fires after the first stage event, so a
+/// robot stream shows the run started before it failed.
+#[cfg(debug_assertions)]
+fn inject_test_panic_for_input(request: &TranscribeRequest) {
+    if let crate::model::InputSource::File { path } = &request.input
+        && let Some(stem) = std::env::var_os(TEST_PANIC_INPUT_STEM_ENV)
+        && path.file_stem() == Some(stem.as_os_str())
+    {
+        panic!("injected test panic for input `{}`", path.display());
+    }
+}
+
 async fn run_pipeline(
-    request: TranscribeRequest,
+    mut request: TranscribeRequest,
     state_root: &Path,
     event_tx: Option<Sender<StreamedRunEvent>>,
     pipeline_config: &PipelineConfig,
+    run_cancel: Option<RunCancel>,
 ) -> FwResult<RunReport> {
     fs::create_dir_all(state_root.join("tmp"))?;
+
+    // `--threads` beyond the CPUs this process may use runs, on every
+    // backend, at that many CPUs (bd-threads-unclamped-pools-never-retired-7kuk).
+    let threads_clamp = backend::request_threads_clamp(&request);
+    if let Some(clamp) = threads_clamp {
+        request.backend_params.threads = u32::try_from(clamp.effective).ok();
+    }
 
     let run_id = Uuid::new_v4().to_string();
     let started_at = Utc::now().to_rfc3339();
     tracing::info!(run_id = %run_id, "Starting transcription run");
     let mut pcx = PipelineCx::new(request.timeout_ms);
+    pcx.run_cancel = run_cancel;
     let stage_budgets = StageBudgetPolicy::from_env();
 
     let run_tmp_dir = tempfile::Builder::new()
@@ -1481,6 +1950,19 @@ async fn run_pipeline(
             "safe_mode": "deterministic configurable stage order",
         }),
     );
+    if let Some(clamp) = threads_clamp {
+        log.push(
+            "orchestration",
+            "orchestration.threads_clamped",
+            &clamp.warning(),
+            json!({
+                "requested_threads": clamp.requested,
+                "effective_threads": clamp.effective,
+            }),
+        );
+    }
+    #[cfg(debug_assertions)]
+    inject_test_panic_for_input(&request);
 
     let result = run_pipeline_body(
         &mut pcx,
@@ -1492,6 +1974,7 @@ async fn run_pipeline(
         &trace_id_str,
         &started_at,
         pipeline_config,
+        threads_clamp.map(|clamp| clamp.warning()),
     )
     .await;
 
@@ -1627,6 +2110,25 @@ fn optional_stage_skip(
     stage: PipelineStage,
     request: &TranscribeRequest,
 ) -> Option<(String, Value)> {
+    // A language-only detection produces no transcript, so there is nothing
+    // to separate, align, punctuate, or attribute to speakers.
+    if request.backend_params.detect_language_only
+        && matches!(
+            stage,
+            PipelineStage::Separate
+                | PipelineStage::Align
+                | PipelineStage::Punctuate
+                | PipelineStage::Diarize
+        )
+    {
+        return Some((
+            "detect_language_only".to_owned(),
+            stage_skip_payload(
+                "detect_language_only",
+                json!({"detect_language_only": true}),
+            ),
+        ));
+    }
     match stage {
         PipelineStage::Vad => {
             if request.backend_params.vad.is_none() {
@@ -1726,6 +2228,18 @@ fn optional_stage_skip(
     }
 }
 
+/// Where a run's `--output-*` files go: `cwd/<input file stem>` (the batch
+/// parser uses this to reject inputs that would overwrite each other's files).
+pub(crate) fn artifact_output_prefix(input: &crate::model::InputSource, cwd: &Path) -> PathBuf {
+    let base_name = match input {
+        crate::model::InputSource::File { path } => path
+            .file_stem()
+            .unwrap_or_else(|| std::ffi::OsStr::new("transcript")),
+        _ => std::ffi::OsStr::new("transcript"),
+    };
+    cwd.join(base_name)
+}
+
 /// Inner body of [`run_pipeline`], factored out so that [`run_pipeline`] can
 /// unconditionally call `pcx.run_finalizers()` after this returns regardless
 /// of success or failure.
@@ -1740,11 +2254,13 @@ async fn run_pipeline_body(
     trace_id_str: &str,
     started_at: &str,
     pipeline_config: &PipelineConfig,
+    threads_clamp_warning: Option<String>,
 ) -> FwResult<RunReport> {
     // Checkpoint: before first stage
     checkpoint_or_emit("orchestration", pcx, log)?;
 
     let mut inter = PipelineIntermediate::new();
+    inter.warnings.extend(threads_clamp_warning);
 
     for stage in pipeline_config.stages() {
         if let Some((_reason, payload)) = optional_stage_skip(*stage, request) {
@@ -1791,7 +2307,7 @@ async fn run_pipeline_body(
                 execute_vad(pcx, log, request, stage_budgets, &mut inter).await?;
             }
             PipelineStage::Separate => {
-                execute_separate(pcx, log, stage_budgets, &mut inter).await?;
+                execute_separate(pcx, log, request, stage_budgets, run_tmp_dir, &mut inter).await?;
             }
             // When `request.backend_params.speculative` is set, the Backend stage
             // is replaced with a `SpeculativeStreamingPipeline`-driven path
@@ -1835,6 +2351,23 @@ async fn run_pipeline_body(
         }
     }
 
+    // Word units that existed only for speaker attribution become the engine's
+    // segments again, split where the attributed speaker changes.
+    if let Some(result) = inter.result.as_mut()
+        && let Some(units) = backend::regroup_diarization_word_units(result)
+    {
+        if let Some(report) = result.diarization.as_mut() {
+            report.speaker_segments =
+                diarization::build_speaker_attributed_segments(&result.segments, &report.turns);
+        }
+        log.push(
+            "orchestration",
+            "orchestration.segments_regrouped",
+            "collapsed diarization word units into speaker-split segments",
+            json!({"word_units": units, "segments": result.segments.len()}),
+        );
+    }
+
     // Emit tail-latency decomposition artifacts and deterministic budget-tuning
     // guidance derived from observed stage timings for this run.
     let latency_profile = stage_latency_profile(&log.events, stage_budgets);
@@ -1869,15 +2402,8 @@ async fn run_pipeline_body(
 
     let output_formats = &request.backend_params.output_formats;
     if !output_formats.is_empty() {
-        let base_name = match &request.input {
-            crate::model::InputSource::File { path } => path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("transcript"),
-            _ => "transcript",
-        };
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let output_prefix = cwd.join(base_name);
+        let output_prefix = artifact_output_prefix(&request.input, &cwd);
 
         match crate::export::write_artifacts(output_formats, &result, &output_prefix) {
             Ok(paths) => {
@@ -1925,6 +2451,8 @@ async fn run_pipeline_body(
                 .as_ref()
                 .and_then(|r| r.version.clone()),
             output_payload_hash: inter.backend_output_sha256,
+            pcm_sha256: None,
+            live_note: None,
         },
     };
 
@@ -2107,6 +2635,21 @@ async fn execute_normalize(
     Ok(())
 }
 
+fn backend_request_for_waveform(
+    request: &TranscribeRequest,
+    native_separation_applied: bool,
+) -> TranscribeRequest {
+    let mut backend_request = request.clone();
+    if native_separation_applied {
+        backend_request
+            .backend_params
+            .diarization_config
+            .get_or_insert_with(crate::model::DiarizationConfig::default)
+            .no_stem = true;
+    }
+    backend_request
+}
+
 async fn execute_backend(
     pcx: &mut PipelineCx,
     log: &mut EventLog,
@@ -2143,10 +2686,14 @@ async fn execute_backend(
     } else if let Some(selection) =
         backend::evaluate_backend_selection(request, normalized_duration, pcx.trace_id())
     {
-        if selection.fallback_triggered {
-            inter
-                .warnings
-                .push("backend selection contract fallback trigger activated".to_owned());
+        if selection.fallback_needs_attention() {
+            inter.warnings.push(format!(
+                "backend selection contract fallback trigger activated ({})",
+                selection
+                    .fallback_reason
+                    .as_deref()
+                    .unwrap_or("decision contract fallback")
+            ));
         }
         pcx.record_evidence_values(&selection.evidence_entries);
         log.push(
@@ -2208,32 +2755,33 @@ async fn execute_backend(
         }),
     );
 
-    let backend_request = request.clone();
+    let backend_request = backend_request_for_waveform(request, inter.vocal_isolated);
     let backend_wav = normalized_wav.clone();
     let backend_dir = run_tmp_dir.path().to_path_buf();
     let backend_budget_ms = stage_budgets.backend_ms;
-    let cancel_token = pcx.stage_token(backend_budget_ms); // ubs:ignore — cancellation token is not a secret
-    let execution_result = run_stage_with_budget("backend", backend_budget_ms, move || {
-        let tok = Some(&cancel_token);
-        if let Some(order) = backend_order {
-            backend::execute_with_order(
-                &backend_request,
-                &backend_wav,
-                &backend_dir,
-                budget_duration(backend_budget_ms),
-                &order,
-                tok,
-            )
-        } else {
-            backend::execute(
-                &backend_request,
-                &backend_wav,
-                &backend_dir,
-                budget_duration(backend_budget_ms),
-                tok,
-            )
-        }
-    });
+    let cancel_token = pcx.named_stage_token("backend", backend_budget_ms); // ubs:ignore — token is not a secret
+    let execution_result =
+        run_stage_with_token_budget("backend", backend_budget_ms, cancel_token, move || {
+            let tok = Some(&cancel_token);
+            if let Some(order) = backend_order {
+                backend::execute_with_order(
+                    &backend_request,
+                    &backend_wav,
+                    &backend_dir,
+                    budget_duration(backend_budget_ms),
+                    &order,
+                    tok,
+                )
+            } else {
+                backend::execute(
+                    &backend_request,
+                    &backend_wav,
+                    &backend_dir,
+                    budget_duration(backend_budget_ms),
+                    tok,
+                )
+            }
+        });
 
     if let Some((top_backend, predicted_success)) = adaptive_prediction {
         let top_succeeded = match &execution_result {
@@ -2292,6 +2840,14 @@ async fn execute_backend(
             "native_fallback_error": execution.native_fallback_error.clone(),
         }),
     );
+    if execution.implementation == backend::BackendImplementation::Native {
+        inter
+            .warnings
+            .extend(backend::native_ignored_option_warnings(
+                request,
+                execution.result.backend,
+            ));
+    }
     let backend_output_sha256 = match sha256_json_value(&execution.result.raw_output) {
         Ok(hash) => Some(hash),
         Err(error) => {
@@ -2395,16 +2951,19 @@ fn surface_backend_result_diagnostics(
         );
     }
 
-    // Audio-window flags on a backend that does not honor them: loud ignore.
+    // Audio-window flags: every in-process native engine and the whisper.cpp
+    // bridge (`-ot`/`-d`) honor them; the other bridges cannot (loud ignore).
     let window_requested = request.backend_params.offset_ms.is_some_and(|v| v > 0)
         || request.backend_params.duration_ms.is_some_and(|v| v > 0);
-    if window_requested && result.backend != BackendKind::WhisperCpp {
+    let window_honored = result.backend == BackendKind::WhisperCpp
+        || is_native_in_process_result(&result.raw_output);
+    if window_requested && !window_honored {
         inter.warnings.push(format!(
             "--offset-ms/--duration-ms are not supported by backend `{}`; the full input was transcribed",
             result.backend.as_str()
         ));
     }
-    if window_requested && result.backend == BackendKind::WhisperCpp && request.diarize {
+    if window_requested && window_honored && request.diarize {
         inter.warnings.push(
             "audio window applied to transcription only; diarization/VAD still cover the full \
              normalized clip"
@@ -2478,7 +3037,19 @@ async fn execute_backend_speculative(
     // talks to the same engine (per design note above). Failures here surface
     // before any backend.start event is emitted so the stream layout matches
     // the pre-speculative dispatch path.
-    let resolved_backend = backend::resolve_static_backend(request)?;
+    //
+    // Resolve against the lane models actually requested: whether an engine
+    // can serve a request depends on the model it names, and the base request
+    // names none (its default model need not be installed). The quality lane
+    // is the merged transcript's authority, so it picks the engine; the fast
+    // lane must then be servable by that same engine.
+    let mut quality_probe = request.clone();
+    quality_probe.model = Some(spec_request.quality_model_name.clone());
+    let resolved_backend = backend::resolve_static_backend(&quality_probe)?;
+    let mut fast_probe = request.clone();
+    fast_probe.backend = resolved_backend;
+    fast_probe.model = Some(spec_request.fast_model_name.clone());
+    backend::resolve_static_backend(&fast_probe)?;
 
     // Convert the serde-friendly request shape into the execution-shape config.
     let spec_config = crate::streaming::SpeculativeConfig {
@@ -2519,104 +3090,119 @@ async fn execute_backend_speculative(
     );
 
     let backend_budget_ms = stage_budgets.backend_ms;
-    let cancel_token = pcx.stage_token(backend_budget_ms); // ubs:ignore — token, not a secret
+    let cancel_token = pcx.named_stage_token("backend", backend_budget_ms); // ubs:ignore — token, not a secret
     let normalized_wav = normalized_wav.clone();
     let backend_dir = run_tmp_dir.path().to_path_buf();
-    let base_request = request.clone();
+    let base_request = backend_request_for_waveform(request, inter.vocal_isolated);
     let run_id = log.run_id.clone();
     let per_invocation_timeout = budget_duration(backend_budget_ms);
 
     /// Internal carry value: the speculation pipeline's inner result is
-    /// reified as a `Result` so the wrapping `run_stage_with_budget` closure
-    /// can always succeed with the partial events / stats / merged segments,
+    /// reified as a `Result` so the wrapping stage-supervisor closure
+    /// can always succeed with the stats / merged segments / lane telemetry,
     /// regardless of whether the pipeline itself errored mid-run.
     type SpecOutcome = (
         FwResult<crate::model::TranscriptionResult>,
-        Vec<crate::model::RunEvent>,
         crate::speculation::SpeculationStats,
         Vec<crate::model::TranscriptionSegment>,
+        SpeculativeLaneTelemetry,
     );
 
-    let outcome: FwResult<SpecOutcome> =
-        run_stage_with_budget("backend", backend_budget_ms, move || {
+    // Speculation events are forwarded into the run's event log the moment the
+    // pipeline produces them, so fast-lane partials reach NDJSON consumers
+    // while the quality lane of the same window is still decoding (bd-r4dy).
+    let outcome: FwResult<SpecOutcome> = run_stage_with_token_budget_streaming(
+        "backend",
+        backend_budget_ms,
+        cancel_token,
+        &mut |event| log.push(&event.stage, &event.code, &event.message, event.payload),
+        move |publish| {
             let tok = cancel_token;
             let mut pipeline =
-                crate::streaming::SpeculativeStreamingPipeline::new(spec_config.clone(), run_id);
-            let fast_model = spec_config.fast_model_name.clone();
-            let quality_model = spec_config.quality_model_name.clone();
+                crate::streaming::SpeculativeStreamingPipeline::new(spec_config.clone(), run_id)
+                    .with_event_sink(Box::new(move |event| publish(event.clone())));
 
-            let inner_result = pipeline.process_file_with_models(
+            // Per-lane requests override the model name AND force the backend
+            // kind to the resolved sticky value.
+            let mut fast_req = base_request.clone();
+            fast_req.backend = resolved_backend;
+            fast_req.model = Some(spec_config.fast_model_name.clone());
+            let mut quality_req = base_request;
+            quality_req.backend = resolved_backend;
+            quality_req.model = Some(spec_config.quality_model_name.clone());
+
+            let overlap_ms = spec_config.overlap_ms;
+            let telemetry = Mutex::new(SpeculativeLaneTelemetry::default());
+            // The lanes run concurrently, and bridge backends write fixed-name
+            // artifacts (e.g. `whispercpp_output.json`) into their work dir: a
+            // shared dir lets one lane read the other's half-written output.
+            // Each lane gets its own; windows within a lane stay sequential.
+            let fast_lane_dir = backend_dir.join("speculative-fast-lane");
+            let quality_lane_dir = backend_dir.join("speculative-quality-lane");
+            std::fs::create_dir_all(&fast_lane_dir)?;
+            std::fs::create_dir_all(&quality_lane_dir)?;
+            // Backends see only the window's slice, so their timestamps are
+            // slice-relative: localize them to absolute time and keep only the
+            // window's owned span before the pipeline merges windows.
+            let run_lane = |lane: SpeculativeLane,
+                            lane_request: &TranscribeRequest,
+                            slice: &SpeculativeWindowSlice|
+             -> FwResult<Vec<crate::model::TranscriptionSegment>> {
+                let lane_dir = match lane {
+                    SpeculativeLane::Fast => &fast_lane_dir,
+                    SpeculativeLane::Quality => &quality_lane_dir,
+                };
+                let execution = crate::backend::execute(
+                    lane_request,
+                    &slice.path,
+                    lane_dir,
+                    per_invocation_timeout,
+                    Some(&tok),
+                )?;
+                telemetry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record(lane, &execution);
+                Ok(slice
+                    .window
+                    .localize_segments(overlap_ms, execution.result.segments))
+            };
+
+            let inner_result = pipeline.process_file_with_lanes(
                 &normalized_wav,
                 || tok.checkpoint(),
-                |audio_path, start_ms, end_ms| {
-                    let slice_path = crate::audio::slice_pcm_wav_to_temp_path(
+                |audio_path, window| {
+                    crate::audio::slice_pcm_wav_to_temp_path(
                         audio_path,
                         &backend_dir,
-                        start_ms,
-                        end_ms,
-                    )?;
-                    // Build per-lane requests by overriding the model name AND
-                    // forcing the backend kind to the resolved sticky value.
-                    let mut fast_req = base_request.clone();
-                    fast_req.backend = resolved_backend;
-                    fast_req.model = Some(fast_model.clone());
-                    let mut quality_req = base_request.clone();
-                    quality_req.backend = resolved_backend;
-                    quality_req.model = Some(quality_model.clone());
-
-                    let fast_execution = crate::backend::execute(
-                        &fast_req,
-                        &slice_path,
-                        &backend_dir,
-                        per_invocation_timeout,
-                        Some(&tok),
-                    );
-                    let fast_segments = match fast_execution {
-                        Ok(execution) => execution.result.segments,
-                        Err(error) => {
-                            let _ = std::fs::remove_file(&slice_path);
-                            return Err(error);
-                        }
-                    };
-                    if let Err(error) = tok.checkpoint() {
-                        let _ = std::fs::remove_file(&slice_path);
-                        return Err(error);
-                    }
-                    let quality_execution = crate::backend::execute(
-                        &quality_req,
-                        &slice_path,
-                        &backend_dir,
-                        per_invocation_timeout,
-                        Some(&tok),
-                    );
-                    let quality_segments = match quality_execution {
-                        Ok(execution) => execution.result.segments,
-                        Err(error) => {
-                            let _ = std::fs::remove_file(&slice_path);
-                            return Err(error);
-                        }
-                    };
-                    let _ = std::fs::remove_file(&slice_path);
-                    Ok((fast_segments, quality_segments))
+                        window.start_ms,
+                        window.end_ms,
+                    )
+                    .map(|path| SpeculativeWindowSlice { path, window })
                 },
+                |slice| run_lane(SpeculativeLane::Fast, &fast_req, slice),
+                |slice| run_lane(SpeculativeLane::Quality, &quality_req, slice),
             );
 
-            // Always carry partial events + stats + merged segments out, so
-            // the outer handler can forward speculation events to the NDJSON
-            // log regardless of whether the pipeline succeeded or failed.
+            // Always carry stats + merged segments out, so the outer handler
+            // can report progress regardless of whether the pipeline failed.
             let stats = pipeline.stats();
-            let merged = pipeline.merged_transcript();
-            // Move the event vector out last (consuming the terminal pipeline)
-            // instead of cloning it via `events().to_vec()`.
-            let emitted = pipeline.into_events();
-            Ok((inner_result, emitted, stats, merged))
-        });
+            let mut merged = pipeline.merged_transcript();
+            crate::streaming::dedupe_seam_repeats(&mut merged);
+            crate::streaming::repair_seam_overlaps(&mut merged);
+            let telemetry = telemetry
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Ok((inner_result, stats, merged, telemetry))
+        },
+    );
 
-    let (inner_result, emitted_events, stats, merged) = match outcome {
+    let (inner_result, stats, merged, telemetry) = match outcome {
         Ok(value) => value,
         Err(error) => {
-            // `run_stage_with_budget` itself failed (stage-budget timeout, panic,
-            // …). No events to forward; just emit the terminal backend.* event.
+            // The stage supervisor itself failed (stage-budget timeout, panic,
+            // …). Speculation events published before the failure were already
+            // forwarded; just emit the terminal backend.* event.
             let code = stage_failure_code("backend", &error);
             log.push(
                 "backend",
@@ -2633,13 +3219,9 @@ async fn execute_backend_speculative(
         }
     };
 
-    // Forward any speculation events that the pipeline produced before
-    // returning (success OR failure). These are the partial transcripts,
-    // confirmations, retractions, corrections, and the aggregate stats
-    // event the speculation pipeline emits internally.
-    for event in emitted_events {
-        log.push(&event.stage, &event.code, &event.message, event.payload);
-    }
+    let inner_result = inner_result.and_then(|spec_result| {
+        conformance::validate_segment_invariants(&merged).map(|()| spec_result)
+    });
 
     match inner_result {
         Ok(spec_result) => {
@@ -2650,11 +3232,13 @@ async fn execute_backend_speculative(
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            // Record backend identity/version so the run's ReplayEnvelope is
-            // populated even for speculative runs. Speculative streams are
-            // bridge-backed today (native engines don't yet participate in
-            // dual-model dispatch).
-            let backend_runtime = backend::runtime_metadata(resolved_backend);
+            // Record the identity of the engine that actually served the
+            // quality lane (the merged transcript's authority) so the run's
+            // ReplayEnvelope is populated and honest for speculative runs.
+            let backend_runtime = telemetry
+                .quality_runtime
+                .clone()
+                .unwrap_or_else(|| backend::runtime_metadata(resolved_backend));
             let output_payload_hash = sha256_segments(&merged);
 
             log.push(
@@ -2667,10 +3251,13 @@ async fn execute_backend_speculative(
                     "windows_processed": stats.windows_processed,
                     "confirmations_emitted": stats.confirmations_emitted,
                     "corrections_emitted": stats.corrections_emitted,
-                    "implementation": "bridge",
+                    "implementation": telemetry.implementation_label(),
+                    "fast_lane_implementation": SpeculativeLaneTelemetry::label(&telemetry.fast_implementations),
+                    "quality_lane_implementation": SpeculativeLaneTelemetry::label(&telemetry.quality_implementations),
+                    "lane_concurrency": "concurrent",
                     "execution_mode": "speculative_streaming",
-                    "native_rollout_stage": serde_json::Value::Null,
-                    "native_fallback_error": serde_json::Value::Null,
+                    "native_rollout_stage": telemetry.rollout_stage,
+                    "native_fallback_error": telemetry.native_fallback_error,
                     "backend_identity": backend_runtime.identity,
                     "backend_version": backend_runtime.version,
                 }),
@@ -2716,6 +3303,80 @@ async fn execute_backend_speculative(
             );
             Err(error)
         }
+    }
+}
+
+/// Which speculative lane produced a backend execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpeculativeLane {
+    Fast,
+    Quality,
+}
+
+/// A per-window WAV slice shared by both speculative lanes; the file is removed
+/// once both lanes have finished with the window.
+struct SpeculativeWindowSlice {
+    path: PathBuf,
+    window: crate::streaming::LaneWindow,
+}
+
+impl Drop for SpeculativeWindowSlice {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// What actually served each speculative lane, accumulated across windows so
+/// the stage reports the real implementation instead of assuming a bridge.
+#[derive(Debug, Default)]
+struct SpeculativeLaneTelemetry {
+    fast_implementations: BTreeSet<&'static str>,
+    quality_implementations: BTreeSet<&'static str>,
+    quality_runtime: Option<backend::BackendRuntimeMetadata>,
+    rollout_stage: Option<String>,
+    native_fallback_error: Option<String>,
+}
+
+impl SpeculativeLaneTelemetry {
+    fn record(&mut self, lane: SpeculativeLane, execution: &backend::BackendExecution) {
+        let implementation = execution.implementation.as_str();
+        match lane {
+            SpeculativeLane::Fast => {
+                self.fast_implementations.insert(implementation);
+            }
+            SpeculativeLane::Quality => {
+                self.quality_implementations.insert(implementation);
+                if self.quality_runtime.is_none() {
+                    self.quality_runtime = Some(execution.runtime.clone());
+                }
+            }
+        }
+        if self.rollout_stage.is_none() {
+            self.rollout_stage = Some(execution.rollout_stage.clone());
+        }
+        if self.native_fallback_error.is_none() {
+            self.native_fallback_error = execution.native_fallback_error.clone();
+        }
+    }
+
+    /// `native`/`bridge` when every execution agrees, `mixed` otherwise, and
+    /// `none` before any lane has run.
+    fn label(implementations: &BTreeSet<&'static str>) -> &'static str {
+        let mut iter = implementations.iter();
+        match (iter.next(), iter.next()) {
+            (None, _) => "none",
+            (Some(only), None) => only,
+            (Some(_), Some(_)) => "mixed",
+        }
+    }
+
+    fn implementation_label(&self) -> &'static str {
+        let all: BTreeSet<&'static str> = self
+            .fast_implementations
+            .union(&self.quality_implementations)
+            .copied()
+            .collect();
+        Self::label(&all)
     }
 }
 
@@ -2775,8 +3436,10 @@ async fn execute_accelerate(
                 return Err(error);
             }
         };
+    // Acceleration notes describe the (only, deterministic CPU) normalization
+    // that ran; they live on `result.acceleration` and the stage event, not in
+    // run warnings.
     inter.result = Some(updated_result);
-    inter.warnings.extend(acceleration.notes.iter().cloned());
 
     let stream_owner_id =
         acceleration_stream_owner_id(trace_id_str, request, acceleration.backend.as_str());
@@ -2960,8 +3623,10 @@ fn ctc_forced_align(
 
     let sec_per_char = duration / total_chars as f64;
     let mut cursor = 0.0f64;
+    // Per segment: the authoritative original span, if this pass replaced it.
+    let mut replaced: Vec<Option<(f64, f64)>> = vec![None; total];
 
-    for segment in segments.iter_mut() {
+    for (index, segment) in segments.iter_mut().enumerate() {
         // Cancellation check per segment for responsive shutdown.
         token.checkpoint()?;
 
@@ -3013,11 +3678,59 @@ fn ctc_forced_align(
         if aligned_start.is_finite() && aligned_end.is_finite() {
             segment.start_sec = Some(aligned_start);
             segment.end_sec = Some(aligned_end);
+            replaced[index] = Some((os, oe));
             corrected += 1;
         } else {
             // Non-finite aligned values: keep the authoritative original.
             fallback += 1;
         }
+    }
+
+    // A correction is only safe if it stays clear of its neighbors' final
+    // spans: a corrected segment next to one that fell back to its original
+    // offsets could otherwise overlap it (e.g. a corrected end landing past
+    // the next segment's original start), producing overlapping subtitle
+    // cues. Revert any correction involved in an overlap to its authoritative
+    // original; each pass reverts at least one segment, so this terminates.
+    const OVERLAP_EPSILON_SEC: f64 = 1e-6;
+    let mut reverted = 0usize;
+    loop {
+        let mut changed = false;
+        for index in 1..total {
+            let (Some(previous_end), Some(next_start)) =
+                (segments[index - 1].end_sec, segments[index].start_sec)
+            else {
+                continue;
+            };
+            if previous_end <= next_start + OVERLAP_EPSILON_SEC {
+                continue;
+            }
+            // Prefer reverting the segment that was moved; if both were,
+            // revert the earlier one first.
+            let culprit = if replaced[index - 1].is_some() {
+                index - 1
+            } else if replaced[index].is_some() {
+                index
+            } else {
+                continue; // both original: the backend's own overlap stands
+            };
+            if let Some((original_start, original_end)) = replaced[culprit].take() {
+                segments[culprit].start_sec = Some(original_start);
+                segments[culprit].end_sec = Some(original_end);
+                reverted += 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if reverted > 0 {
+        corrected -= reverted;
+        fallback += reverted;
+        notes.push(format!(
+            "{reverted} corrected segment(s) reverted to original offsets to keep segments non-overlapping"
+        ));
     }
 
     Ok(AlignmentReport {
@@ -3147,14 +3860,32 @@ fn align_transcription_result(
             method: "dtw_attention",
             energy_valley_snaps: 0,
             energy_evidence_available: false,
-            notes: vec![
-                "preserved authoritative canonical DTW projection timeline; character-density fallback skipped"
-                    .to_owned(),
-            ],
+            // Notes become run warnings; the method already names this
+            // normal outcome.
+            notes: Vec::new(),
         });
     }
 
-    let mut report = ctc_forced_align(&mut result.segments, audio_duration_sec, config, token)?;
+    // bd-azpf: the in-process engine's segment boundaries are the model's own
+    // timestamp tokens. The character-density heuristic only rewrites
+    // segments that already carry timestamps, so applying it here would trade
+    // model evidence for a uniform speech-rate guess (up to the drift guard).
+    // Keep the model boundaries; only the bounded energy-valley snap below
+    // may refine them.
+    let mut report = if is_native_in_process_result(&result.raw_output) {
+        token.checkpoint()?;
+        AlignmentReport {
+            segments_total: result.segments.len(),
+            segments_corrected: 0,
+            segments_fallback: result.segments.len(),
+            method: "native_timestamp_tokens",
+            energy_valley_snaps: 0,
+            energy_evidence_available: false,
+            notes: Vec::new(),
+        }
+    } else {
+        ctc_forced_align(&mut result.segments, audio_duration_sec, config, token)?
+    };
 
     if let Some(profile) = energy_valleys {
         report.energy_evidence_available = true;
@@ -3173,29 +3904,34 @@ fn align_transcription_result(
     Ok(report)
 }
 
+/// The energy-valley profile for alignment, or why it is unavailable (the
+/// reason becomes a run warning; availability is the normal case and is
+/// recorded in the align payload's `energy_evidence_available`).
 fn load_energy_valley_evidence(
     normalized_wav: Option<&Path>,
     token: &CancellationToken,
-) -> FwResult<(Option<backend::native_audio::EnergyValleyProfile>, String)> {
+) -> FwResult<(
+    Option<backend::native_audio::EnergyValleyProfile>,
+    Option<String>,
+)> {
     token.checkpoint()?;
     match normalized_wav {
         Some(path) => match backend::native_audio::energy_valleys_from_wav(path, token) {
-            Ok(profile) => Ok((
-                Some(profile),
-                "native frame-RMS energy evidence available".to_owned(),
-            )),
+            Ok(profile) => Ok((Some(profile), None)),
             Err(error @ (FwError::Cancelled(_) | FwError::StageTimeout { .. })) => Err(error),
             Err(error) => Ok((
                 None,
-                format!(
+                Some(format!(
                     "normalized PCM energy evidence unavailable ({error}); energy-valley snapping failed closed"
-                ),
+                )),
             )),
         },
         None => Ok((
             None,
-            "normalized PCM energy evidence was not produced; energy-valley snapping failed closed"
-                .to_owned(),
+            Some(
+                "normalized PCM energy evidence was not produced; energy-valley snapping failed closed"
+                    .to_owned(),
+            ),
         )),
     }
 }
@@ -3230,19 +3966,15 @@ async fn execute_align(
     let audio_duration = inter.normalized_duration;
     let normalized_wav = inter.normalized_wav.clone();
 
-    let (updated_result, report) = match run_stage_with_budget(
-        "align",
-        align_budget_ms,
-        move || {
+    let (updated_result, report) =
+        match run_stage_with_budget("align", align_budget_ms, move || {
             let config = AlignConfig::default();
             align_token.checkpoint()?;
             let canonical_dtw = has_canonical_word_alignment(&result.raw_output);
+            // Canonical DTW geometry is preserved byte-exact, so no
+            // energy-valley refinement is attempted for it.
             let (energy_valleys, energy_evidence_note) = if canonical_dtw {
-                (
-                    None,
-                    "authoritative canonical DTW geometry preserved byte-exact; energy-valley refinement not attempted"
-                        .to_owned(),
-                )
+                (None, None)
             } else {
                 load_energy_valley_evidence(normalized_wav.as_deref(), &align_token)?
             };
@@ -3253,31 +3985,31 @@ async fn execute_align(
                 energy_valleys.as_ref(),
                 &align_token,
             )?;
-            report.notes.push(energy_evidence_note);
+            report.notes.extend(energy_evidence_note);
             align_token.checkpoint()?;
             Ok((result, report))
-        },
-    ) {
-        Ok(output) => output,
-        Err(error) => {
-            let code = stage_failure_code("align", &error);
-            log.push(
-                "align",
-                &code,
-                stage_failure_message(&error, "alignment stage failed"),
-                json!({
-                    "error": error.to_string(),
-                    "budget_ms": stage_budgets.align_ms,
-                }),
-            );
-            return Err(error);
-        }
-    };
+        }) {
+            Ok(output) => output,
+            Err(error) => {
+                let code = stage_failure_code("align", &error);
+                log.push(
+                    "align",
+                    &code,
+                    stage_failure_message(&error, "alignment stage failed"),
+                    json!({
+                        "error": error.to_string(),
+                        "budget_ms": stage_budgets.align_ms,
+                    }),
+                );
+                return Err(error);
+            }
+        };
 
     inter.result = Some(updated_result);
     inter.warnings.extend(report.notes.iter().cloned());
 
     let align_code = if report.method == "dtw_attention"
+        || report.method == "native_timestamp_tokens"
         || report.segments_corrected > 0
         || report.energy_valley_snaps > 0
     {
@@ -3727,6 +4459,32 @@ fn vad_energy_detect_legacy(
     })
 }
 
+fn apply_vad_state(
+    inter: &mut PipelineIntermediate,
+    report: &VadReport,
+    analysis: Option<backend::native_audio::NativeAudioAnalysis>,
+) {
+    inter.native_audio_analysis = analysis.map(Arc::new);
+    inter.vad_regions = Some(report.regions.clone());
+    inter.vad_silence_only = report.silence_only;
+    if report.silence_only {
+        inter.result = Some(crate::model::TranscriptionResult {
+            backend: crate::model::BackendKind::Auto,
+            transcript: String::new(),
+            language: None,
+            segments: Vec::new(),
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({
+                "vad": "silence_only",
+                "detector": report.detector,
+                "fallback_triggered": report.fallback_triggered,
+            }),
+            artifact_paths: Vec::new(),
+        });
+    }
+}
+
 async fn execute_vad(
     pcx: &mut PipelineCx,
     log: &mut EventLog,
@@ -3775,30 +4533,12 @@ async fn execute_vad(
         }
     };
 
-    inter.native_audio_analysis = analysis.map(Arc::new);
+    apply_vad_state(inter, &report, analysis);
     let vad_code = if report.silence_only {
-        inter.vad_silence_only = true;
-        // Provide an empty result for silence-only audio.
-        inter.result = Some(crate::model::TranscriptionResult {
-            backend: crate::model::BackendKind::Auto,
-            transcript: String::new(),
-            language: None,
-            segments: Vec::new(),
-            acceleration: None,
-            diarization: None,
-            raw_output: json!({
-                "vad": "silence_only",
-                "detector": report.detector,
-                "fallback_triggered": report.fallback_triggered,
-            }),
-            artifact_paths: Vec::new(),
-        });
         "vad.silence"
     } else {
         "vad.ok"
     };
-
-    inter.vad_regions = Some(report.regions.clone());
 
     tracing::debug!(
         stage = "vad",
@@ -3832,16 +4572,37 @@ async fn execute_vad(
 // ---------------------------------------------------------------------------
 
 /// Report produced by the source separation stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeparationMode {
+    /// The pinned in-process DTLN model produced the downstream waveform.
+    Dtln,
+    /// Energy-based analysis ran and produced a coverage verdict.
+    EnergyAnalysis,
+    /// Analysis was impossible; audio passed through with NO isolation claim
+    /// (bd-f2se: the previous `vocal_isolated=true` here was a lie).
+    UnavailablePassthrough,
+}
+
 #[derive(Debug, Clone)]
 struct SeparateReport {
     /// Whether the audio was determined to contain predominantly vocal content.
     vocal_isolated: bool,
+    /// How this report was produced (drives honest stage telemetry).
+    mode: SeparationMode,
     /// Fraction of audio duration covered by active speech regions (0.0 - 1.0).
     speech_coverage: f64,
     /// Average RMS energy of the audio.
     avg_rms: f64,
     /// Number of distinct speech regions detected.
     active_region_count: usize,
+    /// RMS of the DTLN output when a transform ran.
+    output_rms: Option<f64>,
+    /// Sample count of the DTLN output when a transform ran.
+    output_samples: Option<usize>,
+    /// Replacement waveform consumed by downstream stages.
+    output_wav: Option<PathBuf>,
+    /// SHA-256 of the finalized replacement WAV bytes.
+    output_sha256: Option<String>,
     /// Notes about the separation process.
     notes: Vec<String>,
 }
@@ -3884,12 +4645,17 @@ fn source_separate_with_analysis(
             Ok(analysis) => analysis,
             Err(reason) => {
                 return Ok(SeparateReport {
-                    vocal_isolated: true,
+                    vocal_isolated: false,
+                    mode: SeparationMode::UnavailablePassthrough,
                     speech_coverage: 0.0,
                     avg_rms: 0.0,
                     active_region_count: 0,
+                    output_rms: None,
+                    output_samples: None,
+                    output_wav: None,
+                    output_sha256: None,
                     notes: vec![format!(
-                        "analysis unavailable ({reason}); assuming vocal content present"
+                        "analysis unavailable ({reason}); passthrough without isolation claim"
                     )],
                 });
             }
@@ -3927,16 +4693,129 @@ fn source_separate_with_analysis(
     Ok(SeparateReport {
         vocal_isolated,
         speech_coverage,
+        mode: SeparationMode::EnergyAnalysis,
         avg_rms: f64::from(analysis.avg_rms),
         active_region_count: analysis.active_regions.len(),
+        output_rms: None,
+        output_samples: None,
+        output_wav: None,
+        output_sha256: None,
         notes,
     })
+}
+
+fn waveform_rms(samples: &[f32]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let square_sum = samples
+        .iter()
+        .map(|&sample| {
+            let sample = f64::from(sample);
+            sample * sample
+        })
+        .sum::<f64>();
+    (square_sum / samples.len() as f64).sqrt()
+}
+
+fn source_separate_stage(
+    normalized_wav: &Path,
+    cached_analysis: Option<&backend::native_audio::NativeAudioAnalysis>,
+    weights_path: Option<&Path>,
+    output_wav: &Path,
+    token: &CancellationToken,
+) -> FwResult<SeparateReport> {
+    let mut report = source_separate_with_analysis(normalized_wav, cached_analysis, token)?;
+    let Some(weights_path) = weights_path else {
+        report.vocal_isolated = false;
+        report.mode = SeparationMode::UnavailablePassthrough;
+        report.notes.push(
+            "DTLN weights are not configured; original normalized waveform passed through without an isolation claim"
+                .to_owned(),
+        );
+        return Ok(report);
+    };
+
+    let checkpoint = || token.checkpoint();
+    let samples =
+        audio::read_normalized_wav_16k_mono_raw_with_checkpoint(normalized_wav, &checkpoint)?;
+    if samples.len() < crate::separate::BLOCK_LEN {
+        report.vocal_isolated = false;
+        report.mode = SeparationMode::UnavailablePassthrough;
+        report.notes.push(format!(
+            "DTLN requires at least {} samples; {}-sample input passed through without an isolation claim",
+            crate::separate::BLOCK_LEN,
+            samples.len()
+        ));
+        return Ok(report);
+    }
+
+    checkpoint()?;
+    let mut separator = crate::separate::DtlnSeparator::from_safetensors_with_checkpoint(
+        weights_path,
+        &checkpoint,
+    )?;
+    checkpoint()?;
+    let separated = separator.separate_with_checkpoint(&samples, &checkpoint)?;
+    let input_rms = waveform_rms(&samples);
+    let output_rms = waveform_rms(&separated);
+    audio::write_normalized_wav_16k_mono_with_checkpoint(output_wav, &separated, &checkpoint)?;
+    let output_sha256 = sha256_file_with_checkpoint(output_wav, &checkpoint)?;
+
+    report.vocal_isolated = true;
+    report.mode = SeparationMode::Dtln;
+    report.avg_rms = input_rms;
+    report.output_rms = Some(output_rms);
+    report.output_samples = Some(separated.len());
+    report.output_wav = Some(output_wav.to_path_buf());
+    report.output_sha256 = Some(output_sha256);
+    report.notes.push(format!(
+        "DTLN transform applied: input_rms={input_rms:.6}, output_rms={output_rms:.6}, output_samples={}",
+        separated.len()
+    ));
+    Ok(report)
+}
+
+fn apply_separate_report(
+    inter: &mut PipelineIntermediate,
+    report: &SeparateReport,
+) -> FwResult<()> {
+    match (
+        report.output_wav.as_ref(),
+        report.output_samples,
+        report.output_sha256.as_ref(),
+    ) {
+        (Some(output_wav), Some(output_samples), Some(output_sha256)) => {
+            inter.vocal_isolated = report.vocal_isolated;
+            inter.normalized_wav = Some(output_wav.clone());
+            inter.normalized_duration = Some(output_samples as f64 / 16_000.0);
+            inter.normalized_input_sha256 = Some(output_sha256.clone());
+            // Every cached waveform-derived fact below describes the
+            // pre-DTLN bytes. Clear it at the same atomic replacement seam;
+            // execute_separate rebinds VAD state to the finalized output when
+            // the VAD stage actually ran before this stage.
+            inter.native_audio_analysis = None;
+            inter.vad_regions = None;
+            inter.vad_silence_only = false;
+            Ok(())
+        }
+        (None, None, None) => {
+            inter.vocal_isolated = report.vocal_isolated;
+            Ok(())
+        }
+        _ => Err(FwError::ContractViolation(
+            "source separation replacement path, sample count, and content hash must be present together"
+                .to_owned(),
+        )),
+    }
 }
 
 async fn execute_separate(
     pcx: &mut PipelineCx,
     log: &mut EventLog,
+    request: &TranscribeRequest,
     stage_budgets: StageBudgetPolicy,
+    run_tmp_dir: &tempfile::TempDir,
     inter: &mut PipelineIntermediate,
 ) -> FwResult<()> {
     let normalized_wav = inter.normalized_wav.as_ref().ok_or_else(|| {
@@ -3958,13 +4837,45 @@ async fn execute_separate(
 
     let sep_wav = normalized_wav.clone();
     let cached_analysis = inter.native_audio_analysis.clone();
+    let post_vad_config = inter
+        .vad_regions
+        .is_some()
+        .then(|| VadConfig::from_request(request));
+    let weights_path = crate::separate::weights_path_from_env();
+    let output_wav = run_tmp_dir.path().join("dtln_vocals_16k_mono.wav");
     let sep_budget_ms = stage_budgets.separate_ms;
-    let sep_token = pcx.stage_token(sep_budget_ms); // ubs:ignore — cancellation token is not a secret
+    let sep_token = pcx.named_stage_token("separate", sep_budget_ms); // ubs:ignore — cancellation token is not a secret
+    let compute_threads = crate::backend::request_compute_threads(request);
 
-    let report = match run_stage_with_budget("separate", sep_budget_ms, move || {
-        source_separate_with_analysis(&sep_wav, cached_analysis.as_deref(), &sep_token)
-    }) {
-        Ok(report) => report,
+    let (report, post_vad) = match run_compute_stage_with_token_budget(
+        "separate",
+        sep_budget_ms,
+        sep_token,
+        compute_threads,
+        move || {
+            let report = source_separate_stage(
+                &sep_wav,
+                cached_analysis.as_deref(),
+                weights_path.as_deref(),
+                &output_wav,
+                &sep_token,
+            )?;
+            let post_vad = match (post_vad_config.as_ref(), report.output_wav.as_deref()) {
+                (Some(config), Some(replacement_wav)) => Some(vad_energy_detect_with_analysis(
+                    replacement_wav,
+                    config,
+                    &sep_token,
+                )?),
+                _ => None,
+            };
+            // Final worker-side fence after every transform-derived operation,
+            // including post-DTLN VAD. A deadline crossed during native analysis
+            // must not return an apparently successful replacement bundle.
+            sep_token.checkpoint()?;
+            Ok((report, post_vad))
+        },
+    ) {
+        Ok(outcome) => outcome,
         Err(error) => {
             let code = stage_failure_code("separate", &error);
             log.push(
@@ -3977,7 +4888,37 @@ async fn execute_separate(
         }
     };
 
-    inter.vocal_isolated = report.vocal_isolated;
+    // Observable-state fence: cancellation after the worker returns but
+    // before the replacement bundle is applied must emit the standard stage
+    // cancellation event rather than mutate PipelineIntermediate.
+    checkpoint_or_emit("separate", pcx, log)?;
+
+    if let Err(error) = apply_separate_report(inter, &report) {
+        let code = stage_failure_code("separate", &error);
+        log.push(
+            "separate",
+            &code,
+            stage_failure_message(&error, "source separation failed"),
+            json!({"error": error.to_string(), "budget_ms": sep_budget_ms}),
+        );
+        return Err(error);
+    }
+    let post_vad_payload = post_vad.as_ref().map(|(post_vad_report, _)| {
+        json!({
+            "frames_total": post_vad_report.frames_total,
+            "frames_voiced": post_vad_report.frames_voiced,
+            "voice_ratio": post_vad_report.voice_ratio,
+            "silence_only": post_vad_report.silence_only,
+            "regions_count": post_vad_report.regions.len(),
+            "detector": post_vad_report.detector,
+            "fallback_triggered": post_vad_report.fallback_triggered,
+            "activity_threshold": post_vad_report.activity_threshold,
+            "notes": post_vad_report.notes.clone(),
+        })
+    });
+    if let Some((post_vad_report, post_vad_analysis)) = post_vad {
+        apply_vad_state(inter, &post_vad_report, post_vad_analysis);
+    }
     inter.warnings.extend(report.notes.iter().cloned());
 
     tracing::debug!(stage = "separate", "Source separation complete");
@@ -3987,8 +4928,17 @@ async fn execute_separate(
         "source separation pass finished",
         json!({
             "vocal_isolated": report.vocal_isolated,
+            "separation_mode": match report.mode {
+                SeparationMode::Dtln => "dtln",
+                SeparationMode::EnergyAnalysis => "energy_analysis",
+                SeparationMode::UnavailablePassthrough => "unavailable_passthrough",
+            },
             "speech_coverage": report.speech_coverage,
             "avg_rms": report.avg_rms,
+            "output_rms": report.output_rms,
+            "output_samples": report.output_samples,
+            "output_sha256": report.output_sha256,
+            "post_separation_vad": post_vad_payload,
             "active_region_count": report.active_region_count,
             "notes": report.notes,
         }),
@@ -4727,10 +5677,12 @@ async fn execute_diarize(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let compute_threads = crate::backend::request_compute_threads(request);
 
-    let (updated_result, report, tiny_diarize_hint_evidence) = match run_stage_with_budget(
+    let (updated_result, report, tiny_diarize_hint_evidence) = match run_compute_stage_with_budget(
         "diarize",
         diarize_budget_ms,
+        compute_threads,
         move || {
             validate_diarization_execution_request(
                 engine,
@@ -5491,6 +6443,39 @@ fn sortformer_acoustic_fallback_eligible(error: &FwError) -> bool {
     )
 }
 
+/// Residency key for the verified native Sortformer session.
+const SORTFORMER_RESIDENT_SESSION: &str = "sortformer.session";
+
+/// The verified native Sortformer session: authenticated, parsed and built
+/// once per batch while a [`crate::native_engine::ModelResidency`] is alive,
+/// and per run otherwise. Diarization borrows the session immutably, so a
+/// reused session yields exactly what a freshly built one would.
+fn resident_sortformer_session(
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<Arc<crate::sortformer_inference::SortformerSession>> {
+    if let Some(session) = crate::native_engine::resident_component::<
+        crate::sortformer_inference::SortformerSession,
+    >(SORTFORMER_RESIDENT_SESSION)
+    {
+        return Ok(session);
+    }
+    let cached =
+        crate::model_distribution::resolve_cached_sortformer_with_cancel(|| checkpoint().is_err())?;
+    checkpoint()?;
+    let package = crate::sortformer_conformance::load_verified_sortformer_package_with_checkpoint(
+        &cached.receipt_path,
+        &cached.package_path,
+        checkpoint,
+    )?;
+    let session = Arc::new(
+        crate::sortformer_inference::SortformerSession::from_verified_package_with_checkpoint(
+            &package, checkpoint,
+        )?,
+    );
+    crate::native_engine::retain_resident_component(SORTFORMER_RESIDENT_SESSION, &session);
+    Ok(session)
+}
+
 fn run_native_sortformer_diarization(
     samples: &[f32],
     normalized_input_sha256: &str,
@@ -5506,18 +6491,7 @@ fn run_native_sortformer_diarization(
                 .to_owned(),
         ));
     }
-    let cached =
-        crate::model_distribution::resolve_cached_sortformer_with_cancel(|| checkpoint().is_err())?;
-    checkpoint()?;
-    let package = crate::sortformer_conformance::load_verified_sortformer_package_with_checkpoint(
-        &cached.receipt_path,
-        &cached.package_path,
-        checkpoint,
-    )?;
-    let session =
-        crate::sortformer_inference::SortformerSession::from_verified_package_with_checkpoint(
-            &package, checkpoint,
-        )?;
+    let session = resident_sortformer_session(checkpoint)?;
     let output = session.diarize_with_checkpoint(
         crate::sortformer_inference::SortformerPcm::mono_16khz(samples),
         checkpoint,
@@ -5663,7 +6637,7 @@ fn run_native_sortformer_diarization(
         sortformer_activity_shares(&turns, timed_speech_ms)?;
     let report = DiarizationReport {
         implementation: "native-sortformer-v1".to_owned(),
-        contract_version: "sortformer-diarization-v1".to_owned(),
+        contract_version: diarization::SORTFORMER_DIARIZATION_CONTRACT_VERSION.to_owned(),
         feature_schema: "sortformer-activity-80ms-v1".to_owned(),
         speaker_evidence_mode: DiarizationSpeakerEvidenceMode::SortformerActivity,
         normalized_input_sha256: normalized_input_sha256.to_owned(),
@@ -6042,6 +7016,13 @@ fn tiny_diarize_boundary_hints(
         boundaries_ms,
         tiny_diarize_hint_evidence(true, accepted_count, "accepted"),
     )
+}
+
+/// Whether a backend result came from the in-process native engine, whose
+/// segment times are decoded timestamp tokens rather than estimates.
+fn is_native_in_process_result(raw_output: &Value) -> bool {
+    raw_output.get("in_process").and_then(Value::as_bool) == Some(true)
+        && raw_output.get("implementation").and_then(Value::as_str) == Some("real-inference")
 }
 
 fn has_canonical_word_alignment(raw_output: &Value) -> bool {
@@ -6709,17 +7690,19 @@ impl EventLog {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::hint::black_box;
     use std::path::PathBuf;
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
     use asupersync::runtime::RuntimeBuilder;
+    use chrono::Utc;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
-    use crate::error::FwError;
+    use crate::error::{FwError, FwResult};
     use crate::model::{
         AcousticDiarizationRolloutStage, BackendKind, BackendParams, DiarizationConfig,
         DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus, DiarizationReport,
@@ -6738,18 +7721,20 @@ mod tests {
         SeparateReport, SpeakerEmbedding, StageBudgetPolicy, VadConfig, VadRegionMs, VadReport,
         acceleration_cancellation_fence_payload, acceleration_context_payload,
         acceleration_stream_owner_id, align_transcription_result,
-        apply_native_diarization_projection, apply_padding, budget_duration, checkpoint_or_emit,
-        clamp_diarization_turns_to_duration_ms, ctc_forced_align, diarize_segments,
-        emit_diarization_report_events, event_elapsed_ms, external_diarization_fallback_admitted,
-        external_diarization_report, finite_seconds_interval_to_ms, has_canonical_word_alignment,
-        is_abbreviation_period, is_decimal_period, is_ellipsis_period, load_energy_valley_evidence,
-        merge_regions_by_gap, ms_to_frames, nearest_energy_valley, normalized_pcm_duration_ms,
-        optional_stage_skip, parse_acoustic_diarization_rollout, parse_budget_ms,
-        parse_event_ts_ms, punctuate_segments, recommended_budget, resolved_diarization_engine,
-        resolved_diarization_engine_for_rollout, result_has_external_diarization, run_pipeline,
-        run_stage_with_budget, sanitize_process_pid, selected_diarization_engine, sha256_bytes_hex,
-        sha256_file, sha256_file_with_checkpoint, sha256_json_value, silhouette_score,
-        sortformer_acoustic_fallback_eligible, sortformer_activity_shares,
+        apply_native_diarization_projection, apply_padding, artifact_output_prefix,
+        budget_duration, checkpoint_or_emit, clamp_diarization_turns_to_duration_ms,
+        ctc_forced_align, diarize_segments, emit_diarization_report_events, event_elapsed_ms,
+        external_diarization_fallback_admitted, external_diarization_report,
+        finite_seconds_interval_to_ms, has_canonical_word_alignment, is_abbreviation_period,
+        is_decimal_period, is_ellipsis_period, load_energy_valley_evidence, merge_regions_by_gap,
+        ms_to_frames, named_stage_token_for_deadlines, nearest_energy_valley,
+        normalized_pcm_duration_ms, optional_stage_skip, parse_acoustic_diarization_rollout,
+        parse_budget_ms, parse_event_ts_ms, punctuate_segments, recommended_budget,
+        resolved_diarization_engine, resolved_diarization_engine_for_rollout,
+        result_has_external_diarization, run_pipeline, run_stage_with_budget,
+        run_stage_with_token_budget, sanitize_process_pid, selected_diarization_engine,
+        sha256_bytes_hex, sha256_file, sha256_file_with_checkpoint, sha256_json_value,
+        silhouette_score, sortformer_acoustic_fallback_eligible, sortformer_activity_shares,
         sortformer_count_request_is_capacity_eligible, source_separate,
         source_separate_with_analysis, split_long_regions, stage_budget_ms, stage_failure_code,
         stage_failure_message, stage_latency_profile, state_root, tiny_diarize_boundary_hints,
@@ -6757,6 +7742,57 @@ mod tests {
         unknown_neural_diarization_with_hard_hints, vad_energy_detect,
         vad_energy_detect_with_analysis, validate_diarization_execution_request,
     };
+    use super::{SpeculativeLaneTelemetry, run_stage_with_timeout_streaming};
+
+    #[test]
+    fn isolate_input_panic_turns_a_panic_into_that_inputs_error() {
+        // bd-batch-panic-isolation-p7fa: a literal panic carries `&str`, a
+        // formatted one `String`; both keep their text. Any other payload is
+        // still an error, and a run's own error passes through unchanged.
+        type Run = Box<dyn FnOnce() -> FwResult<RunReport>>;
+        let detail = String::from("formatted payload");
+        let cases: [(Run, &str); 3] = [
+            (
+                Box::new(|| -> FwResult<RunReport> { panic!("literal payload") }),
+                "input run panicked: literal payload",
+            ),
+            (
+                Box::new(move || -> FwResult<RunReport> { panic!("{detail}") }),
+                "input run panicked: formatted payload",
+            ),
+            (
+                Box::new(|| -> FwResult<RunReport> { std::panic::panic_any(7_u32) }),
+                "input run panicked: non-string panic payload",
+            ),
+        ];
+        for (run, message) in cases {
+            match super::isolate_input_panic(run) {
+                Err(FwError::ContractViolation(text)) => assert_eq!(text, message),
+                other => panic!("expected a contract violation, got {other:?}"),
+            }
+        }
+
+        let error = super::isolate_input_panic(|| Err(FwError::Cancelled("ctrl-c".to_owned())))
+            .expect_err("the run's own error");
+        assert_eq!(error.error_code(), "FW-CANCELLED");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_output_prefix_preserves_non_utf8_input_stem() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let input = InputSource::File {
+            path: PathBuf::from(std::ffi::OsString::from_vec(b"recording-\x80.wav".to_vec())),
+        };
+
+        let prefix = artifact_output_prefix(&input, std::path::Path::new("/tmp/output"));
+
+        assert_eq!(
+            prefix.file_name().expect("artifact file name").as_bytes(),
+            b"recording-\x80"
+        );
+    }
 
     #[test]
     fn report_event_snapshot_elision_preserves_pipeline_tail_events() {
@@ -6807,6 +7843,7 @@ mod tests {
                 dir.path(),
                 None,
                 &persist_config,
+                None,
             ))
             .expect("persist-only pipeline should succeed");
         assert_eq!(
@@ -6845,6 +7882,7 @@ mod tests {
                 dir.path(),
                 None,
                 &persist_config,
+                None,
             ))
             .expect("disabled persistence should return a report");
         assert_eq!(
@@ -6863,6 +7901,7 @@ mod tests {
                 dir.path(),
                 None,
                 &PipelineConfig::new(Vec::new()),
+                None,
             ))
             .expect("empty pipeline should return a report");
         assert_eq!(
@@ -7574,6 +8613,7 @@ mod tests {
             dir.path(),
             Some(tx),
             &PipelineConfig::default(),
+            None,
         ));
         assert!(result.is_err());
 
@@ -7615,6 +8655,7 @@ mod tests {
                 root,
                 Some(tx),
                 &PipelineConfig::default(),
+                None,
             ));
             let error = result.expect_err("pipeline should fail ingest on missing input");
             assert!(
@@ -7676,6 +8717,7 @@ mod tests {
             dir.path(),
             Some(tx),
             &PipelineConfig::default(),
+            None,
         ));
         let error = result.expect_err("pipeline should cancel at checkpoint");
         assert!(matches!(error, FwError::Cancelled(_)));
@@ -7824,6 +8866,7 @@ mod tests {
                 root,
                 Some(tx),
                 &PipelineConfig::default(),
+                None,
             ));
             let error = result.expect_err("pipeline should cancel at checkpoint");
             assert!(matches!(error, FwError::Cancelled(_)));
@@ -7937,6 +8980,48 @@ mod tests {
             stage_failure_message(&error, "fallback"),
             "stage budget exceeded"
         );
+    }
+
+    #[test]
+    fn timed_out_stage_is_quiescent_before_followup_starts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let active = Arc::new(AtomicBool::new(false));
+        let quiesced = Arc::new(AtomicBool::new(false));
+        let worker_active = Arc::clone(&active);
+        let worker_quiesced = Arc::clone(&quiesced);
+        let budget_ms = 20;
+        let deadline = Utc::now() + chrono::Duration::milliseconds(budget_ms as i64);
+        let token = named_stage_token_for_deadlines(None, deadline, "backend", budget_ms as u64);
+        let worker_token = token;
+
+        let result: FwResult<()> =
+            run_stage_with_token_budget("backend", budget_ms as u64, token, move || {
+                worker_active.store(true, Ordering::SeqCst);
+                loop {
+                    match worker_token.checkpoint() {
+                        Ok(()) => std::thread::yield_now(),
+                        Err(error) => {
+                            worker_active.store(false, Ordering::SeqCst);
+                            worker_quiesced.store(true, Ordering::SeqCst);
+                            return Err(error);
+                        }
+                    }
+                }
+            });
+
+        assert!(matches!(result, Err(FwError::StageTimeout { .. })));
+        assert!(quiesced.load(Ordering::SeqCst));
+        assert!(!active.load(Ordering::SeqCst));
+
+        run_stage_with_budget("followup", 5_000, move || {
+            assert!(
+                !active.load(Ordering::SeqCst),
+                "later stage overlapped timed-out native work"
+            );
+            Ok(())
+        })
+        .expect("follow-up stage");
     }
 
     #[test]
@@ -8464,6 +9549,80 @@ mod tests {
     }
 
     #[test]
+    fn named_stage_token_reports_stage_timeout() {
+        let pcx = PipelineCx::new(None);
+        let token = pcx.named_stage_token("separate", 1); // ubs:ignore — cancellation token is not a secret
+        std::thread::sleep(Duration::from_millis(10));
+        let error = token
+            .checkpoint()
+            .expect_err("named stage budget must expire");
+        assert!(matches!(
+            error,
+            FwError::StageTimeout {
+                ref stage,
+                budget_ms: 1
+            } if stage == "separate"
+        ));
+    }
+
+    #[test]
+    fn named_stage_token_reports_timeout_before_later_pipeline_deadline() {
+        let pcx = PipelineCx::new(Some(60_000));
+        let token = pcx.named_stage_token("separate", 1); // ubs:ignore — cancellation token is not a secret
+        std::thread::sleep(Duration::from_millis(10));
+        let error = token
+            .checkpoint()
+            .expect_err("shorter named stage budget must expire first");
+        assert!(matches!(
+            error,
+            FwError::StageTimeout {
+                ref stage,
+                budget_ms: 1
+            } if stage == "separate"
+        ));
+    }
+
+    #[test]
+    fn named_stage_token_tie_prefers_stage_timeout() {
+        let tied_deadline = chrono::DateTime::<Utc>::MIN_UTC;
+        let token = super::named_stage_token_for_deadlines(
+            Some(tied_deadline),
+            tied_deadline,
+            "separate",
+            30_000,
+        );
+        assert!(matches!(
+            token.deadline_failure,
+            super::DeadlineFailure::StageTimeout {
+                stage: "separate",
+                budget_ms: 30_000
+            }
+        ));
+    }
+
+    #[test]
+    fn named_stage_token_preserves_earlier_pipeline_cancellation() {
+        let pcx = PipelineCx::new(Some(1));
+        let token = pcx.named_stage_token("separate", 60_000); // ubs:ignore — cancellation token is not a secret
+        std::thread::sleep(Duration::from_millis(10));
+        let error = token
+            .checkpoint()
+            .expect_err("earlier pipeline deadline must expire");
+        assert!(matches!(error, FwError::Cancelled(_)));
+    }
+
+    #[test]
+    fn stage_receiver_preserves_earlier_pipeline_cancellation() {
+        let pcx = PipelineCx::new(Some(1));
+        let token = pcx.named_stage_token("separate", 100); // ubs:ignore — cancellation token is not a secret
+        let result = super::run_stage_with_token_budget("separate", 100, token, || {
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(())
+        });
+        assert!(matches!(result, Err(FwError::Cancelled(_))));
+    }
+
+    #[test]
     fn stage_token_respects_pipeline_deadline() {
         let pcx = PipelineCx::new(Some(1)); // pipeline deadline
         let token = pcx.stage_token(60_000); // ubs:ignore — cancellation token is not a secret
@@ -8939,6 +10098,45 @@ mod tests {
         assert_eq!(hash.len(), 64);
     }
 
+    /// bd-robot-batch-epipe-keeps-running-elf0: a run's caller can cancel it
+    /// through the context and every token derived from it, without touching
+    /// the process-wide shutdown state.
+    #[test]
+    fn run_cancel_trips_the_context_and_every_derived_token() {
+        use super::RunCancel;
+
+        let cancel = RunCancel::new();
+        let mut pcx = PipelineCx::new(None);
+        pcx.run_cancel = Some(cancel);
+        let tokens = [
+            pcx.cancellation_token(),
+            pcx.stage_token(60_000),
+            pcx.named_stage_token("backend", 60_000),
+        ];
+        assert!(pcx.checkpoint().is_ok());
+        assert!(tokens.iter().all(|token| token.checkpoint().is_ok()));
+
+        cancel.cancel();
+        let message = |result: FwResult<()>| match result {
+            Err(FwError::Cancelled(message)) => message,
+            other => panic!("expected a caller cancellation, got {other:?}"),
+        };
+        assert_eq!(message(pcx.checkpoint()), "run cancelled by its caller");
+        for token in &tokens {
+            assert_eq!(message(token.checkpoint()), "run cancelled by its caller");
+            assert!(matches!(token.expiration_error(), FwError::Cancelled(_)));
+        }
+        assert!(
+            !crate::cli::ShutdownController::is_shutting_down(),
+            "a run cancel must not become a process shutdown (exit 130)"
+        );
+
+        // Another run's context and tokens are untouched.
+        let other = PipelineCx::new(None);
+        assert!(other.checkpoint().is_ok());
+        assert!(other.stage_token(60_000).checkpoint().is_ok());
+    }
+
     // ── checkpoint_or_emit failure path ──
 
     #[test]
@@ -9048,6 +10246,79 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), FwError::InvalidRequest(_)));
+    }
+
+    fn stage_event(code: &str) -> RunEvent {
+        RunEvent {
+            seq: 0,
+            ts_rfc3339: Utc::now().to_rfc3339(),
+            stage: "speculation".to_owned(),
+            code: code.to_owned(),
+            message: String::new(),
+            payload: json!({}),
+        }
+    }
+
+    #[test]
+    fn streaming_stage_forwards_events_before_the_operation_finishes() {
+        // The worker refuses to finish until the supervisor has acknowledged
+        // its first event, which is only possible if published events are
+        // forwarded live rather than collected after the stage returns.
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        let mut forwarded = Vec::new();
+        let result = run_stage_with_timeout_streaming(
+            "test",
+            Duration::from_secs(30),
+            || FwError::StageTimeout {
+                stage: "test".to_owned(),
+                budget_ms: 30_000,
+            },
+            &mut |event: RunEvent| {
+                forwarded.push(event.code);
+                let _ = ack_tx.send(());
+            },
+            move |publish| {
+                publish(stage_event("transcript.partial"));
+                ack_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| {
+                    FwError::InvalidRequest("event was not forwarded live".to_owned())
+                })?;
+                publish(stage_event("transcript.confirm"));
+                Ok(7)
+            },
+        );
+        assert_eq!(result.expect("stage succeeds"), 7);
+        assert_eq!(forwarded, ["transcript.partial", "transcript.confirm"]);
+    }
+
+    #[test]
+    fn streaming_stage_keeps_events_published_before_a_timeout() {
+        let mut forwarded = Vec::new();
+        let result: FwResult<()> = run_stage_with_timeout_streaming(
+            "test",
+            Duration::from_millis(50),
+            || FwError::StageTimeout {
+                stage: "test".to_owned(),
+                budget_ms: 50,
+            },
+            &mut |event: RunEvent| forwarded.push(event.code),
+            |publish| {
+                publish(stage_event("transcript.partial"));
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(FwError::StageTimeout { .. })));
+        assert_eq!(forwarded, ["transcript.partial"]);
+    }
+
+    #[test]
+    fn speculative_lane_telemetry_labels_reflect_what_ran() {
+        let mut implementations = BTreeSet::new();
+        assert_eq!(SpeculativeLaneTelemetry::label(&implementations), "none");
+        implementations.insert("native");
+        assert_eq!(SpeculativeLaneTelemetry::label(&implementations), "native");
+        implementations.insert("bridge");
+        assert_eq!(SpeculativeLaneTelemetry::label(&implementations), "mixed");
     }
 
     // ── budget_duration edge cases ──
@@ -10552,6 +11823,7 @@ mod tests {
             dir.path(),
             Some(tx),
             &PipelineConfig::default(),
+            None,
         ));
         assert!(result.is_err());
 
@@ -10601,6 +11873,7 @@ mod tests {
             dir.path(),
             Some(tx),
             &PipelineConfig::default(),
+            None,
         ));
         let error = result.expect_err("pipeline should cancel at checkpoint");
         assert!(matches!(error, FwError::Cancelled(_)));
@@ -12028,15 +13301,98 @@ mod tests {
         assert_eq!(report.segments_fallback, 2);
         assert_eq!(report.energy_valley_snaps, 0);
         assert!(!report.energy_evidence_available);
+        assert_eq!(report.method, "dtw_attention");
         assert!(
-            report
-                .notes
-                .iter()
-                .any(|note| note.contains("canonical DTW"))
+            report.notes.is_empty(),
+            "the normal canonical path raises no run warning: {:?}",
+            report.notes
         );
         assert_eq!(
             serde_json::to_value(&result.segments).expect("serialize preserved segments"),
             original_json
+        );
+    }
+
+    #[test]
+    fn native_results_keep_model_timestamps_and_only_energy_snap() {
+        let native_raw = json!({
+            "engine": "whisper.cpp-native",
+            "in_process": true,
+            "implementation": "real-inference",
+        });
+        // Boundaries a char-density pass would move: 8 + 12 chars over 2 s
+        // puts the heuristic boundary at 0.8 s, inside the 0.5 s drift guard.
+        let segments = vec![
+            make_segment(0.0, 1.04, "abcdefgh"),
+            make_segment(1.04, 2.0, "abcdefghijkl"),
+        ];
+        let mut without_evidence = TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: String::new(),
+            language: Some("en".to_owned()),
+            segments: segments.clone(),
+            acceleration: None,
+            diarization: None,
+            raw_output: native_raw.clone(),
+            artifact_paths: Vec::new(),
+        };
+        let report = align_transcription_result(
+            &mut without_evidence,
+            Some(2.0),
+            &AlignConfig::default(),
+            None,
+            &CancellationToken::no_deadline(),
+        )
+        .expect("native alignment");
+        assert_eq!(report.method, "native_timestamp_tokens");
+        assert_eq!(report.segments_corrected, 0);
+        assert_eq!(
+            serde_json::to_value(&without_evidence.segments).expect("serialize"),
+            serde_json::to_value(&segments).expect("serialize"),
+            "model timestamps must survive untouched"
+        );
+
+        // With energy evidence, only the bounded valley snap may refine them.
+        let mut with_evidence = without_evidence.clone();
+        with_evidence.segments = segments;
+        let valleys = crate::backend::native_audio::EnergyValleyProfile {
+            frame_ms: 20,
+            activity_threshold: 0.05,
+            valleys: vec![crate::backend::native_audio::EnergyValley {
+                timestamp_ms: 1_000,
+                rms: 0.0,
+            }],
+        };
+        let report = align_transcription_result(
+            &mut with_evidence,
+            Some(2.0),
+            &AlignConfig::default(),
+            Some(&valleys),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("native alignment with evidence");
+        assert_eq!(report.method, "native_timestamp_tokens");
+        assert_eq!(report.energy_valley_snaps, 1);
+        assert_eq!(with_evidence.segments[0].start_sec, Some(0.0));
+        assert_eq!(with_evidence.segments[0].end_sec, Some(1.0));
+        assert_eq!(with_evidence.segments[1].start_sec, Some(1.0));
+        assert_eq!(with_evidence.segments[1].end_sec, Some(2.0));
+
+        // Non-native results keep the existing heuristic path.
+        let mut bridge = without_evidence.clone();
+        bridge.raw_output = json!({});
+        let report = align_transcription_result(
+            &mut bridge,
+            Some(2.0),
+            &AlignConfig::default(),
+            None,
+            &CancellationToken::no_deadline(),
+        )
+        .expect("bridge alignment");
+        assert_eq!(report.method, "char_density_heuristic");
+        assert_eq!(
+            report.segments_corrected, 2,
+            "fixture must be one the heuristic rewrites"
         );
     }
 
@@ -12182,6 +13538,7 @@ mod tests {
         let (profile, absent_reason) = load_energy_valley_evidence(None, &token)
             .expect("missing normalized audio is nonfatal");
         assert!(profile.is_none());
+        let absent_reason = absent_reason.expect("absence is explained");
         assert!(absent_reason.contains("was not produced"));
         assert!(absent_reason.contains("failed closed"));
 
@@ -12190,6 +13547,7 @@ mod tests {
         let (profile, error_reason) = load_energy_valley_evidence(Some(&missing), &token)
             .expect("unreadable normalized audio is nonfatal evidence absence");
         assert!(profile.is_none());
+        let error_reason = error_reason.expect("failure is explained");
         assert!(error_reason.contains("energy evidence unavailable"));
         assert!(error_reason.contains("i/o failure"));
         assert!(error_reason.contains("failed closed"));
@@ -12557,6 +13915,49 @@ mod tests {
             "first segment end should be original"
         );
         assert_eq!(report.segments_fallback + report.segments_corrected, 2);
+    }
+
+    #[test]
+    fn ctc_align_never_leaves_a_correction_overlapping_a_fallback_neighbor() {
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let config = AlignConfig::default(); // 0.5 s drift guard
+        // 30 chars over 3 s => 0.1 s/char.
+        // s0 (12 chars): aligned [0, 1.2] vs original [0, 1.0] -> within drift, corrected.
+        // s1 (2 chars): aligned [1.2, 1.4] vs original [1.0, 2.0] -> end drift 0.6, fallback.
+        // Without reconciliation s0's corrected end (1.2) overlaps s1's start (1.0).
+        let mut segments = vec![
+            make_segment(0.0, 1.0, "aaaaaaaaaaaa"),
+            make_segment(1.0, 2.0, "bb"),
+            make_segment(2.0, 3.0, "cccccccccccccccc"),
+        ];
+        let report = ctc_forced_align(&mut segments, Some(3.0), &config, &token).unwrap();
+
+        for pair in segments.windows(2) {
+            let (previous_end, next_start) = (
+                pair[0].end_sec.expect("timed"),
+                pair[1].start_sec.expect("timed"),
+            );
+            assert!(
+                previous_end <= next_start + 1e-9,
+                "segments overlap: {previous_end} > {next_start}"
+            );
+        }
+        assert_eq!(segments[0].start_sec, Some(0.0));
+        assert_eq!(
+            segments[0].end_sec,
+            Some(1.0),
+            "s0 reverted to its original"
+        );
+        assert_eq!(report.segments_corrected, 1, "only s2 keeps its correction");
+        assert_eq!(report.segments_fallback, 2);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("reverted to original offsets")),
+            "{:?}",
+            report.notes
+        );
     }
 
     #[test]
@@ -13415,7 +14816,7 @@ mod tests {
     }
 
     #[test]
-    fn source_separate_returns_vocal_isolated_on_invalid_wav() {
+    fn source_separate_passthrough_without_claim_on_invalid_wav() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.wav");
         std::fs::write(&path, b"fake audio").unwrap();
@@ -13423,12 +14824,14 @@ mod tests {
         let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
         let report = source_separate(&path, &token).unwrap();
 
-        // Invalid WAV → fallback path: assumes vocal content present.
-        assert!(report.vocal_isolated);
+        // Invalid WAV → passthrough with NO isolation claim (bd-f2se removed
+        // the vocal_isolated=true lie on this path).
+        assert!(!report.vocal_isolated);
+        assert_eq!(report.mode, super::SeparationMode::UnavailablePassthrough);
         assert!(!report.notes.is_empty());
         assert!(
-            report.notes[0].contains("analysis unavailable"),
-            "expected fallback note, got: {}",
+            report.notes[0].contains("passthrough without isolation claim"),
+            "expected honest passthrough note, got: {}",
             report.notes[0]
         );
     }
@@ -13508,9 +14911,335 @@ mod tests {
         let result =
             source_separate(std::path::Path::new("/nonexistent/audio.wav"), &token).unwrap();
 
-        // Missing file → graceful fallback.
-        assert!(result.vocal_isolated);
-        assert!(result.notes[0].contains("analysis unavailable"));
+        // Missing file → graceful passthrough WITHOUT an isolation claim
+        // (bd-f2se removed the vocal_isolated=true lie here).
+        assert!(!result.vocal_isolated);
+        assert_eq!(result.mode, super::SeparationMode::UnavailablePassthrough);
+        assert!(result.notes[0].contains("passthrough without isolation claim"));
+    }
+
+    #[test]
+    fn source_separate_stage_without_weights_is_honest_passthrough() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("speech.wav");
+        let output = dir.path().join("must-not-exist.wav");
+        let samples = (0..16_000)
+            .map(|index| {
+                let phase = index as f64 * 440.0 * std::f64::consts::TAU / 16_000.0;
+                (phase.sin() * 8_000.0) as i16
+            })
+            .collect::<Vec<_>>();
+        write_pcm16_mono_wav_for_vad(&input, 16_000, &samples);
+
+        let report = super::source_separate_stage(
+            &input,
+            None,
+            None,
+            &output,
+            &CancellationToken::no_deadline(),
+        )
+        .expect("missing weights must be an honest passthrough");
+        assert!(!report.vocal_isolated);
+        assert_eq!(report.mode, super::SeparationMode::UnavailablePassthrough);
+        assert!(report.output_wav.is_none());
+        assert!(report.output_rms.is_none());
+        assert!(report.output_samples.is_none());
+        assert!(report.output_sha256.is_none());
+        assert!(!output.exists());
+        let mut inter = super::PipelineIntermediate::new();
+        inter.normalized_wav = Some(input.clone());
+        inter.normalized_duration = Some(1.0);
+        inter.normalized_input_sha256 = Some("original-normalized-hash".to_owned());
+        super::apply_separate_report(&mut inter, &report)
+            .expect("passthrough report must preserve the normalized input binding");
+        assert_eq!(inter.normalized_wav.as_deref(), Some(input.as_path()));
+        assert_eq!(inter.normalized_duration, Some(1.0));
+        assert_eq!(
+            inter.normalized_input_sha256.as_deref(),
+            Some("original-normalized-hash")
+        );
+        assert!(!inter.vocal_isolated);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("weights are not configured"))
+        );
+    }
+
+    #[test]
+    fn apply_separate_report_rebinds_replay_hash_atomically() {
+        let input = PathBuf::from("original-normalized.wav");
+        let output = PathBuf::from("dtln-vocals.wav");
+        let original_hash = super::sha256_bytes_hex(b"original normalized wav bytes");
+        let replacement_hash = super::sha256_bytes_hex(b"finalized DTLN wav bytes");
+        let report = super::SeparateReport {
+            vocal_isolated: true,
+            mode: super::SeparationMode::Dtln,
+            speech_coverage: 0.75,
+            avg_rms: 0.25,
+            active_region_count: 1,
+            output_rms: Some(0.125),
+            output_samples: Some(8_000),
+            output_wav: Some(output.clone()),
+            output_sha256: Some(replacement_hash.clone()),
+            notes: Vec::new(),
+        };
+        let mut inter = super::PipelineIntermediate::new();
+        inter.vocal_isolated = false;
+        inter.normalized_wav = Some(input.clone());
+        inter.normalized_duration = Some(1.0);
+        inter.normalized_input_sha256 = Some(original_hash.clone());
+        inter.native_audio_analysis = Some(Arc::new(
+            crate::backend::native_audio::NativeAudioAnalysis {
+                duration_ms: 1_000,
+                sample_rate_hz: 16_000,
+                frame_ms: 20,
+                frame_count: 50,
+                avg_rms: 0.25,
+                max_rms: 0.5,
+                activity_threshold: 0.01,
+                active_regions: Vec::new(),
+            },
+        ));
+        inter.vad_regions = Some(vec![(0.0, 1.0)]);
+        inter.vad_silence_only = true;
+
+        let mut malformed = report.clone();
+        malformed.output_sha256 = None;
+        let error = super::apply_separate_report(&mut inter, &malformed)
+            .expect_err("a replacement without its finalized content hash must fail closed");
+        assert!(matches!(error, FwError::ContractViolation(_)));
+        assert!(!inter.vocal_isolated);
+        assert_eq!(inter.normalized_wav.as_deref(), Some(input.as_path()));
+        assert_eq!(inter.normalized_duration, Some(1.0));
+        assert_eq!(
+            inter.normalized_input_sha256.as_deref(),
+            Some(original_hash.as_str())
+        );
+        assert!(inter.native_audio_analysis.is_some());
+        assert_eq!(inter.vad_regions.as_deref(), Some(&[(0.0, 1.0)][..]));
+        assert!(inter.vad_silence_only);
+
+        super::apply_separate_report(&mut inter, &report)
+            .expect("complete replacement evidence must apply");
+        assert!(inter.vocal_isolated);
+        assert_eq!(inter.normalized_wav.as_deref(), Some(output.as_path()));
+        assert_eq!(inter.normalized_duration, Some(0.5));
+        assert_eq!(
+            inter.normalized_input_sha256.as_deref(),
+            Some(replacement_hash.as_str())
+        );
+        assert!(inter.native_audio_analysis.is_none());
+        assert!(inter.vad_regions.is_none());
+        assert!(!inter.vad_silence_only);
+    }
+
+    #[test]
+    fn source_separate_stage_short_input_passes_through_before_loading_weights() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("short.wav");
+        let output = dir.path().join("must-not-exist.wav");
+        let samples = vec![1_000i16; crate::separate::BLOCK_LEN - 1];
+        write_pcm16_mono_wav_for_vad(&input, 16_000, &samples);
+
+        let report = super::source_separate_stage(
+            &input,
+            None,
+            Some(std::path::Path::new(
+                "/nonexistent/must-not-load.safetensors",
+            )),
+            &output,
+            &CancellationToken::no_deadline(),
+        )
+        .expect("short input must pass through before model loading");
+        assert!(!report.vocal_isolated);
+        assert_eq!(report.mode, super::SeparationMode::UnavailablePassthrough);
+        assert!(report.output_wav.is_none());
+        assert!(report.output_samples.is_none());
+        assert!(!output.exists());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("requires at least 512 samples"))
+        );
+    }
+
+    #[test]
+    fn execute_separate_with_real_weights_writes_and_applies_replacement_waveform() {
+        let Some(_weights_path) = crate::separate::weights_path_from_env() else {
+            eprintln!("SKIP: FRANKEN_WHISPER_DTLN_WEIGHTS not set (model-gated)");
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("one-frame.wav");
+        let output = dir.path().join("dtln_vocals_16k_mono.wav");
+        let samples = (0..crate::separate::BLOCK_LEN)
+            .map(|index| {
+                let phase = index as f64 * 440.0 * std::f64::consts::TAU / 16_000.0;
+                (phase.sin() * 8_000.0) as i16
+            })
+            .collect::<Vec<_>>();
+        write_pcm16_mono_wav_for_vad(&input, 16_000, &samples);
+
+        let mut pcx = PipelineCx::new(None);
+        let mut log = EventLog::new(
+            "dtln-stage-test".to_owned(),
+            "00000000000000000000000000000000".to_owned(),
+            None,
+        );
+        let mut inter = super::PipelineIntermediate::new();
+        inter.normalized_wav = Some(input.clone());
+        inter.normalized_duration = Some(99.0);
+        let original_hash = super::sha256_file(&input).expect("hash input WAV");
+        inter.normalized_input_sha256 = Some(original_hash.clone());
+        inter.native_audio_analysis = Some(Arc::new(
+            crate::backend::native_audio::NativeAudioAnalysis {
+                duration_ms: 99_000,
+                sample_rate_hz: 16_000,
+                frame_ms: 20,
+                frame_count: 4_950,
+                avg_rms: 0.5,
+                max_rms: 0.75,
+                activity_threshold: 0.01,
+                active_regions: Vec::new(),
+            },
+        ));
+        inter.vad_regions = Some(vec![(0.0, 99.0)]);
+        let request = TranscribeRequest {
+            input: InputSource::File {
+                path: input.clone(),
+            },
+            backend: BackendKind::WhisperDiarization,
+            model: None,
+            language: None,
+            translate: false,
+            diarize: true,
+            persist: false,
+            db_path: dir.path().join("storage.sqlite3"),
+            timeout_ms: None,
+            backend_params: BackendParams::default(),
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime
+            .block_on(super::execute_separate(
+                &mut pcx,
+                &mut log,
+                &request,
+                StageBudgetPolicy::from_source(|_| None),
+                &dir,
+                &mut inter,
+            ))
+            .expect("real DTLN artifact must produce a replacement waveform");
+
+        assert!(inter.vocal_isolated);
+        assert_eq!(inter.normalized_wav.as_deref(), Some(output.as_path()));
+        assert_eq!(
+            inter.normalized_duration,
+            Some(crate::separate::BLOCK_LEN as f64 / 16_000.0)
+        );
+        let replacement_hash = super::sha256_file(&output).expect("hash replacement WAV");
+        assert_ne!(replacement_hash, original_hash);
+        assert_eq!(
+            inter.normalized_input_sha256.as_deref(),
+            Some(replacement_hash.as_str())
+        );
+        let rebound_analysis = inter
+            .native_audio_analysis
+            .as_ref()
+            .expect("post-DTLN VAD analysis must be rebound to replacement bytes");
+        assert_eq!(rebound_analysis.duration_ms, 32);
+        assert_ne!(inter.vad_regions.as_deref(), Some(&[(0.0, 99.0)][..]));
+        assert!(inter.vad_silence_only);
+        let silence_result = inter
+            .result
+            .as_ref()
+            .expect("sub-40 ms post-DTLN VAD result must short-circuit as silence");
+        assert!(silence_result.transcript.is_empty());
+        assert!(silence_result.segments.is_empty());
+        let event = log
+            .events
+            .iter()
+            .find(|event| event.code == "separate.ok")
+            .expect("successful stage must emit separate.ok");
+        assert_eq!(event.payload.get("separation_mode"), Some(&json!("dtln")));
+        assert_eq!(
+            event.payload.get("output_samples"),
+            Some(&json!(crate::separate::BLOCK_LEN))
+        );
+        assert_eq!(event.payload.get("vocal_isolated"), Some(&json!(true)));
+        assert_eq!(
+            event.payload.get("output_sha256"),
+            Some(&json!(replacement_hash))
+        );
+        let post_vad = event
+            .payload
+            .get("post_separation_vad")
+            .and_then(Value::as_object)
+            .expect("separate.ok must carry byte-bound post-DTLN VAD evidence");
+        assert_eq!(
+            post_vad.get("detector"),
+            Some(&json!("native_audio_waveform"))
+        );
+        assert_eq!(
+            post_vad.get("frames_total"),
+            Some(&json!(rebound_analysis.frame_count))
+        );
+        assert_eq!(
+            post_vad.get("regions_count"),
+            Some(&json!(inter.vad_regions.as_ref().map_or(0, Vec::len)))
+        );
+        assert_eq!(post_vad.get("silence_only"), Some(&json!(true)));
+        assert!(
+            event
+                .payload
+                .get("output_rms")
+                .and_then(Value::as_f64)
+                .is_some_and(f64::is_finite)
+        );
+
+        let written =
+            crate::audio::read_normalized_wav_16k_mono_raw_with_checkpoint(&output, &|| Ok(()))
+                .expect("replacement WAV must be readable by the downstream raw reader");
+        assert_eq!(written.len(), crate::separate::BLOCK_LEN);
+        let original =
+            crate::audio::read_normalized_wav_16k_mono_raw_with_checkpoint(&input, &|| Ok(()))
+                .expect("input WAV must remain readable for the transform comparison");
+        assert_ne!(written, original, "DTLN output must not be an input copy");
+    }
+
+    #[test]
+    fn native_separation_disables_external_backend_double_stemming() {
+        let dir = tempdir().unwrap();
+        let request = TranscribeRequest {
+            input: InputSource::File {
+                path: dir.path().join("input.wav"),
+            },
+            backend: BackendKind::WhisperDiarization,
+            model: None,
+            language: None,
+            translate: false,
+            diarize: true,
+            persist: false,
+            db_path: dir.path().join("storage.sqlite3"),
+            timeout_ms: None,
+            backend_params: BackendParams::default(),
+        };
+
+        let passthrough = super::backend_request_for_waveform(&request, false);
+        assert!(passthrough.backend_params.diarization_config.is_none());
+        let separated = super::backend_request_for_waveform(&request, true);
+        assert!(
+            separated
+                .backend_params
+                .diarization_config
+                .as_ref()
+                .is_some_and(|config| config.no_stem)
+        );
+        assert!(request.backend_params.diarization_config.is_none());
     }
 
     fn assert_vad_reports_equal(actual: &VadReport, expected: &VadReport) {
@@ -13540,13 +15269,17 @@ mod tests {
     }
 
     fn assert_separate_reports_equal(actual: &SeparateReport, expected: &SeparateReport) {
-        assert_eq!(actual.vocal_isolated, expected.vocal_isolated);
+        assert_eq!(actual.mode, expected.mode);
         assert_eq!(
             actual.speech_coverage.to_bits(),
             expected.speech_coverage.to_bits()
         );
         assert_eq!(actual.avg_rms.to_bits(), expected.avg_rms.to_bits());
         assert_eq!(actual.active_region_count, expected.active_region_count);
+        assert_eq!(actual.output_rms, expected.output_rms);
+        assert_eq!(actual.output_samples, expected.output_samples);
+        assert_eq!(actual.output_wav, expected.output_wav);
+        assert_eq!(actual.output_sha256, expected.output_sha256);
         assert_eq!(actual.notes, expected.notes);
     }
 
@@ -13649,7 +15382,6 @@ mod tests {
             checksum = checksum.wrapping_add(report.active_region_count as u64);
             black_box(&report);
         }
-        black_box(checksum);
         started.elapsed()
     }
 
@@ -13704,17 +15436,16 @@ mod tests {
         let candidate_signature = separate_report_signature(&candidate);
         assert_eq!(candidate_signature, historical_signature);
         let output_sha256 = format!("{:x}", Sha256::digest(candidate_signature.as_bytes()));
-
         let calibration = measure_source_separation::<false>(&path, &analysis, 1);
         let iterations = (TARGET_ARM_SECS / calibration.as_secs_f64()).ceil() as usize;
         let iterations = iterations.clamp(1, 4_096);
-
-        black_box(paired_source_separation_ratios::<false, false>(
+        let warmup_ratios = paired_source_separation_ratios::<false, true>(
             &path,
             &analysis,
             iterations,
             WARMUP_REPETITIONS,
-        ));
+        );
+        black_box(warmup_ratios);
         let null_ratios = paired_source_separation_ratios::<false, false>(
             &path,
             &analysis,
@@ -13786,6 +15517,26 @@ mod tests {
         assert!(
             msg.contains("Separate stage requires Normalize before it"),
             "expected Separate dependency error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_separate_after_backend_fails_closed() {
+        let config = PipelineConfig::new(vec![
+            PipelineStage::Ingest,
+            PipelineStage::Normalize,
+            PipelineStage::Backend,
+            PipelineStage::Separate,
+        ]);
+        let error = config
+            .validate()
+            .expect_err("waveform replacement after backend execution must be rejected");
+        assert!(matches!(error, FwError::InvalidRequest(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("Separate stage must precede Backend"),
+            "unexpected validation error: {error}"
         );
     }
 
@@ -14438,7 +16189,8 @@ mod tests {
         let report =
             source_separate(std::path::Path::new("/nonexistent/audio.wav"), &token).unwrap();
         // Should fallback gracefully.
-        assert!(report.vocal_isolated);
+        assert!(!report.vocal_isolated);
+        assert_eq!(report.mode, super::SeparationMode::UnavailablePassthrough);
         assert!(
             report
                 .notes
@@ -16227,69 +17979,37 @@ mod tests {
     #[test]
     fn run_all_bounded_slow_custom_exceeds_budget_continues_to_next() {
         // A slow Custom finalizer sleeps longer than the budget, triggering
-        // the "exceeded cleanup budget" warning (line 636).  Verify the
-        // *next* finalizer still executes despite the budget breach.
-        use std::sync::{Arc, Mutex};
-
-        let second_ran = Arc::new(Mutex::new(false));
-        let second_ran_clone = Arc::clone(&second_ran);
+        // the "exceeded cleanup budget" warning. Verify the *next* finalizer
+        // still executes despite the budget breach. Finalizers pop LIFO, so
+        // the marker is registered first and the slow one pops first.
+        let (marker_ran, marker_ran_rx) = std::sync::mpsc::channel();
 
         let mut registry = FinalizerRegistry::new();
-
-        // Register the slow one first (runs second due to LIFO).
-        registry.register(
-            "slow",
-            Finalizer::Custom(Box::new(|| {
-                std::thread::sleep(Duration::from_millis(150));
-            })),
-        );
-
-        // This finalizer runs first (LIFO) — it records that it ran.
-        // Wait, LIFO means last-registered runs first.  We want slow to
-        // run first, so register it second (so it pops first).
-        // Actually: entries.pop() pops the LAST element → LIFO.
-        // So register "marker" first, "slow" second → slow runs first,
-        // then marker.  But we want to prove the marker *after* the slow
-        // one still runs.  So register them the other way:
-        //   - Register slow first  (index 0)
-        //   - Register marker second (index 1) → pops first
-        //
-        // Actually the test is: slow finalizer exceeds budget but the
-        // *next* finalizer still runs.  So we want:
-        //   pop order: marker (index 1) → slow (index 0)
-        // That doesn't trigger exceeded budget before marker.  Instead:
-        //   Register marker first (index 0), slow second (index 1)
-        //   pop order: slow (index 1) → marker (index 0)
-        // slow runs, exceeds budget → warning → continues → marker runs.
-        // That's what we want.
-
-        // Reset: re-create from scratch.
-        let mut registry = FinalizerRegistry::new();
-
-        // Index 0: marker (will execute second, after slow).
         registry.register(
             "marker",
             Finalizer::Custom(Box::new(move || {
-                *second_ran_clone.lock().unwrap() = true;
+                let _ = marker_ran.send(());
             })),
         );
-
-        // Index 1: slow (pops first, exceeds budget).
         registry.register(
             "slow",
             Finalizer::Custom(Box::new(|| {
                 std::thread::sleep(Duration::from_millis(150));
             })),
         );
-
         assert_eq!(registry.len(), 2);
 
         // Budget of 10ms — the slow finalizer (150ms) will exceed this.
         registry.run_all_bounded(10);
-
         assert_eq!(registry.len(), 0);
+
+        // Each Custom finalizer runs on its own thread and gets the budget
+        // to finish, not to start: on a loaded host the marker's thread may
+        // not have been scheduled before run_all_bounded returned (bd-yixf).
+        // Wait for the event itself; a marker that is never started still
+        // fails here.
         assert!(
-            *second_ran.lock().unwrap(),
+            marker_ran_rx.recv_timeout(Duration::from_secs(30)).is_ok(),
             "marker finalizer must still run even after slow one exceeds budget"
         );
     }

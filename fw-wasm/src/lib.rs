@@ -34,6 +34,8 @@ pub mod native_engine;
 pub mod diarization_projection;
 #[path = "../../src/sortformer_conformance.rs"]
 pub mod sortformer_conformance;
+#[path = "../../src/sortformer_f16_contract.rs"]
+pub mod sortformer_f16_contract;
 #[path = "../../src/sortformer_inference.rs"]
 pub mod sortformer_inference;
 
@@ -61,6 +63,9 @@ mod wasm_api {
     use crate::native_engine::decode::{self, DecodeParams, LoadedModel};
     use crate::native_engine::ggml::{GgmlModel, HostReader};
     use crate::sortformer_inference::{SortformerPcm, SortformerSession};
+
+    const WASM_DIARIZATION_PROJECTION_SCHEMA_VERSION: &str =
+        "wasm-diarization-projection-v1";
 
     thread_local! {
         // The loaded models live in the worker that called the load entry
@@ -318,12 +323,16 @@ mod wasm_api {
     // transcription, native Sortformer diarization, the CLI's own
     // turn-mapping + projection-fusion-v1 (the same relocated code, not a
     // mirror), then merged speaker-attributed runs. The result JSON is
-    // `{language, segments, turns, speaker_segments, dropped_windows,
-    // audio_sec}`; `initial_prompt` is the CLI's `--prompt` (None/empty is
-    // byte-identical to no prompt). Projection runs at segment granularity
-    // (`word_aligned = false`) because word timestamps stay off in the
-    // browser build. Exposed as two stages so the page can build a progress
-    // model between them, plus a single-shot compatibility wrapper.
+    // `{language, segments, turns, speaker_segments, projection_timeline,
+    // dropped_windows, audio_sec, processed_audio_sec}`; `initial_prompt` is
+    // the CLI's `--prompt` (None/empty is
+    // byte-identical to no prompt). The fixed large-v3-turbo route records
+    // decoder attention and uses the same canonical DTW word normalizer as the
+    // native backend. Missing/too-short parent timings retain the same
+    // canonical fallback units and disable only the word-aligned projection
+    // policy; a wholly absent timing set preserves the prior decoder-segment
+    // path. Exposed as two stages so the page can build a progress model
+    // between them, plus a single-shot compatibility wrapper.
 
     /// Hydrate the FastEnhancer denoiser from its pinned artifact bytes
     /// (838 KB; the page verifies the sha256 pin before the bytes get here,
@@ -427,7 +436,7 @@ mod wasm_api {
         initial_prompt: Option<String>,
         language: Option<String>,
     ) -> Result<String, JsValue> {
-        let audio_sec = samples.len() as f64 / 16_000.0;
+        let processed_audio_sec = samples.len() as f64 / 16_000.0;
 
         let out = MODEL.with(|slot| {
             let slot = slot.borrow();
@@ -438,8 +447,17 @@ mod wasm_api {
             // misfire when the first window is music/noise (a real user got a
             // Japanese guess on an English recording); the page exposes a
             // selector so the user can pin it.
+            // The 32-layer large-v1/v2/v3 family is ambiguous from hparams
+            // alone. The byte loaders do not receive a trusted model name, so
+            // keep that generic family on the conservative segment path
+            // instead of silently applying large-v3 alignment heads. The
+            // deployed large-v3-turbo route is uniquely identified by its
+            // four decoder layers and retains DTW.
+            let word_timestamps =
+                !(model.hparams.n_text_layer == 32 && model.hparams.n_text_state == 1_280);
             let params = DecodeParams {
                 timestamps: true,
+                word_timestamps,
                 n_threads: 1,
                 initial_prompt: initial_prompt.filter(|p| !p.trim().is_empty()),
                 language: language.filter(|l| !l.trim().is_empty() && l != "auto"),
@@ -478,10 +496,31 @@ mod wasm_api {
                 &|| Ok(()),
             )
             .map_err(js_err)?;
+        let (projection_segments, word_aligned, projection_granularity) = match out
+            .word_timings
+            .as_ref()
+            .filter(|timings| timings.iter().any(|segment| !segment.is_empty()))
+        {
+            Some(word_timings) => {
+                let normalized =
+                    crate::diarization_projection::normalize_dtw_projection_units(
+                        &out.segments,
+                        word_timings,
+                        || Ok(()),
+                    )
+                    .map_err(js_err)?;
+                (
+                    normalized.segments,
+                    normalized.word_aligned_safe,
+                    "canonical_dtw_units",
+                )
+            }
+            None => (out.segments.clone(), false, "decoder_segments"),
+        };
         let mut projection = crate::diarization_projection::project_diarization_onto_segments(
-            &out.segments,
+            &projection_segments,
             &turns,
-            false,
+            word_aligned,
         )
         .map_err(js_err)?;
         let mut turns = turns;
@@ -516,8 +555,14 @@ mod wasm_api {
             "speaker_segments": speaker_segments,
             "mixed_speaker_segment_indices": projection.mixed_speaker_segment_indices,
             "overlap_suspected_segment_indices": projection.overlap_suspected_segment_indices,
+            "projection_timeline": {
+                "schema_version": WASM_DIARIZATION_PROJECTION_SCHEMA_VERSION,
+                "granularity": projection_granularity,
+                "word_aligned_safe": word_aligned,
+            },
             "dropped_windows": out.dropped_windows.len(),
-            "audio_sec": audio_sec,
+            "audio_sec": processed_audio_sec + offset_sec,
+            "processed_audio_sec": processed_audio_sec,
             "skipped_leading_sec": offset_sec,
         })
         .to_string())

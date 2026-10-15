@@ -434,9 +434,10 @@ the valid modulus response at each support. Second order filters a first-order
 modulus path only at a larger support and averages the resulting valid modulus.
 One output requires at least eight valid positions. Non-wrapping
 support prevents a smooth trend or single regime boundary from acquiring an
-artificial reverse transition at the window seam. Focused analytic ramp and
-scalar differential tests use `2e-6`; the promotion tolerance remains to be
-frozen by `.15.3`. A constant or near-constant input trajectory is rejected
+artificial reverse transition at the window seam. Focused analytic ramp,
+scalar differential, and metamorphic tests use the frozen
+`ACOUSTIC_SIDECAR_DIFFERENTIAL_TOLERANCE` of `2e-6`. A constant or near-constant
+input trajectory is rejected
 before normalization rather than reported as a bank of zeros. `FirstOrder`,
 `SecondOrder`, and `FirstAndSecondOrder` are distinct
 hashed selections. `SecondOrder` computes
@@ -506,8 +507,8 @@ Nothing in this section establishes that any new candidate improves
 diarization. `bd-odj7.13.15` therefore remains in progress.
 
 The evaluator uses the separate
-`public-diarization-acoustic-sidecar-study-v3` schema and
-`public-diarization-acoustic-sidecar-study-runner-v3`; it does not modify public
+`public-diarization-acoustic-sidecar-study-v6` schema and
+`public-diarization-acoustic-sidecar-study-runner-v8`; it does not modify public
 acoustic ablation v8. The protocol fixes oracle VAD (`oracle_vad=true`) and
 leaves speaker count inferred (`oracle_speaker_count=false` with an `Infer`
 request). Its DER/JER and speaker-count evidence therefore evaluates
@@ -529,7 +530,7 @@ exact lane order:
 12. `all_haar_l4`
 13. `all_d4_l4`
 
-The baseline is explicitly unfused. For each candidate, the v3 artifact retains
+The baseline is explicitly unfused. For each candidate, the v6 artifact retains
 aggregate boundary metrics; conditional same/different-speaker metrics;
 comparable-frame and retained-pair score coverage; Channel and MixedAuxiliary
 dominance opportunities, counts, and rates split by same/different-speaker
@@ -1226,11 +1227,11 @@ resource, privacy, or fallback rules.
 
 ## 11. Privacy and corpus handling
 
-Schema v5 may persist turns, hint audit rows, typed speaker-count outcomes,
+Schema v6 may persist turns, hint audit rows, typed speaker-count outcomes,
 per-hint dispositions, and privacy-safe profile summaries inside SQLite. It
 does not persist raw PCM, frame features, Fourier spectra, cepstra, reusable
 speaker vectors, the CLI hint-document source path, or corpus metadata.
-`persist_profiles` records explicit consent but does not expand the v5 storage
+`persist_profiles` records explicit consent but does not expand the v6 storage
 surface; reusable vectors require a separately reviewed schema and retention
 policy.
 
@@ -1384,9 +1385,16 @@ artifact may already exist and is never truncated. An ambiguous rename result
 is also commit-uncertain and conservatively preserves the held inode; only an
 authoritative no-clobber conflict permits pre-commit scrubbing. A
 bundle/evidence pair is staged before either publication, but the two
-independent final-name renames
-are not a cross-file transaction, so callers must treat successful evidence
-publication as the completed pair.
+independent final-name renames are not a cross-file transaction. Successful
+evidence publication is therefore the explicit completion signal. If the
+bundle commit succeeds and evidence publication does not, a retry may resume
+only when the existing bundle remains an owner-only regular file whose inode
+identity and complete pretty-JSON bytes exactly match the newly recomputed,
+canonically verified bundle. The retry opens that bundle read-only and creates
+only the still-absent evidence destination through the same no-clobber commit.
+A byte mismatch, identity change, permission change, non-regular destination,
+or existing evidence file fails closed; recovery never deletes, truncates, or
+overwrites either final destination.
 The path-bearing descriptor type is deserialization-only and has no `Debug` or
 serialization implementation.
 
@@ -1515,7 +1523,7 @@ model contains 3,677,760 parameters: 3,676,320 trainable plus the frozen
 1,440-element first-stage weighting tensor.
 
 `scripts/export_redimnet2.py` is the only accepted raw-checkpoint boundary. Its
-current exporter and conversion-receipt schemas are v2; the synthetic truth
+current exporter and conversion-receipt schemas are v3; the synthetic truth
 tensor contract remains v1. It requires the exact Python/package tuple and
 14-file source manifest. Before
 import, it requires the executable `redimnet2` package-file census to equal the
@@ -1555,18 +1563,39 @@ are captured and retained only as path-free code, count, byte, and message
 digests; unknown warnings or console output fail. The
 initial frontend ceiling of `2e-5`/`2e-6` was rejected before native work and
 is preserved in the receipt rather than erased. Two independent final hardened
-exports were byte-identical, including the path-free receipt at SHA-256
+v2 exports were byte-identical, including the immutable path-free v2 receipt at
+SHA-256
 `e4e5aab1838dd386895425acc11e3405191e30ce2111c313c2734bfc2bccd77e`.
 
-The v1.0.0 tag contains no top-level repository license file even though a
-later main revision has an MIT file and individual pinned sources carry MIT or
-Apache notices. Model-weight redistribution scope is therefore unresolved.
-The receipt fixes distribution status to `operator_local_no_release`; no
-converted package, checkpoint, truth tensors, feature values, local paths,
-audio, transcripts, or biometric vectors may enter Git, a public release, or
-runtime evidence. This licensing boundary does not prevent local parity and
-comparison work, but it does prevent artifact publication or a distributable
-product claim.
+The two historical v2 receipts remain `operator_local_no_release`; changing the
+future schema does not reinterpret those immutable bytes. The license-scope
+premise behind that conservative status was nevertheless wrong. Although the
+v1.0.0 tree has no top-level `LICENSE`, its immutable README says that the
+repository contains the official implementation and pretrained weights, links
+the exact v1.0.0 model assets including `b2-vox2-lm.pt`, and declares `MIT`.
+The exporter already pins that README at SHA-256
+`27d500b510a1cdc054a8ccbad484cf6062639fcb9d6b661714214fe766ed4e76`.
+The source commit time (2026-03-04T13:25:10Z) and GitHub release-record creation
+time (2026-03-04T13:25:24Z) both precede the checkpoint asset creation time
+(2026-03-04T14:25:02Z) and release publication time
+(2026-03-04T14:25:10Z). The MIT declaration is therefore contemporaneous scope
+evidence for the published checkpoint, not a retroactive inference from a July
+change. The 2026-07-09 commit `2a8d15f65b1d` later supplied the canonical full
+MIT payload and notice; those 1,067 bytes have SHA-256
+`3d5a4bf9936a7d09dd770588c0d7cb116fc16916a0310d71fb1fff5d64562101`.
+
+Fresh v3 receipts record `license_scope.status = resolved` but fail closed on
+transport: `artifact_status = operator_local_pending_release_manifest` and
+`release_ready = false`. A raw or converted package may claim
+`github_release_with_license_and_notice` only after a separate identity-bound
+release manifest co-admits the weights, conversion receipt, exact canonical
+license payload as `LICENSE.redimnet2.txt`, and the notice
+`Copyright (c) 2026 Palabra.ai`. The converter does not create that release
+manifest. Model and truth bytes remain outside Git and public runtime evidence.
+A fresh v3 export must recheck package/truth determinism, receipt determinism,
+privacy/path absence, the new schema/status fields, and both license hashes;
+the historical package, truth, and v2 receipt hashes are not a v3 execution
+result.
 
 The AMI adapter enforces the corpus site's scenario-only training,
 development, and unseen-test meeting-family split. Other corpora use an

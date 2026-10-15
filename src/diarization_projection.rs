@@ -4,21 +4,28 @@
 //!
 //! Relocated VERBATIM from `diarization.rs` (which re-exports everything, so
 //! call sites and type identities are unchanged) into this dependency-light
-//! module: it uses only `crate::model` types, `crate::error`, and the
-//! canonical projection epsilon — no ECAPA/acoustic machinery — so the wasm
-//! build (bd-m2jm) can mount the exact fusion code the CLI ships instead of
-//! mirroring it.
+//! module: it uses only the shared model/error types and the native decoder's
+//! content-free DTW timing observations — no ECAPA/acoustic machinery — so the
+//! wasm build (bd-m2jm) can mount the exact fusion and word-normalization code
+//! the CLI ships instead of mirroring it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{FwError, FwResult};
 use crate::model::{DiarizationTurn, TranscriptionSegment};
+use crate::native_engine::dtw::WordTiming;
 
 /// The canonical projection timestamp epsilon (seconds). Mirrors
 /// `crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC`; the parent crate
 /// asserts the two stay equal (`projection_epsilon_matches_conformance`), and
 /// the constant lives here so this module carries no conformance dependency.
 pub const CANONICAL_PROJECTION_EPSILON_SEC: f64 = 1e-6;
+/// Smallest positive interval retained for a canonical DTW word unit.
+///
+/// The parent crate asserts this stays equal to the conformance contract; the
+/// value lives here as well so the browser mounts the exact normalizer without
+/// pulling in the native conformance module.
+pub const CANONICAL_PROJECTION_MIN_DURATION_SEC: f64 = 0.001;
 
 /// Lossless convenience projection of an independent acoustic turn timeline.
 ///
@@ -30,6 +37,519 @@ pub struct DiarizationProjection {
     pub segments: Vec<TranscriptionSegment>,
     pub mixed_speaker_segment_indices: Vec<usize>,
     pub overlap_suspected_segment_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectionUnitProvenance {
+    DecoderWordTimestamp,
+    SegmentInterpolationFallback,
+    SegmentGeometryFallback,
+}
+
+impl ProjectionUnitProvenance {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::DecoderWordTimestamp => "decoder_word_timestamp",
+            Self::SegmentInterpolationFallback => "segment_interpolation_fallback",
+            Self::SegmentGeometryFallback => "segment_geometry_fallback",
+        }
+    }
+
+    pub(crate) const fn supported_labels() -> [&'static str; 3] {
+        [
+            Self::DecoderWordTimestamp.as_str(),
+            Self::SegmentInterpolationFallback.as_str(),
+            Self::SegmentGeometryFallback.as_str(),
+        ]
+    }
+}
+
+/// One unambiguous transcript unit accepted by acoustic projection.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CanonicalProjectionUnit {
+    pub(crate) start_sec: f64,
+    pub(crate) end_sec: f64,
+    pub(crate) text: String,
+    pub(crate) confidence: Option<f64>,
+    pub(crate) source_segment_index: usize,
+    pub(crate) source_word_start_index: usize,
+    pub(crate) source_word_end_index: usize,
+    pub(crate) provenance: ProjectionUnitProvenance,
+    pub(crate) was_clamped: bool,
+    pub(crate) was_expanded: bool,
+}
+
+impl CanonicalProjectionUnit {
+    fn as_segment(&self) -> TranscriptionSegment {
+        TranscriptionSegment {
+            start_sec: Some(self.start_sec),
+            end_sec: Some(self.end_sec),
+            text: self.text.clone(),
+            speaker: None,
+            confidence: self.confidence,
+        }
+    }
+}
+
+/// Canonical DTW word units plus path-free normalization counters.
+#[derive(Debug, Clone)]
+pub(crate) struct DtwProjectionNormalization {
+    pub(crate) segments: Vec<TranscriptionSegment>,
+    /// Engine segment each unit in `segments` came from (same length, ascending).
+    pub(crate) unit_source_segments: Vec<usize>,
+    #[cfg(test)]
+    pub(crate) canonical_units: Vec<CanonicalProjectionUnit>,
+    pub(crate) input_timed_segments: usize,
+    pub(crate) decoder_word_units: usize,
+    pub(crate) interpolated_fallback_units: usize,
+    pub(crate) segment_geometry_fallback_units: usize,
+    pub(crate) interpolated_fallback_segments: usize,
+    pub(crate) segment_geometry_fallback_segments: usize,
+    pub(crate) clamped_units: usize,
+    pub(crate) expanded_units: usize,
+    pub(crate) word_aligned_safe: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionNormalizationErrorReason {
+    ExtraTimingSegments,
+    ParentTimestampPair,
+    ParentTimestampNonFinite,
+    ParentTimestampNegative,
+    ParentDuration,
+    ParentOverlap,
+    WordTimestampNonFinite,
+    WordTimestampNegative,
+    WordTimestampReversed,
+    WordOrderReversed,
+    WordOverlap,
+    CanonicalInvariant,
+}
+
+impl ProjectionNormalizationErrorReason {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::ExtraTimingSegments => "FW-DTW-PROJECTION-EXTRA-SEGMENTS",
+            Self::ParentTimestampPair => "FW-DTW-PROJECTION-PARENT-PAIR",
+            Self::ParentTimestampNonFinite => "FW-DTW-PROJECTION-PARENT-NONFINITE",
+            Self::ParentTimestampNegative => "FW-DTW-PROJECTION-PARENT-NEGATIVE",
+            Self::ParentDuration => "FW-DTW-PROJECTION-PARENT-DURATION",
+            Self::ParentOverlap => "FW-DTW-PROJECTION-PARENT-OVERLAP",
+            Self::WordTimestampNonFinite => "FW-DTW-PROJECTION-WORD-NONFINITE",
+            Self::WordTimestampNegative => "FW-DTW-PROJECTION-WORD-NEGATIVE",
+            Self::WordTimestampReversed => "FW-DTW-PROJECTION-WORD-REVERSED",
+            Self::WordOrderReversed => "FW-DTW-PROJECTION-WORD-ORDER",
+            Self::WordOverlap => "FW-DTW-PROJECTION-WORD-OVERLAP",
+            Self::CanonicalInvariant => "FW-DTW-PROJECTION-CANONICAL-INVARIANT",
+        }
+    }
+}
+
+fn projection_normalization_error(
+    reason: ProjectionNormalizationErrorReason,
+    segment_index: usize,
+    word_index: Option<usize>,
+    detail: impl std::fmt::Display,
+) -> FwError {
+    let word = word_index.map_or_else(String::new, |index| format!(" word={index}"));
+    FwError::InvalidRequest(format!(
+        "dtw projection normalization [{}]: segment={segment_index}{word} {detail}",
+        reason.code()
+    ))
+}
+
+/// Normalize decoder-grid DTW observations into positive, ordered half-open
+/// word units shared by native and browser diarization projection.
+pub(crate) fn normalize_dtw_projection_units<C>(
+    engine_segments: &[TranscriptionSegment],
+    word_timings: &[Vec<WordTiming>],
+    mut checkpoint: C,
+) -> FwResult<DtwProjectionNormalization>
+where
+    C: FnMut() -> FwResult<()>,
+{
+    if word_timings.len() > engine_segments.len() {
+        return Err(projection_normalization_error(
+            ProjectionNormalizationErrorReason::ExtraTimingSegments,
+            engine_segments.len(),
+            None,
+            format_args!(
+                "received {} timing vectors for {} engine segments",
+                word_timings.len(),
+                engine_segments.len()
+            ),
+        ));
+    }
+
+    let mut canonical_units = Vec::new();
+    let mut input_timed_segments = 0usize;
+    let mut interpolated_fallback_segments = 0usize;
+    let mut segment_geometry_fallback_segments = 0usize;
+    let mut word_aligned_safe = true;
+    let mut previous_parent_end = None;
+
+    for (segment_index, segment) in engine_segments.iter().enumerate() {
+        checkpoint()?;
+        let (parent_start, parent_end) =
+            canonical_parent_bounds(segment, segment_index, previous_parent_end)?;
+        previous_parent_end = Some(parent_end);
+        match word_timings.get(segment_index) {
+            Some(timed) if !timed.is_empty() => {
+                input_timed_segments += 1;
+                validate_raw_word_geometry(timed, segment_index)?;
+                normalize_timed_segment(
+                    segment,
+                    timed,
+                    segment_index,
+                    parent_start,
+                    parent_end,
+                    &mut canonical_units,
+                    &mut segment_geometry_fallback_segments,
+                    &mut word_aligned_safe,
+                );
+            }
+            _ => append_interpolated_fallback(
+                segment,
+                segment_index,
+                parent_start,
+                parent_end,
+                &mut canonical_units,
+                &mut interpolated_fallback_segments,
+                &mut segment_geometry_fallback_segments,
+                &mut word_aligned_safe,
+            ),
+        }
+    }
+
+    validate_canonical_projection_units(&canonical_units)?;
+    let mut decoder_word_units = 0usize;
+    let mut interpolated_fallback_units = 0usize;
+    let mut segment_geometry_fallback_units = 0usize;
+    let mut clamped_units = 0usize;
+    let mut expanded_units = 0usize;
+    for unit in &canonical_units {
+        match unit.provenance {
+            ProjectionUnitProvenance::DecoderWordTimestamp => decoder_word_units += 1,
+            ProjectionUnitProvenance::SegmentInterpolationFallback => {
+                interpolated_fallback_units += 1;
+            }
+            ProjectionUnitProvenance::SegmentGeometryFallback => {
+                segment_geometry_fallback_units += 1;
+            }
+        }
+        clamped_units += usize::from(unit.was_clamped);
+        expanded_units += usize::from(unit.was_expanded);
+    }
+    let segments = canonical_units
+        .iter()
+        .map(CanonicalProjectionUnit::as_segment)
+        .collect();
+    let unit_source_segments = canonical_units
+        .iter()
+        .map(|unit| unit.source_segment_index)
+        .collect();
+
+    Ok(DtwProjectionNormalization {
+        segments,
+        unit_source_segments,
+        #[cfg(test)]
+        canonical_units,
+        input_timed_segments,
+        decoder_word_units,
+        interpolated_fallback_units,
+        segment_geometry_fallback_units,
+        interpolated_fallback_segments,
+        segment_geometry_fallback_segments,
+        clamped_units,
+        expanded_units,
+        word_aligned_safe,
+    })
+}
+
+fn canonical_parent_bounds(
+    segment: &TranscriptionSegment,
+    segment_index: usize,
+    previous_parent_end: Option<f64>,
+) -> FwResult<(f64, f64)> {
+    let (mut start, end) = match (segment.start_sec, segment.end_sec) {
+        (Some(start), Some(end)) => (start, end),
+        _ => {
+            return Err(projection_normalization_error(
+                ProjectionNormalizationErrorReason::ParentTimestampPair,
+                segment_index,
+                None,
+                "parent segment requires paired timestamps",
+            ));
+        }
+    };
+    if !start.is_finite() || !end.is_finite() {
+        return Err(projection_normalization_error(
+            ProjectionNormalizationErrorReason::ParentTimestampNonFinite,
+            segment_index,
+            None,
+            "parent timestamps must be finite",
+        ));
+    }
+    if start < 0.0 || end < 0.0 {
+        return Err(projection_normalization_error(
+            ProjectionNormalizationErrorReason::ParentTimestampNegative,
+            segment_index,
+            None,
+            "parent timestamps must be non-negative",
+        ));
+    }
+    if let Some(previous_end) = previous_parent_end
+        && start < previous_end
+    {
+        if start + CANONICAL_PROJECTION_EPSILON_SEC < previous_end {
+            return Err(projection_normalization_error(
+                ProjectionNormalizationErrorReason::ParentOverlap,
+                segment_index,
+                None,
+                "parent segment materially overlaps its predecessor",
+            ));
+        }
+        start = previous_end;
+    }
+    if end <= start {
+        return Err(projection_normalization_error(
+            ProjectionNormalizationErrorReason::ParentDuration,
+            segment_index,
+            None,
+            "parent segment must retain positive duration after adjacency normalization",
+        ));
+    }
+    Ok((start, end))
+}
+
+fn validate_raw_word_geometry(words: &[WordTiming], segment_index: usize) -> FwResult<()> {
+    let mut previous_start = None;
+    let mut previous_end = None;
+    for (word_index, word) in words.iter().enumerate() {
+        if !word.start_sec.is_finite() || !word.end_sec.is_finite() {
+            return Err(projection_normalization_error(
+                ProjectionNormalizationErrorReason::WordTimestampNonFinite,
+                segment_index,
+                Some(word_index),
+                "word timestamps must be finite",
+            ));
+        }
+        if word.start_sec < 0.0 || word.end_sec < 0.0 {
+            return Err(projection_normalization_error(
+                ProjectionNormalizationErrorReason::WordTimestampNegative,
+                segment_index,
+                Some(word_index),
+                "word timestamps must be non-negative",
+            ));
+        }
+        if word.end_sec < word.start_sec {
+            return Err(projection_normalization_error(
+                ProjectionNormalizationErrorReason::WordTimestampReversed,
+                segment_index,
+                Some(word_index),
+                "word end precedes word start",
+            ));
+        }
+        if let Some(prior_start) = previous_start
+            && word.start_sec + CANONICAL_PROJECTION_EPSILON_SEC < prior_start
+        {
+            return Err(projection_normalization_error(
+                ProjectionNormalizationErrorReason::WordOrderReversed,
+                segment_index,
+                Some(word_index),
+                "word starts are not monotonic",
+            ));
+        }
+        if let Some(prior_end) = previous_end
+            && word.start_sec + CANONICAL_PROJECTION_EPSILON_SEC < prior_end
+        {
+            return Err(projection_normalization_error(
+                ProjectionNormalizationErrorReason::WordOverlap,
+                segment_index,
+                Some(word_index),
+                "word materially overlaps its predecessor",
+            ));
+        }
+        previous_start = Some(word.start_sec);
+        previous_end = Some(word.end_sec);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_timed_segment(
+    segment: &TranscriptionSegment,
+    timed: &[WordTiming],
+    segment_index: usize,
+    parent_start: f64,
+    parent_end: f64,
+    out: &mut Vec<CanonicalProjectionUnit>,
+    segment_geometry_fallback_segments: &mut usize,
+    word_aligned_safe: &mut bool,
+) {
+    let required_duration = timed.len() as f64 * CANONICAL_PROJECTION_MIN_DURATION_SEC;
+    if parent_end - parent_start < required_duration {
+        append_segment_geometry_fallback(
+            segment,
+            timed,
+            segment_index,
+            parent_start,
+            parent_end,
+            out,
+            segment_geometry_fallback_segments,
+            word_aligned_safe,
+        );
+        return;
+    }
+
+    let mut cursor = parent_start;
+    for (word_index, word) in timed.iter().enumerate() {
+        let remaining = timed.len() - word_index - 1;
+        let latest_end = parent_end - remaining as f64 * CANONICAL_PROJECTION_MIN_DURATION_SEC;
+        let latest_start =
+            parent_end - (remaining + 1) as f64 * CANONICAL_PROJECTION_MIN_DURATION_SEC;
+        let desired_start = word.start_sec.clamp(parent_start, parent_end);
+        let start = desired_start.max(cursor).min(latest_start);
+        let desired_end = word.end_sec.clamp(parent_start, parent_end);
+        let minimum_end = if start == latest_start {
+            latest_end
+        } else {
+            start + CANONICAL_PROJECTION_MIN_DURATION_SEC
+        };
+        let end = desired_end.max(minimum_end).min(latest_end);
+        let was_clamped = (start - word.start_sec).abs() > CANONICAL_PROJECTION_EPSILON_SEC
+            || (end - word.end_sec).abs() > CANONICAL_PROJECTION_EPSILON_SEC;
+        let was_expanded = word.end_sec - word.start_sec
+            < CANONICAL_PROJECTION_MIN_DURATION_SEC - CANONICAL_PROJECTION_EPSILON_SEC;
+        out.push(CanonicalProjectionUnit {
+            start_sec: start,
+            end_sec: end,
+            text: word.text.clone(),
+            confidence: segment.confidence,
+            source_segment_index: segment_index,
+            source_word_start_index: word_index,
+            source_word_end_index: word_index + 1,
+            provenance: ProjectionUnitProvenance::DecoderWordTimestamp,
+            was_clamped,
+            was_expanded,
+        });
+        cursor = end;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_interpolated_fallback(
+    segment: &TranscriptionSegment,
+    segment_index: usize,
+    parent_start: f64,
+    parent_end: f64,
+    out: &mut Vec<CanonicalProjectionUnit>,
+    interpolated_fallback_segments: &mut usize,
+    segment_geometry_fallback_segments: &mut usize,
+    word_aligned_safe: &mut bool,
+) {
+    *word_aligned_safe = false;
+    let words = segment.text.split_whitespace().collect::<Vec<_>>();
+    if words.is_empty() {
+        *interpolated_fallback_segments += 1;
+        return;
+    }
+    let duration = parent_end - parent_start;
+    if duration < words.len() as f64 * CANONICAL_PROJECTION_MIN_DURATION_SEC {
+        append_segment_geometry_fallback(
+            segment,
+            &[],
+            segment_index,
+            parent_start,
+            parent_end,
+            out,
+            segment_geometry_fallback_segments,
+            word_aligned_safe,
+        );
+        return;
+    }
+    *interpolated_fallback_segments += 1;
+
+    for (word_index, word) in words.iter().enumerate() {
+        let count = words.len() as f64;
+        let start = parent_start + duration * word_index as f64 / count;
+        let end = if word_index + 1 == words.len() {
+            parent_end
+        } else {
+            parent_start + duration * (word_index + 1) as f64 / count
+        };
+        out.push(CanonicalProjectionUnit {
+            start_sec: start,
+            end_sec: end,
+            text: (*word).to_owned(),
+            confidence: segment.confidence,
+            source_segment_index: segment_index,
+            source_word_start_index: word_index,
+            source_word_end_index: word_index + 1,
+            provenance: ProjectionUnitProvenance::SegmentInterpolationFallback,
+            was_clamped: false,
+            was_expanded: false,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_segment_geometry_fallback(
+    segment: &TranscriptionSegment,
+    timed: &[WordTiming],
+    segment_index: usize,
+    parent_start: f64,
+    parent_end: f64,
+    out: &mut Vec<CanonicalProjectionUnit>,
+    segment_geometry_fallback_segments: &mut usize,
+    word_aligned_safe: &mut bool,
+) {
+    *segment_geometry_fallback_segments += 1;
+    *word_aligned_safe = false;
+    let segment_text = segment.text.trim();
+    let text = if segment_text.is_empty() {
+        timed
+            .iter()
+            .map(|word| word.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        segment_text.to_owned()
+    };
+    out.push(CanonicalProjectionUnit {
+        start_sec: parent_start,
+        end_sec: parent_end,
+        text,
+        confidence: segment.confidence,
+        source_segment_index: segment_index,
+        source_word_start_index: 0,
+        source_word_end_index: timed.len().max(1),
+        provenance: ProjectionUnitProvenance::SegmentGeometryFallback,
+        was_clamped: false,
+        was_expanded: false,
+    });
+}
+
+fn validate_canonical_projection_units(units: &[CanonicalProjectionUnit]) -> FwResult<()> {
+    let mut previous_end = None;
+    for unit in units {
+        let valid = unit.start_sec.is_finite()
+            && unit.end_sec.is_finite()
+            && unit.start_sec >= 0.0
+            && unit.end_sec > unit.start_sec
+            && unit.source_word_end_index > unit.source_word_start_index
+            && previous_end.is_none_or(|end| unit.start_sec >= end);
+        if !valid {
+            return Err(projection_normalization_error(
+                ProjectionNormalizationErrorReason::CanonicalInvariant,
+                unit.source_segment_index,
+                Some(unit.source_word_start_index),
+                "normalizer produced a non-finite, non-positive, reversed, or overlapping unit",
+            ));
+        }
+        previous_end = Some(unit.end_sec);
+    }
+    Ok(())
 }
 
 pub(crate) fn minimum_optional_confidence(left: Option<f64>, right: Option<f64>) -> Option<f64> {
@@ -298,7 +818,7 @@ fn snap_speaker_changes_to_punctuation(projected: &mut [TranscriptionSegment]) {
 /// well-formed, monotonic zero-width pair to absent timing; projection will
 /// then retain it as an explicitly unknown speaker observation.  Other bad
 /// timestamp shapes remain fail-closed in [`validate_projection_segments`].
-fn canonicalize_zero_duration_projection_segments(
+pub(crate) fn canonicalize_zero_duration_projection_segments(
     segments: &[TranscriptionSegment],
     word_aligned: bool,
 ) -> FwResult<Vec<TranscriptionSegment>> {
@@ -751,15 +1271,56 @@ pub fn finite_seconds_interval_to_ms(start_sec: f64, end_sec: f64) -> Option<(u6
 
 #[cfg(test)]
 mod tests {
-    /// The module-local epsilon must stay equal to the conformance-canonical
-    /// one (duplicated here so this module carries no conformance dep).
+    use crate::model::{DiarizationTurn, TranscriptionSegment};
+
+    /// bd-6xsk regression: whisper.cpp `--split-on-word --max-segment-length`
+    /// runs can emit a zero-duration middle segment (`start_ms == end_ms`).
+    /// The projection must canonicalize it — text preserved, timestamps
+    /// released into the explicitly-unknown-speaker lane (mixed-marked when
+    /// several known speakers exist) — instead of rejecting the entire run.
     #[test]
-    fn projection_epsilon_matches_conformance() {
-        assert!(
-            (super::CANONICAL_PROJECTION_EPSILON_SEC
-                - crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC)
-                .abs()
-                == 0.0
-        );
+    fn zero_duration_middle_segment_survives_projection() {
+        let turn = |start_ms: u64, end_ms: u64, speaker: &str| DiarizationTurn {
+            start_ms,
+            end_ms,
+            speaker_ref: Some(speaker.to_owned()),
+            speaker_confidence: Some(0.9),
+            change_confidence: None,
+            overlap_suspected: false,
+            hard_hint_attributed: false,
+        };
+        let segment =
+            |start_sec: Option<f64>, end_sec: Option<f64>, text: &str| TranscriptionSegment {
+                start_sec,
+                end_sec,
+                text: text.to_owned(),
+                speaker: None,
+                confidence: Some(0.8),
+            };
+        let segments = vec![
+            segment(Some(0.0), Some(1.0), "And so my fellow"),
+            // The degenerate observation: a word-aligned slice whose decoder
+            // timestamps collapsed onto the same instant.
+            segment(Some(1.0), Some(1.0), "Americans"),
+            segment(Some(1.5), Some(3.0), "ask not"),
+        ];
+        let turns = vec![turn(0, 2_000, "A"), turn(2_000, 4_000, "B")];
+
+        let projection = super::project_diarization_onto_segments(&segments, &turns, true)
+            .expect("a zero-duration middle segment must not reject the run");
+
+        assert_eq!(projection.segments.len(), 3);
+        // Text and order are never modified.
+        assert_eq!(projection.segments[1].text, "Americans");
+        // The degenerate middle segment is canonicalized into the explicitly
+        // unknown-speaker lane, not dropped and not fail-closed.
+        assert_eq!(projection.segments[1].start_sec, None);
+        assert_eq!(projection.segments[1].end_sec, None);
+        assert!(projection.mixed_speaker_segment_indices.contains(&1));
+        // Neighboring timed segments keep their timestamps and get labels.
+        assert_eq!(projection.segments[0].start_sec, Some(0.0));
+        assert_eq!(projection.segments[0].speaker.as_deref(), Some("A"));
+        assert_eq!(projection.segments[2].end_sec, Some(3.0));
+        assert_eq!(projection.segments[2].speaker.as_deref(), Some("B"));
     }
 }

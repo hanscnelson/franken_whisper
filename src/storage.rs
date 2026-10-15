@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, ReplayEnvelope, RunEvent, RunReport, RunSummary, StoredRunDetails,
-    TranscriptionResult,
+    TranscriptionResult, TranscriptionSegment,
 };
 
 /// Resolve the request that actually governed diarization. The CLI's compact
@@ -28,22 +28,48 @@ fn effective_diarization_request(
     })
 }
 
+/// Native stack one storage statement must have left before it is polled on
+/// the running stack (bd-c376).
+///
+/// `fsqlite`'s statement futures nest deeply (statement dispatch → DML →
+/// triggers → nested statement execution), and a debug build gives each
+/// `async fn` poll frame a slot for every temporary across every await point:
+/// measured with gdb on a debug test binary, the poll frame of
+/// `execute_statement_dispatch_impl` alone is 1.37 MB and the chain under one
+/// `RunStore::open` schema statement 1.75 MB, so libtest's 2 MiB worker stack
+/// overflowed as soon as the caller's own frames passed ~0.3 MB
+/// (`ListenPersistSink::open` is 97 KB, the listen persistence tests 87-89 KB).
+/// The debug value covers that chain about twice over. Release poll frames
+/// are a small fraction of it (see the release figure below).
+const STORAGE_POLL_STACK_RED_ZONE_BYTES: usize = if cfg!(debug_assertions) {
+    4 * 1024 * 1024
+} else {
+    1024 * 1024
+};
+
+/// Size of the heap-allocated stack segment a statement is polled on when the
+/// running thread has less than [`STORAGE_POLL_STACK_RED_ZONE_BYTES`] left.
+/// Mapped lazily: only the pages the poll touches are committed.
+const STORAGE_POLL_STACK_SEGMENT_BYTES: usize = if cfg!(debug_assertions) {
+    16 * 1024 * 1024
+} else {
+    4 * 1024 * 1024
+};
+
 /// Drive `future` to completion on this thread's runtime.
 ///
 /// The runtime is built once per thread rather than once per statement: a
 /// single `persist_report` issues many statements, and the concurrency tests
 /// drive several threads at once.
 ///
-/// The future is boxed before it is polled. `fsqlite`'s statement futures nest
-/// deeply (statement dispatch → DML → triggers → nested statement execution —
-/// deep enough that `fsqlite` raises its own `recursion_limit` to type-check
-/// them), so both their state machines and the synchronous poll chain that
-/// drives them are large. Boxing moves the outermost state machine off the
-/// stack; it measurably reduces the depth but does **not** on its own make a
-/// debug build fit on libtest's ordinary worker stack — that needs the
-/// `RUST_MIN_STACK` set in `.cargo/config.toml`, which is where the full
-/// rationale lives. This is debug-only for the measured suite: a release build
-/// clears the same 202 tests with `RUST_MIN_STACK` unset.
+/// The future is boxed before it is polled, which moves the outermost state
+/// machine off the stack, and the poll itself runs with at least
+/// [`STORAGE_POLL_STACK_RED_ZONE_BYTES`] of native stack: on the running stack
+/// when that much is left, otherwise on a fresh heap-allocated segment
+/// (`stacker::maybe_grow`, the mechanism `fsqlite` itself uses for nested view
+/// execution). A storage call therefore works on any thread an embedding
+/// caller (or libtest) runs it on, whatever that thread's stack size; above
+/// the red zone the guard costs one remaining-stack comparison.
 fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, FrankenError> {
     thread_local! {
         static RUNTIME: Result<asupersync::runtime::Runtime, String> =
@@ -51,12 +77,19 @@ fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, FrankenError
                 .build()
                 .map_err(|error| error.to_string());
     }
-    RUNTIME.with(|runtime| match runtime {
-        Ok(runtime) => Ok(runtime.block_on(Box::pin(future))),
-        Err(error) => Err(FrankenError::Internal(format!(
-            "cannot build franken_whisper storage runtime: {error}"
-        ))),
-    })
+    let future = Box::pin(future);
+    stacker::maybe_grow(
+        STORAGE_POLL_STACK_RED_ZONE_BYTES,
+        STORAGE_POLL_STACK_SEGMENT_BYTES,
+        || {
+            RUNTIME.with(|runtime| match runtime {
+                Ok(runtime) => Ok(runtime.block_on(crate::with_caller_cx(future))),
+                Err(error) => Err(FrankenError::Internal(format!(
+                    "cannot build franken_whisper storage runtime: {error}"
+                ))),
+            })
+        },
+    )
 }
 
 /// Synchronous facade over the now-`async` [`fsqlite::Connection`].
@@ -155,12 +188,64 @@ struct TableColumn {
 
 const PERSIST_BUSY_RETRY_ATTEMPTS: usize = 8;
 const PERSIST_BUSY_BASE_BACKOFF_MS: u64 = 5;
+// FrankenSQLite accepts at most 32,766 numbered parameters. Stay below that
+// hard ceiling so a future query can add fixed parameters without silently
+// making an otherwise valid history batch unparsable.
+const HISTORY_QUERY_PARAMETER_CHUNK: usize = 32_000;
 static PERSIST_SAVEPOINT_COUNTER: AtomicU64 = AtomicU64::new(1);
+static READ_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl std::fmt::Debug for RunStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunStore").finish_non_exhaustive()
     }
+}
+
+/// Row payload for opening a live listen run (bd-rt-persist-a66y): one
+/// session = one run row, backend `native-listen`.
+pub(crate) struct ListenRunOpen<'a> {
+    pub run_id: &'a str,
+    pub started_at_rfc3339: &'a str,
+    /// Source label: the replay file path, or `mic` / `stdin-pcm`.
+    pub input_path: &'a str,
+    /// Full listen config snapshot so replay/audit can round-trip it.
+    pub request_json: &'a str,
+}
+
+/// One committed delta persisted as a segment row (speaker/confidence NULL:
+/// the live lane carries no diarization attribution).
+pub(crate) struct ListenSegmentRow {
+    pub idx: usize,
+    pub start_sec: f64,
+    pub end_sec: f64,
+    pub text: String,
+}
+
+/// One buffered stream event persisted verbatim at flush time. Note the
+/// deliberate divergence from batch: `transcript.partial` events are NOT
+/// persisted for live runs (ephemeral preview garnish); deltas, utterance
+/// lifecycle, warnings, verdicts, and session lifecycle ARE.
+pub(crate) struct ListenEventRow {
+    pub seq: u64,
+    pub ts_rfc3339: String,
+    pub code: String,
+    pub payload_json: String,
+}
+
+/// Row payload for closing a live listen run (bd-rt-persist-a66y): drains
+/// retained segments and remaining events, then writes the true end time and
+/// final summary fields in the same transaction.
+pub(crate) struct ListenCloseRow<'a> {
+    pub run_id: &'a str,
+    /// Any delta rows retained after the last utterance flush failed. They
+    /// land in the same terminal transaction as the final run envelope.
+    pub segments: &'a [ListenSegmentRow],
+    pub events: &'a [ListenEventRow],
+    pub result_json: &'a str,
+    pub warnings_json: &'a str,
+    pub replay_json: &'a str,
+    pub transcript: &'a str,
+    pub finished_at_rfc3339: &'a str,
 }
 
 impl RunStore {
@@ -206,6 +291,30 @@ impl RunStore {
 
     pub(crate) fn connection(&self) -> &BlockingConnection {
         &self.connection
+    }
+
+    fn with_read_snapshot<T>(&self, operation: impl FnOnce() -> FwResult<T>) -> FwResult<T> {
+        let savepoint_name = next_read_snapshot_name();
+        self.connection
+            .execute(&format!("SAVEPOINT {savepoint_name};"))
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+
+        match operation() {
+            Ok(value) => {
+                if let Err(error) = self
+                    .connection
+                    .execute(&format!("RELEASE SAVEPOINT {savepoint_name};"))
+                {
+                    let _ = rollback_savepoint(&self.connection, &savepoint_name);
+                    return Err(FwError::Storage(error.to_string()));
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = rollback_savepoint(&self.connection, &savepoint_name);
+                Err(error)
+            }
+        }
     }
 
     pub fn persist_report(&self, report: &RunReport) -> FwResult<()> {
@@ -283,8 +392,25 @@ impl RunStore {
         limit: usize,
         token: Option<&crate::orchestrator::CancellationToken>,
     ) -> FwResult<Vec<RunSummary>> {
+        self.with_read_snapshot(|| self.list_recent_runs_cancellable_in_snapshot(limit, token))
+    }
+
+    fn list_recent_runs_cancellable_in_snapshot(
+        &self,
+        limit: usize,
+        token: Option<&crate::orchestrator::CancellationToken>,
+    ) -> FwResult<Vec<RunSummary>> {
         if let Some(tok) = token {
             tok.checkpoint()?;
+        }
+
+        // `started_at` is stored verbatim (sync import preserves the archive's
+        // spelling), and valid RFC3339 offsets or fractional-second spellings
+        // are not lexicographically chronological, so SQL `ORDER BY started_at`
+        // can list the wrong runs (bd-9otn). Order by the parsed instant here.
+        let mut selected = self.run_ids_newest_first()?;
+        if limit > 0 {
+            selected.truncate(limit);
         }
 
         // Project only the 140-char preview in SQL (fsqlite's `ColumnSubstrPrefix`
@@ -295,45 +421,52 @@ impl RunStore {
         // projection (`<blob:<=140>` vs the full `<blob:N>`), so if the projected
         // result contains any BLOB transcript we re-run with the full column and
         // fall back to the historical rendering — byte-exact for every DB state.
-        let build_sql = |expr: &str| {
-            if limit > 0 {
-                format!(
-                    "SELECT id, started_at, finished_at, backend, {expr} FROM runs \
-                     ORDER BY started_at DESC, id DESC LIMIT {limit}"
-                )
-            } else {
-                format!(
-                    "SELECT id, started_at, finished_at, backend, {expr} FROM runs \
-                     ORDER BY started_at DESC, id DESC"
-                )
+        let mut rows_by_id: std::collections::HashMap<String, Row> =
+            std::collections::HashMap::with_capacity(selected.len());
+        for run_id_chunk in selected.chunks(HISTORY_QUERY_PARAMETER_CHUNK) {
+            if let Some(tok) = token {
+                tok.checkpoint()?;
             }
-        };
+            let placeholders = numbered_placeholders(run_id_chunk.len());
+            let params = text_id_params(run_id_chunk);
+            let build_sql = |expr: &str| {
+                format!(
+                    "SELECT id, started_at, finished_at, backend, {expr} FROM runs \
+                     WHERE id IN ({placeholders})"
+                )
+            };
+            let rows = self
+                .connection
+                .query_with_params(&build_sql("substr(transcript, 1, 140)"), &params)
+                .map_err(|error| FwError::Storage(error.to_string()))?;
 
-        let rows = self
-            .connection
-            .query(&build_sql("substr(transcript, 1, 140)"))
-            .map_err(|error| FwError::Storage(error.to_string()))?;
+            // BLOB transcripts render by byte length, which the projection would
+            // shorten; re-run with the full column so the preview matches the
+            // historical `<blob:N>` marker exactly.
+            let rows = if rows
+                .iter()
+                .any(|row| matches!(row.get(4), Some(SqliteValue::Blob(_))))
+            {
+                self.connection
+                    .query_with_params(&build_sql("transcript"), &params)
+                    .map_err(|error| FwError::Storage(error.to_string()))?
+            } else {
+                rows
+            };
+            for row in rows {
+                rows_by_id.insert(value_to_string(row.get(0)), row);
+            }
+        }
 
-        // BLOB transcripts render by byte length, which the projection would
-        // shorten; re-run with the full column so the preview matches the
-        // historical `<blob:N>` marker exactly.
-        let rows = if rows
+        selected
             .iter()
-            .any(|row| matches!(row.get(4), Some(SqliteValue::Blob(_))))
-        {
-            self.connection
-                .query(&build_sql("transcript"))
-                .map_err(|error| FwError::Storage(error.to_string()))?
-        } else {
-            rows
-        };
-
-        rows.into_iter()
+            .filter_map(|run_id| rows_by_id.remove(run_id))
             .map(|row| {
                 let run_id = value_to_string(row.get(0));
                 let started = value_to_string(row.get(1));
                 let finished = value_to_string(row.get(2));
-                let backend = parse_backend(&value_to_string(row.get(3)));
+                let backend_text = value_to_string(row.get(3));
+                let backend = parse_stored_backend(&run_id, &backend_text)?;
                 let transcript = value_to_string(row.get(4));
                 let preview = transcript.chars().take(140).collect::<String>();
 
@@ -348,6 +481,27 @@ impl RunStore {
             .collect()
     }
 
+    /// Every run ID ordered newest first by the instant its `started_at`
+    /// denotes (see [`started_at_order_key`]), ties broken by ID descending.
+    fn run_ids_newest_first(&self) -> FwResult<Vec<String>> {
+        let rows = self
+            .connection
+            .query("SELECT id, started_at FROM runs")
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        let mut keyed: Vec<(StartedAtOrderKey, String)> = rows
+            .into_iter()
+            .map(|row| {
+                let started_at = value_to_string(row.get(1));
+                (
+                    started_at_order_key(started_at),
+                    value_to_string(row.get(0)),
+                )
+            })
+            .collect();
+        keyed.sort_unstable_by(|left, right| right.cmp(left));
+        Ok(keyed.into_iter().map(|(_, run_id)| run_id).collect())
+    }
+
     pub fn load_latest_run_details(&self) -> FwResult<Option<StoredRunDetails>> {
         self.load_latest_run_details_cancellable(None)
     }
@@ -356,19 +510,34 @@ impl RunStore {
         &self,
         token: Option<&crate::orchestrator::CancellationToken>,
     ) -> FwResult<Option<StoredRunDetails>> {
+        self.load_latest_run_details_cancellable_with_after_id(token, || Ok(()))
+    }
+
+    fn load_latest_run_details_cancellable_with_after_id(
+        &self,
+        token: Option<&crate::orchestrator::CancellationToken>,
+        after_latest_id: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Option<StoredRunDetails>> {
+        self.with_read_snapshot(|| {
+            self.load_latest_run_details_cancellable_in_snapshot(token, after_latest_id)
+        })
+    }
+
+    fn load_latest_run_details_cancellable_in_snapshot(
+        &self,
+        token: Option<&crate::orchestrator::CancellationToken>,
+        after_latest_id: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Option<StoredRunDetails>> {
         if let Some(tok) = token {
             tok.checkpoint()?;
         }
 
-        // Use SQL ORDER BY and LIMIT 1 for efficient latest-run lookup.
-        let rows = self
-            .connection
-            .query("SELECT id FROM runs ORDER BY started_at DESC, id DESC LIMIT 1")
-            .map_err(|error| FwError::Storage(error.to_string()))?;
+        // Latest by the instant `started_at` denotes, not its text spelling.
+        let latest = self.run_ids_newest_first()?.into_iter().next();
+        after_latest_id()?;
 
-        if let Some(row) = rows.into_iter().next() {
-            let run_id = value_to_string(row.get(0));
-            self.load_run_details_cancellable(&run_id, token)
+        if let Some(run_id) = latest {
+            self.load_run_details_cancellable_in_snapshot(&run_id, token, || Ok(()))
         } else {
             Ok(None)
         }
@@ -378,10 +547,32 @@ impl RunStore {
         self.load_run_details_cancellable(run_id, None)
     }
 
+    #[cfg(test)]
+    fn load_run_details_with_after_run_row(
+        &self,
+        run_id: &str,
+        after_run_row: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Option<StoredRunDetails>> {
+        self.with_read_snapshot(|| {
+            self.load_run_details_cancellable_in_snapshot(run_id, None, after_run_row)
+        })
+    }
+
     pub(crate) fn load_run_details_cancellable(
         &self,
         run_id: &str,
         token: Option<&crate::orchestrator::CancellationToken>,
+    ) -> FwResult<Option<StoredRunDetails>> {
+        self.with_read_snapshot(|| {
+            self.load_run_details_cancellable_in_snapshot(run_id, token, || Ok(()))
+        })
+    }
+
+    fn load_run_details_cancellable_in_snapshot(
+        &self,
+        run_id: &str,
+        token: Option<&crate::orchestrator::CancellationToken>,
+        after_run_row: impl FnOnce() -> FwResult<()>,
     ) -> FwResult<Option<StoredRunDetails>> {
         if let Some(tok) = token {
             tok.checkpoint()?;
@@ -405,6 +596,7 @@ impl RunStore {
             .connection
             .query_with_params(&run_sql, &[SqliteValue::Text(run_id.to_owned().into())])
             .map_err(|error| FwError::Storage(error.to_string()))?;
+        after_run_row()?;
 
         let Some(row) = rows.first() else {
             return Ok(None);
@@ -413,7 +605,7 @@ impl RunStore {
         let run_id = value_to_string(row.get(0));
         let started_at_rfc3339 = value_to_string(row.get(1));
         let finished_at_rfc3339 = value_to_string(row.get(2));
-        let backend = parse_backend(&value_to_string(row.get(3)));
+        let backend_text = value_to_string(row.get(3));
         let result_json = value_to_string(row.get(4));
         let warnings_json = value_to_string(row.get(5));
         let transcript_fallback = value_to_string(row.get(6));
@@ -423,6 +615,7 @@ impl RunStore {
         let result: TranscriptionResult = serde_json::from_str(&result_json).map_err(|error| {
             FwError::Storage(format!("invalid result_json for run {run_id}: {error}"))
         })?;
+        let backend = validate_stored_backend_coherence(&run_id, &backend_text, result.backend)?;
         validate_stored_result_contracts(&run_id, &result)?;
 
         let warnings =
@@ -436,7 +629,24 @@ impl RunStore {
             result.transcript.clone()
         };
 
-        // Checkpoint before loading events (second major query).
+        let segments = if backend == BackendKind::NativeListen {
+            if let Some(tok) = token {
+                tok.checkpoint()?;
+            }
+            let segment_rows = self
+                .connection
+                .query_with_params(
+                    "SELECT idx, start_sec, end_sec, speaker, text, confidence \
+                     FROM segments WHERE run_id = ?1 ORDER BY idx ASC",
+                    &[SqliteValue::Text(run_id.clone().into())],
+                )
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            parse_durable_segment_rows(&run_id, &segment_rows, 0)?
+        } else {
+            result.segments
+        };
+
+        // Checkpoint before loading events (the next major query).
         if let Some(tok) = token {
             tok.checkpoint()?;
         }
@@ -488,7 +698,7 @@ impl RunStore {
             finished_at_rfc3339,
             backend,
             transcript,
-            segments: result.segments,
+            segments,
             diarization: result.diarization,
             projection_timeline,
             events,
@@ -498,25 +708,126 @@ impl RunStore {
         }))
     }
 
-    /// Load full details for many runs with two batched `WHERE id/run_id IN (…)`
-    /// queries instead of the per-run N+1 (`load_run_details` × N, each 2 queries +
-    /// 2 schema scans). Returns details for the run_ids that exist, in input order.
+    /// Load full details for many runs with batched `WHERE id/run_id IN (…)`
+    /// queries instead of the per-run N+1. Ordinary batch-ASR history uses runs +
+    /// events; a third query loads authoritative segment rows only when the batch
+    /// contains native-listen runs. Returns existing run_ids in input order,
+    /// preserving repeated IDs as repeated byte-identical detail records.
     /// Output is byte-identical to per-run `load_run_details` (asserted by
     /// `load_run_details_batch_matches_per_run`). `FW_STORAGE_BATCH_HISTORY=0` falls
     /// back to the per-run path (kill-switch + A/B arm).
     pub fn load_run_details_batch(&self, run_ids: &[String]) -> FwResult<Vec<StoredRunDetails>> {
+        self.load_run_details_batch_with_configuration(
+            run_ids,
+            batch_history_enabled(),
+            |_| {},
+            || Ok(()),
+        )
+    }
+
+    /// Atomically select recent run IDs and load their complete detail rows.
+    /// The list and every parent/segment/event query share one read snapshot,
+    /// so a concurrent live flush cannot make routing history observe a list
+    /// from one database moment and details from another.
+    pub fn load_recent_run_details(&self, limit: usize) -> FwResult<Vec<StoredRunDetails>> {
+        self.load_recent_run_details_with_after_summaries(limit, || Ok(()))
+    }
+
+    fn load_recent_run_details_with_after_summaries(
+        &self,
+        limit: usize,
+        after_summaries: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Vec<StoredRunDetails>> {
+        self.with_read_snapshot(|| {
+            let summaries = self.list_recent_runs_cancellable_in_snapshot(limit, None)?;
+            after_summaries()?;
+            let run_ids = summaries
+                .into_iter()
+                .map(|summary| summary.run_id)
+                .collect::<Vec<_>>();
+            let details = self.load_run_details_batch_in_snapshot(
+                &run_ids,
+                batch_history_enabled(),
+                |_| {},
+                || Ok(()),
+            )?;
+            if details.len() != run_ids.len() {
+                return Err(FwError::Storage(
+                    "a run selected for recent history was absent from the same read snapshot"
+                        .to_owned(),
+                ));
+            }
+            Ok(details)
+        })
+    }
+
+    #[cfg(test)]
+    fn load_run_details_batch_with_after_run_rows(
+        &self,
+        run_ids: &[String],
+        after_run_rows: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Vec<StoredRunDetails>> {
+        self.load_run_details_batch_with_configuration(
+            run_ids,
+            batch_history_enabled(),
+            |_| {},
+            after_run_rows,
+        )
+    }
+
+    fn load_run_details_batch_with_configuration(
+        &self,
+        run_ids: &[String],
+        use_batched_queries: bool,
+        observe_run_query: impl FnMut(usize),
+        after_run_rows: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Vec<StoredRunDetails>> {
         if run_ids.is_empty() {
             return Ok(Vec::new());
         }
-        if !batch_history_enabled() {
+        self.with_read_snapshot(|| {
+            self.load_run_details_batch_in_snapshot(
+                run_ids,
+                use_batched_queries,
+                observe_run_query,
+                after_run_rows,
+            )
+        })
+    }
+
+    fn load_run_details_batch_in_snapshot(
+        &self,
+        run_ids: &[String],
+        use_batched_queries: bool,
+        mut observe_run_query: impl FnMut(usize),
+        after_run_rows: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Vec<StoredRunDetails>> {
+        if run_ids.is_empty() {
+            after_run_rows()?;
+            return Ok(Vec::new());
+        }
+        if !use_batched_queries {
             let mut out = Vec::with_capacity(run_ids.len());
-            for id in run_ids {
-                if let Some(details) = self.load_run_details(id)? {
+            let mut after_run_rows = Some(after_run_rows);
+            for (index, id) in run_ids.iter().enumerate() {
+                let hook = after_run_rows.take().filter(|_| index == 0);
+                if let Some(details) =
+                    self.load_run_details_cancellable_in_snapshot(id, None, || match hook {
+                        Some(hook) => hook(),
+                        None => Ok(()),
+                    })?
+                {
                     out.push(details);
                 }
             }
             return Ok(out);
         }
+
+        let mut seen = std::collections::HashSet::with_capacity(run_ids.len());
+        let unique_run_ids = run_ids
+            .iter()
+            .filter(|run_id| seen.insert(run_id.as_str()))
+            .collect::<Vec<_>>();
 
         // Optional-column exprs computed ONCE (not once per run) — see load_run_details.
         let replay_expr = if self.table_has_column("runs", "replay_json")? {
@@ -529,59 +840,105 @@ impl RunStore {
         } else {
             "'{}' AS acceleration_json"
         };
-        let placeholders = (1..=run_ids.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let params: Vec<SqliteValue> = run_ids
-            .iter()
-            .map(|id| SqliteValue::Text(id.clone().into()))
-            .collect();
-
-        let run_sql = format!(
-            "SELECT id, started_at, finished_at, backend, result_json, warnings_json, transcript, {replay_expr}, {acceleration_expr} \
-             FROM runs WHERE id IN ({placeholders})"
-        );
-        let run_rows = self
-            .connection
-            .query_with_params(&run_sql, &params)
-            .map_err(|error| FwError::Storage(error.to_string()))?;
         let mut run_by_id: std::collections::HashMap<String, fsqlite::Row> =
-            std::collections::HashMap::with_capacity(run_rows.len());
-        for row in run_rows {
-            run_by_id.insert(value_to_string(row.get(0)), row);
+            std::collections::HashMap::with_capacity(unique_run_ids.len());
+        let mut native_listen_run_ids = Vec::new();
+        for run_id_chunk in unique_run_ids.chunks(HISTORY_QUERY_PARAMETER_CHUNK) {
+            observe_run_query(run_id_chunk.len());
+            let placeholders = numbered_placeholders(run_id_chunk.len());
+            let params = text_id_params(run_id_chunk);
+            let run_sql = format!(
+                "SELECT id, started_at, finished_at, backend, result_json, warnings_json, transcript, {replay_expr}, {acceleration_expr} \
+                 FROM runs WHERE id IN ({placeholders})"
+            );
+            let run_rows = self
+                .connection
+                .query_with_params(&run_sql, &params)
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            for row in run_rows {
+                let run_id = value_to_string(row.get(0));
+                let backend_text = value_to_string(row.get(3));
+                let result_json = value_to_string(row.get(4));
+                let backend = validate_run_backend_json(&run_id, &backend_text, &result_json)?;
+                if backend == BackendKind::NativeListen {
+                    native_listen_run_ids.push(run_id.clone());
+                }
+                run_by_id.insert(run_id, row);
+            }
+        }
+        after_run_rows()?;
+
+        let mut segments_by_run: std::collections::HashMap<String, Vec<fsqlite::Row>> =
+            std::collections::HashMap::new();
+        for run_id_chunk in native_listen_run_ids.chunks(HISTORY_QUERY_PARAMETER_CHUNK) {
+            let segment_placeholders = numbered_placeholders(run_id_chunk.len());
+            let segment_params = text_id_params(run_id_chunk);
+            let segment_sql = format!(
+                "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence \
+                 FROM segments WHERE run_id IN ({segment_placeholders}) \
+                 ORDER BY run_id ASC, idx ASC"
+            );
+            let segment_rows = self
+                .connection
+                .query_with_params(&segment_sql, &segment_params)
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            for row in segment_rows {
+                segments_by_run
+                    .entry(value_to_string(row.get(0)))
+                    .or_default()
+                    .push(row);
+            }
         }
 
-        let evt_sql = format!(
-            "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
-             FROM events WHERE run_id IN ({placeholders}) ORDER BY run_id ASC, seq ASC"
-        );
-        let evt_rows = self
-            .connection
-            .query_with_params(&evt_sql, &params)
-            .map_err(|error| FwError::Storage(error.to_string()))?;
         let mut events_by_run: std::collections::HashMap<String, Vec<fsqlite::Row>> =
             std::collections::HashMap::new();
-        for row in evt_rows {
-            events_by_run
-                .entry(value_to_string(row.get(0)))
-                .or_default()
-                .push(row);
+        for run_id_chunk in unique_run_ids.chunks(HISTORY_QUERY_PARAMETER_CHUNK) {
+            let placeholders = numbered_placeholders(run_id_chunk.len());
+            let params = text_id_params(run_id_chunk);
+            let evt_sql = format!(
+                "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
+                 FROM events WHERE run_id IN ({placeholders}) ORDER BY run_id ASC, seq ASC"
+            );
+            let evt_rows = self
+                .connection
+                .query_with_params(&evt_sql, &params)
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            for row in evt_rows {
+                events_by_run
+                    .entry(value_to_string(row.get(0)))
+                    .or_default()
+                    .push(row);
+            }
+        }
+
+        let mut details_by_id = std::collections::HashMap::with_capacity(run_by_id.len());
+        for run_id in unique_run_ids {
+            let Some(run_row) = run_by_id.get(run_id) else {
+                continue;
+            };
+            let events = events_by_run
+                .get(run_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let segments = segments_by_run
+                .get(run_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let details = assemble_run_details_batched(run_row, events, segments)?;
+            details_by_id.insert(run_id.as_str().to_owned(), details);
         }
 
         let mut out = Vec::with_capacity(run_ids.len());
         for run_id in run_ids {
-            let Some(run_row) = run_by_id.get(run_id) else {
-                continue;
-            };
-            let events = events_by_run.remove(run_id).unwrap_or_default();
-            out.push(assemble_run_details_batched(run_row, &events)?);
+            if let Some(details) = details_by_id.get(run_id) {
+                out.push(details.clone());
+            }
         }
         Ok(out)
     }
 
     /// Current schema version. Bump when adding migrations.
-    pub const SCHEMA_VERSION: u32 = 5;
+    pub const SCHEMA_VERSION: u32 = 6;
 
     fn initialize_schema(&self) -> FwResult<()> {
         // Enable WAL mode for concurrent read/write support.
@@ -737,6 +1094,24 @@ CREATE TABLE IF NOT EXISTS _meta (
         Ok(())
     }
 
+    fn validate_sync_database_id(&self) -> FwResult<String> {
+        let identity_rows = self
+            .connection
+            .query("SELECT value FROM _meta WHERE key = 'sync_database_id';")
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        let database_id = identity_rows
+            .first()
+            .map(|row| value_to_string(row.get(0)))
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                FwError::Storage("database schema v6 is missing sync_database_id".to_owned())
+            })?;
+        uuid::Uuid::parse_str(&database_id).map_err(|error| {
+            FwError::Storage(format!("invalid sync_database_id `{database_id}`: {error}"))
+        })?;
+        Ok(database_id)
+    }
+
     /// Run forward migrations from the current version to SCHEMA_VERSION.
     fn run_migrations(&self) -> FwResult<()> {
         let mut current = self.current_schema_version()?;
@@ -750,6 +1125,7 @@ CREATE TABLE IF NOT EXISTS _meta (
         }
 
         if current == Self::SCHEMA_VERSION {
+            self.validate_sync_database_id()?;
             return Ok(());
         }
 
@@ -758,7 +1134,8 @@ CREATE TABLE IF NOT EXISTS _meta (
         // version=0, but CREATE TABLE IF NOT EXISTS has already supplied every
         // table that was absent. When the runs table has the v2 columns, finish
         // the index-only v3/v4 work directly. The following v5 migration owns
-        // the derived-cache rebuild after ensuring its typed evidence columns.
+        // the derived-cache rebuild after ensuring its typed evidence columns;
+        // v6 then installs the incremental-sync mutation authority.
         // This avoids replaying v4's table DDL against a brand-new current-shape
         // DB, which leaves needless freelist pages in fsqlite.
         if current == 0 {
@@ -795,6 +1172,7 @@ CREATE TABLE IF NOT EXISTS _meta (
                     has_derived_rows |= !present.is_empty();
                 }
                 if has_v5_columns && !has_canonical_runs && !has_derived_rows {
+                    self.migrate_sync_mutation_schema_v6()?;
                     self.set_schema_version(Self::SCHEMA_VERSION)?;
                     return Ok(());
                 }
@@ -813,7 +1191,11 @@ CREATE TABLE IF NOT EXISTS _meta (
             let next = current + 1;
             tracing::info!(from = current, to = next, "Migrating schema");
             self.apply_migration(next).map_err(|error| {
-                FwError::Storage(format!("migration to v{next} failed: {error}"))
+                let detail = match error {
+                    FwError::Storage(detail) => detail,
+                    other => other.to_string(),
+                };
+                FwError::Storage(format!("migration to v{next} failed: {detail}"))
             })?;
             self.set_schema_version(next)?;
             tracing::info!(version = next, "Migration complete");
@@ -857,6 +1239,7 @@ CREATE TABLE IF NOT EXISTS _meta (
             }
             4 => self.migrate_diarization_schema_v4(),
             5 => self.migrate_diarization_schema_v5(),
+            6 => self.migrate_sync_mutation_schema_v6(),
             _ => Err(FwError::Storage(format!(
                 "unknown migration version: {version}"
             ))),
@@ -978,6 +1361,128 @@ CREATE TABLE IF NOT EXISTS speaker_profile_summaries (
                     .map_err(|error| FwError::Storage(error.to_string()))?;
                 Ok(())
             }
+            Err(error) => {
+                let _ = rollback_savepoint(&self.connection, SAVEPOINT);
+                Err(error)
+            }
+        }
+    }
+
+    /// Install the monotonic authority used by incremental JSONL export.
+    ///
+    /// `finished_at` is domain data: callers can backfill it or update a run
+    /// without moving it beyond a timestamp cursor.  This bounded table keeps
+    /// only the newest database-assigned sequence for each aggregate.  Triggers
+    /// advance the sequence for parent and child mutations in the same SQLite
+    /// transaction as the mutation itself, so an export snapshot can select a
+    /// complete run aggregate without relying on wall-clock spelling or caller
+    /// discipline.
+    fn migrate_sync_mutation_schema_v6(&self) -> FwResult<()> {
+        const SAVEPOINT: &str = "fw_migrate_sync_mutations_v6";
+        self.connection
+            .execute(&format!("SAVEPOINT {SAVEPOINT};"))
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+
+        let result = (|| -> FwResult<()> {
+            self.connection
+                .execute(
+                    r#"
+CREATE TABLE IF NOT EXISTS sync_run_mutations (
+    mutation_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE
+);
+
+INSERT OR IGNORE INTO sync_run_mutations (run_id)
+    SELECT id FROM runs ORDER BY id;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_runs_insert
+AFTER INSERT ON runs
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (NEW.id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_runs_update
+AFTER UPDATE ON runs
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (OLD.id);
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (NEW.id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_runs_delete
+AFTER DELETE ON runs
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (OLD.id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_segments_insert
+AFTER INSERT ON segments
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (NEW.run_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_segments_update
+AFTER UPDATE ON segments
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (OLD.run_id);
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (NEW.run_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_segments_delete
+AFTER DELETE ON segments
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (OLD.run_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_events_insert
+AFTER INSERT ON events
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (NEW.run_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_events_update
+AFTER UPDATE ON events
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (OLD.run_id);
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (NEW.run_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_events_delete
+AFTER DELETE ON events
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (OLD.run_id);
+END;
+"#,
+                )
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+
+            // Mutation sequences are local to one database lineage. Persist a
+            // stable random identity in the database itself so a cursor from an
+            // unrelated database can never be accepted merely because its
+            // numeric sequence happens to be in range. INSERT OR IGNORE makes
+            // reopening and interrupted migration retries retain the identity.
+            self.connection
+                .execute_with_params(
+                    "INSERT OR IGNORE INTO _meta (key, value) \
+                     VALUES ('sync_database_id', ?1);",
+                    &[text_value(uuid::Uuid::new_v4().to_string())],
+                )
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            self.validate_sync_database_id().map_err(|error| {
+                let detail = match error {
+                    FwError::Storage(detail) => detail,
+                    other => other.to_string(),
+                };
+                FwError::Storage(format!("v6 identity migration failed: {detail}"))
+            })?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .connection
+                .execute(&format!("RELEASE SAVEPOINT {SAVEPOINT};"))
+                .map(|_| ())
+                .map_err(|error| FwError::Storage(error.to_string())),
             Err(error) => {
                 let _ = rollback_savepoint(&self.connection, SAVEPOINT);
                 Err(error)
@@ -1138,16 +1643,18 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                         contract_version,
                         Some(crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION)
                             | Some(crate::diarization::NEURAL_DIARIZATION_CONTRACT_VERSION)
+                            | Some(crate::diarization::SORTFORMER_DIARIZATION_CONTRACT_VERSION)
                     );
                     if !contract_supported || value.get("speaker_count").is_none() {
                         return Err(FwError::Storage(format!(
                             "cannot rebuild diarization report for run {run_id}: contract {:?} \
-                             is unsupported; expected exactly {} or {}; export or recover the \
-                             canonical run JSON with a matching franken_whisper version before \
-                             migrating",
+                             is unsupported; expected exactly {}, {} or {}; export or recover \
+                             the canonical run JSON with a matching franken_whisper version \
+                             before migrating",
                             contract_version,
                             crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION,
                             crate::diarization::NEURAL_DIARIZATION_CONTRACT_VERSION,
+                            crate::diarization::SORTFORMER_DIARIZATION_CONTRACT_VERSION,
                         )));
                     }
                     serde_json::from_value::<crate::model::DiarizationReport>(value.clone())
@@ -1975,6 +2482,317 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
     }
 
     // -----------------------------------------------------------------------
+    // bd-rt-persist-a66y: utterance-granular persistence for live listen runs
+    // -----------------------------------------------------------------------
+
+    /// Retry wrapper for the listen-flush family: same busy/backoff budget
+    /// as the batch persist path (concurrent batch agents + live sessions
+    /// share one database file).
+    fn retry_busy<T>(&self, mut op: impl FnMut(&Self) -> FwResult<T>) -> FwResult<T> {
+        for attempt in 0..=PERSIST_BUSY_RETRY_ATTEMPTS {
+            match op(self) {
+                Ok(value) => return Ok(value),
+                Err(error)
+                    if is_busy_storage_error(&error) && attempt < PERSIST_BUSY_RETRY_ATTEMPTS =>
+                {
+                    std::thread::sleep(Duration::from_millis(
+                        PERSIST_BUSY_BASE_BACKOFF_MS * (attempt as u64 + 1),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(FwError::Storage(
+            "listen persist retry loop exhausted unexpectedly".to_owned(),
+        ))
+    }
+
+    /// Insert the run row opening a live listen session (one session = one
+    /// row, backend `native-listen`). `finished_at` starts at `started_at`
+    /// and is advanced to a "last known alive" wall time on every flush —
+    /// the NOT NULL schema makes a provisional value mandatory; a crashed
+    /// session is recognizable as a listen run whose events lack the
+    /// session-end marker (round 4 convention). `replay_json` opens as an
+    /// honestly-labeled placeholder; the PCM hash lands only on clean close.
+    pub(crate) fn listen_open_run(&self, open: &ListenRunOpen<'_>) -> FwResult<()> {
+        // Crashed sessions must stay readable by the standard loaders, so
+        // the row opens with a schema-valid minimal result (empty
+        // transcript); close() overwrites it with the final summary.
+        let result_placeholder = serde_json::json!({
+            "backend": "native_listen",
+            "transcript": "",
+            "language": null,
+            "segments": [],
+            "acceleration": null,
+            "raw_output": {},
+            "artifact_paths": [],
+        })
+        .to_string();
+        let replay_placeholder = serde_json::json!({
+            "kind": "live-session",
+            "pcm_sha256": serde_json::Value::Null,
+            "live_note": "audio not retained; hash is an integrity fingerprint, not a replayable reference",
+        })
+        .to_string();
+        self.retry_busy(|store| {
+            let savepoint = next_persist_savepoint_name();
+            store
+                .connection
+                .execute(&format!("SAVEPOINT {savepoint};"))
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            let inner = store.connection.execute_with_params(
+                "INSERT INTO runs (id, started_at, finished_at, backend, input_path, \
+                 normalized_wav_path, request_json, result_json, warnings_json, transcript, \
+                 replay_json) VALUES (?1, ?2, ?2, 'native-listen', ?3, '', ?4, ?6, '[]', '', ?5)",
+                &[
+                    SqliteValue::Text(open.run_id.to_owned().into()),
+                    SqliteValue::Text(open.started_at_rfc3339.to_owned().into()),
+                    SqliteValue::Text(open.input_path.to_owned().into()),
+                    SqliteValue::Text(open.request_json.to_owned().into()),
+                    SqliteValue::Text(replay_placeholder.clone().into()),
+                    SqliteValue::Text(result_placeholder.clone().into()),
+                ],
+            );
+
+            match inner {
+                Ok(_) => store
+                    .connection
+                    .execute(&format!("RELEASE SAVEPOINT {savepoint};"))
+                    .map(|_| ())
+                    .map_err(|error| FwError::Storage(error.to_string())),
+                Err(error) => {
+                    let _ = rollback_savepoint(&store.connection, &savepoint);
+                    Err(FwError::Storage(error.to_string()))
+                }
+            }
+        })
+    }
+
+    /// Audit reader (bd-rt-persist-a66y): number of durable segment rows
+    /// for a listen run. The segments TABLE is the authoritative utterance
+    /// store for live runs; `result_json.segments` stays an empty summary.
+    pub fn listen_segment_count(&self, run_id: &str) -> FwResult<i64> {
+        let rows = self
+            .connection
+            .query_with_params(
+                "SELECT COUNT(*) FROM segments WHERE run_id = ?1",
+                &[SqliteValue::Text(run_id.to_owned().into())],
+            )
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        Ok(rows
+            .first()
+            .and_then(|row| row.get(0).and_then(|value| value.as_integer()))
+            .unwrap_or(0))
+    }
+
+    /// Append one closed utterance's delta segments plus every stream event
+    /// buffered since the previous flush, inside ONE savepoint transaction;
+    /// advance `finished_at` to the last-known-alive time and refresh the
+    /// running transcript. Utterances are the atomic durability unit.
+    pub(crate) fn listen_flush_utterance(
+        &self,
+        run_id: &str,
+        segments: &[ListenSegmentRow],
+        events: &[ListenEventRow],
+        transcript_so_far: &str,
+        finished_at_rfc3339: &str,
+    ) -> FwResult<()> {
+        self.retry_busy(|store| {
+            let savepoint = next_persist_savepoint_name();
+            store
+                .connection
+                .execute(&format!("SAVEPOINT {savepoint};"))
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            let inner = (|| -> Result<(), FwError> {
+                for segment in segments {
+                    store
+                        .connection
+                        .execute_with_params(
+                            "INSERT OR REPLACE INTO segments (run_id, idx, start_sec, end_sec, \
+                             speaker, text, confidence) VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL)",
+                            &[
+                                SqliteValue::Text(run_id.to_owned().into()),
+                                SqliteValue::Integer(segment.idx as i64),
+                                SqliteValue::Float(segment.start_sec),
+                                SqliteValue::Float(segment.end_sec),
+                                SqliteValue::Text(segment.text.clone().into()),
+                            ],
+                        )
+                        .map_err(|error| FwError::Storage(error.to_string()))?;
+                }
+                for event in events {
+                    store
+                        .connection
+                        .execute_with_params(
+                            "INSERT OR REPLACE INTO events (run_id, seq, ts_rfc3339, stage, code, \
+                             message, payload_json) VALUES (?1, ?2, ?3, 'listen', ?4, '', ?5)",
+                            &[
+                                SqliteValue::Text(run_id.to_owned().into()),
+                                SqliteValue::Integer(event.seq as i64),
+                                SqliteValue::Text(event.ts_rfc3339.clone().into()),
+                                SqliteValue::Text(event.code.clone().into()),
+                                SqliteValue::Text(event.payload_json.clone().into()),
+                            ],
+                        )
+                        .map_err(|error| FwError::Storage(error.to_string()))?;
+                }
+                if !segments.is_empty() || !events.is_empty() {
+                    store
+                        .connection
+                        .execute_with_params(
+                            "UPDATE runs SET finished_at = ?2, transcript = ?3 WHERE id = ?1",
+                            &[
+                                SqliteValue::Text(run_id.to_owned().into()),
+                                SqliteValue::Text(finished_at_rfc3339.to_owned().into()),
+                                SqliteValue::Text(transcript_so_far.to_owned().into()),
+                            ],
+                        )
+                        .map_err(|error| FwError::Storage(error.to_string()))?;
+                }
+                Ok(())
+            })();
+            match inner {
+                Ok(()) => store
+                    .connection
+                    .execute(&format!("RELEASE SAVEPOINT {savepoint};"))
+                    .map(|_| ())
+                    .map_err(|error| FwError::Storage(error.to_string())),
+                Err(error) => {
+                    let _ = rollback_savepoint(&store.connection, &savepoint);
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    /// Close a live session: drain retained segments and remaining events,
+    /// write the true end time, final stats/result JSON, warnings, running
+    /// transcript, and the finalized replay envelope with the streamed
+    /// session-PCM hash. A failure here is NOT swallowed by the caller (final
+    /// close failure surfaces as run_error after the session events were
+    /// emitted).
+    pub(crate) fn listen_close_run(&self, close: &ListenCloseRow<'_>) -> FwResult<()> {
+        let run_id = close.run_id;
+        let segments = close.segments;
+        let events = close.events;
+        let result_json = close.result_json;
+        let warnings_json = close.warnings_json;
+        let replay_json = close.replay_json;
+        let transcript = close.transcript;
+        let finished_at_rfc3339 = close.finished_at_rfc3339;
+        validate_run_backend_json(run_id, "native-listen", result_json)?;
+        self.retry_busy(|store| {
+            let savepoint = next_persist_savepoint_name();
+            store
+                .connection
+                .execute(&format!("SAVEPOINT {savepoint};"))
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            let inner = (|| -> Result<(), FwError> {
+                for segment in segments {
+                    store
+                        .connection
+                        .execute_with_params(
+                            "INSERT OR REPLACE INTO segments (run_id, idx, start_sec, end_sec, \
+                             speaker, text, confidence) VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL)",
+                            &[
+                                SqliteValue::Text(run_id.to_owned().into()),
+                                SqliteValue::Integer(segment.idx as i64),
+                                SqliteValue::Float(segment.start_sec),
+                                SqliteValue::Float(segment.end_sec),
+                                SqliteValue::Text(segment.text.clone().into()),
+                            ],
+                        )
+                        .map_err(|error| FwError::Storage(error.to_string()))?;
+                }
+                for event in events {
+                    store
+                        .connection
+                        .execute_with_params(
+                            "INSERT OR REPLACE INTO events (run_id, seq, ts_rfc3339, stage, code, \
+                             message, payload_json) VALUES (?1, ?2, ?3, 'listen', ?4, '', ?5)",
+                            &[
+                                SqliteValue::Text(run_id.to_owned().into()),
+                                SqliteValue::Integer(event.seq as i64),
+                                SqliteValue::Text(event.ts_rfc3339.clone().into()),
+                                SqliteValue::Text(event.code.clone().into()),
+                                SqliteValue::Text(event.payload_json.clone().into()),
+                            ],
+                        )
+                        .map_err(|error| FwError::Storage(error.to_string()))?;
+                }
+
+                store
+                    .connection
+                    .execute_with_params(
+                        "UPDATE runs SET finished_at = ?2, result_json = ?3, warnings_json = ?4, \
+                         replay_json = ?5, transcript = ?6 WHERE id = ?1",
+                        &[
+                            SqliteValue::Text(run_id.to_owned().into()),
+                            SqliteValue::Text(finished_at_rfc3339.to_owned().into()),
+                            SqliteValue::Text(result_json.to_owned().into()),
+                            SqliteValue::Text(warnings_json.to_owned().into()),
+                            SqliteValue::Text(replay_json.to_owned().into()),
+                            SqliteValue::Text(transcript.to_owned().into()),
+                        ],
+                    )
+                    .map_err(|error| FwError::Storage(error.to_string()))?;
+                Ok(())
+            })();
+            match inner {
+                Ok(()) => store
+                    .connection
+                    .execute(&format!("RELEASE SAVEPOINT {savepoint};"))
+                    .map(|_| ())
+                    .map_err(|error| FwError::Storage(error.to_string())),
+                Err(error) => {
+                    let _ = rollback_savepoint(&store.connection, &savepoint);
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    /// Audit reader (bd-rt-persist-a66y): the persisted listen-config
+    /// snapshot (`runs.request_json`) so downstream tooling can verify the
+    /// config round-trip without raw SQL access.
+    pub fn stored_request_json(&self, run_id: &str) -> FwResult<Option<String>> {
+        let rows = self
+            .connection
+            .query_with_params(
+                "SELECT request_json FROM runs WHERE id = ?1",
+                &[SqliteValue::Text(run_id.to_owned().into())],
+            )
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        Ok(rows.first().map(|row| value_to_string(row.get(0))))
+    }
+
+    /// Audit reader (bd-rt-persist-a66y): the raw replay envelope JSON so
+    /// downstream tooling can inspect live-session integrity metadata
+    /// (`pcm_sha256` / `live_note`) without raw SQL access.
+    pub fn stored_replay_json(&self, run_id: &str) -> FwResult<Option<String>> {
+        let rows = self
+            .connection
+            .query_with_params(
+                "SELECT replay_json FROM runs WHERE id = ?1",
+                &[SqliteValue::Text(run_id.to_owned().into())],
+            )
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        Ok(rows.first().map(|row| value_to_string(row.get(0))))
+    }
+
+    /// Audit reader (bd-rt-persist-a66y): `PRAGMA integrity_check` verdict
+    /// for crash-recovery assertions and operator diagnostics.
+    pub fn query_integrity_check(&self) -> String {
+        let rows = self
+            .connection
+            .query("PRAGMA integrity_check;")
+            .unwrap_or_default();
+        rows.first()
+            .map(|row| value_to_string(row.get(0)))
+            .unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
     // bd-3i1.3: Diagnostic PRAGMAs for storage observability
     // -----------------------------------------------------------------------
 
@@ -2192,13 +3010,41 @@ fn persist_skip_stmt_sp_enabled() -> bool {
     std::env::var("FW_PERSIST_SKIP_STMT_SP").ok().as_deref() != Some("0")
 }
 
-/// Whether [`RunStore::load_run_details_batch`] loads many runs with two batched
+/// Whether [`RunStore::load_run_details_batch`] loads many runs with batched
 /// `WHERE id/run_id IN (…)` queries (default) instead of one `load_run_details`
-/// (two queries + two schema scans) per run — the app-level N+1 in the routing-
-/// history command. Output is identical either way (asserted by a batch-vs-per-run
-/// test). `FW_STORAGE_BATCH_HISTORY=0` restores the per-run path (kill-switch + A/B).
+/// call per run — the app-level N+1 in the routing-history command. Native-listen
+/// batches add one bounded segment query; ordinary runs retain the runs+events
+/// path. Output is identical either way (asserted by batch-vs-per-run tests).
+/// `FW_STORAGE_BATCH_HISTORY=0` restores the per-run path (kill-switch + A/B).
 fn batch_history_enabled() -> bool {
     std::env::var("FW_STORAGE_BATCH_HISTORY").ok().as_deref() != Some("0")
+}
+
+/// Sort key for a stored `started_at` value: a valid RFC3339 timestamp orders
+/// by the UTC instant it denotes (so `+02:00` offsets and fractional-second
+/// spellings compare chronologically); any other spelling orders before every
+/// valid instant, among themselves by text.
+type StartedAtOrderKey = (Option<chrono::DateTime<chrono::Utc>>, String);
+
+fn started_at_order_key(started_at: String) -> StartedAtOrderKey {
+    match chrono::DateTime::parse_from_rfc3339(&started_at) {
+        Ok(instant) => (Some(instant.with_timezone(&chrono::Utc)), String::new()),
+        Err(_) => (None, started_at),
+    }
+}
+
+fn numbered_placeholders(count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn text_id_params<T: AsRef<str>>(run_ids: &[T]) -> Vec<SqliteValue> {
+    run_ids
+        .iter()
+        .map(|run_id| SqliteValue::Text(run_id.as_ref().to_owned().into()))
+        .collect()
 }
 
 /// Re-authenticate nested typed contracts after deserializing canonical run
@@ -2215,20 +3061,105 @@ fn validate_stored_result_contracts(run_id: &str, result: &TranscriptionResult) 
     Ok(())
 }
 
+fn parse_durable_segment_rows(
+    run_id: &str,
+    rows: &[fsqlite::Row],
+    column_offset: usize,
+) -> FwResult<Vec<TranscriptionSegment>> {
+    rows.iter()
+        .map(|row| {
+            let idx = row
+                .get(column_offset)
+                .and_then(SqliteValue::as_integer)
+                .ok_or_else(|| {
+                    FwError::Storage(format!("invalid durable segment index for run {run_id}"))
+                })?;
+            if idx < 0 {
+                return Err(FwError::Storage(format!(
+                    "invalid durable segment index {idx} for run {run_id}"
+                )));
+            }
+
+            let start_sec =
+                parse_optional_segment_float(row.get(column_offset + 1), run_id, idx, "start_sec")?;
+            let end_sec =
+                parse_optional_segment_float(row.get(column_offset + 2), run_id, idx, "end_sec")?;
+            let speaker = match row.get(column_offset + 3) {
+                None | Some(SqliteValue::Null) => None,
+                Some(SqliteValue::Text(value)) => Some(value.to_string()),
+                Some(_) => {
+                    return Err(FwError::Storage(format!(
+                        "invalid durable segment speaker for run {run_id} index {idx}"
+                    )));
+                }
+            };
+            let text = row
+                .get(column_offset + 4)
+                .and_then(SqliteValue::as_text)
+                .ok_or_else(|| {
+                    FwError::Storage(format!(
+                        "invalid durable segment text for run {run_id} index {idx}"
+                    ))
+                })?
+                .to_owned();
+            let confidence = parse_optional_segment_float(
+                row.get(column_offset + 5),
+                run_id,
+                idx,
+                "confidence",
+            )?;
+
+            Ok(TranscriptionSegment {
+                start_sec,
+                end_sec,
+                text,
+                speaker,
+                confidence,
+            })
+        })
+        .collect()
+}
+
+fn parse_optional_segment_float(
+    value: Option<&SqliteValue>,
+    run_id: &str,
+    idx: i64,
+    field: &str,
+) -> FwResult<Option<f64>> {
+    let number = match value {
+        None | Some(SqliteValue::Null) => return Ok(None),
+        Some(SqliteValue::Float(value)) => *value,
+        Some(SqliteValue::Integer(value)) => *value as f64,
+        Some(_) => {
+            return Err(FwError::Storage(format!(
+                "invalid durable segment {field} for run {run_id} index {idx}"
+            )));
+        }
+    };
+    if !number.is_finite() {
+        return Err(FwError::Storage(format!(
+            "non-finite durable segment {field} for run {run_id} index {idx}"
+        )));
+    }
+    Ok(Some(number))
+}
+
 /// Assemble a [`StoredRunDetails`] from a batched `runs` row (9 cols: id,
 /// started_at, finished_at, backend, result_json, warnings_json, transcript,
 /// replay_json, acceleration_json) and its batched `events` rows (7 cols: run_id,
 /// seq, ts_rfc3339, stage, code, message, payload_json). Mirrors the per-run
 /// assembly in `load_run_details_cancellable` exactly — the only difference is the
 /// events carry `run_id` at column 0 (so seq…payload shift +1) to allow grouping.
+/// Native-listen `segment_rows` likewise carry `run_id` before idx…confidence.
 fn assemble_run_details_batched(
     run_row: &fsqlite::Row,
     event_rows: &[fsqlite::Row],
+    segment_rows: &[fsqlite::Row],
 ) -> FwResult<StoredRunDetails> {
     let run_id = value_to_string(run_row.get(0));
     let started_at_rfc3339 = value_to_string(run_row.get(1));
     let finished_at_rfc3339 = value_to_string(run_row.get(2));
-    let backend = parse_backend(&value_to_string(run_row.get(3)));
+    let backend_text = value_to_string(run_row.get(3));
     let result_json = value_to_string(run_row.get(4));
     let warnings_json = value_to_string(run_row.get(5));
     let transcript_fallback = value_to_string(run_row.get(6));
@@ -2238,6 +3169,7 @@ fn assemble_run_details_batched(
     let result: TranscriptionResult = serde_json::from_str(&result_json).map_err(|error| {
         FwError::Storage(format!("invalid result_json for run {run_id}: {error}"))
     })?;
+    let backend = validate_stored_backend_coherence(&run_id, &backend_text, result.backend)?;
     validate_stored_result_contracts(&run_id, &result)?;
     let warnings =
         parse_required_json_field::<Vec<String>>("warnings_json", &run_id, &warnings_json)?;
@@ -2247,6 +3179,11 @@ fn assemble_run_details_batched(
         transcript_fallback
     } else {
         result.transcript.clone()
+    };
+    let segments = if backend == BackendKind::NativeListen {
+        parse_durable_segment_rows(&run_id, segment_rows, 1)?
+    } else {
+        result.segments
     };
 
     let events = event_rows
@@ -2286,7 +3223,7 @@ fn assemble_run_details_batched(
         finished_at_rfc3339,
         backend,
         transcript,
-        segments: result.segments,
+        segments,
         diarization: result.diarization,
         projection_timeline,
         events,
@@ -2493,13 +3430,10 @@ fn value_to_i64(value: Option<&SqliteValue>) -> i64 {
     }
 }
 
-fn parse_backend(value: &str) -> BackendKind {
-    match value {
-        "whisper_cpp" => BackendKind::WhisperCpp,
-        "insanely_fast" => BackendKind::InsanelyFast,
-        "whisper_diarization" => BackendKind::WhisperDiarization,
-        _ => BackendKind::Auto,
-    }
+fn storage_u64(value: u64, field: &str) -> FwResult<SqliteValue> {
+    i64::try_from(value)
+        .map(SqliteValue::Integer)
+        .map_err(|_| FwError::Storage(format!("{field} exceeds SQLite INTEGER range")))
 }
 
 fn is_busy_storage_error(error: &FwError) -> bool {
@@ -2530,10 +3464,44 @@ fn optional_float(value: Option<f64>) -> SqliteValue {
     }
 }
 
-fn storage_u64(value: u64, field: &str) -> FwResult<SqliteValue> {
-    i64::try_from(value)
-        .map(SqliteValue::Integer)
-        .map_err(|_| FwError::Storage(format!("{field} exceeds SQLite INTEGER range")))
+fn parse_stored_backend(run_id: &str, value: &str) -> FwResult<BackendKind> {
+    match value {
+        "auto" => Ok(BackendKind::Auto),
+        "whisper_cpp" => Ok(BackendKind::WhisperCpp),
+        "insanely_fast" => Ok(BackendKind::InsanelyFast),
+        "whisper_diarization" => Ok(BackendKind::WhisperDiarization),
+        "native-listen" => Ok(BackendKind::NativeListen),
+        _ => Err(FwError::Storage(format!(
+            "invalid backend for run {run_id}: unknown runs.backend value {value:?}"
+        ))),
+    }
+}
+
+fn validate_stored_backend_coherence(
+    run_id: &str,
+    stored_backend: &str,
+    result_backend: BackendKind,
+) -> FwResult<BackendKind> {
+    let backend = parse_stored_backend(run_id, stored_backend)?;
+    if backend != result_backend {
+        return Err(FwError::Storage(format!(
+            "backend mismatch for run {run_id}: runs.backend={stored_backend:?}, \
+             result_json.backend={:?}",
+            result_backend.as_str()
+        )));
+    }
+    Ok(backend)
+}
+
+pub(crate) fn validate_run_backend_json(
+    run_id: &str,
+    stored_backend: &str,
+    result_json: &str,
+) -> FwResult<BackendKind> {
+    let result: TranscriptionResult = serde_json::from_str(result_json).map_err(|error| {
+        FwError::Storage(format!("invalid result_json for run {run_id}: {error}"))
+    })?;
+    validate_stored_backend_coherence(run_id, stored_backend, result.backend)
 }
 
 fn storage_index(value: usize, field: &str) -> FwResult<SqliteValue> {
@@ -2584,6 +3552,11 @@ fn parse_optional_acceleration_json(
 fn next_persist_savepoint_name() -> String {
     let id = PERSIST_SAVEPOINT_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("fw_persist_{id}")
+}
+
+fn next_read_snapshot_name() -> String {
+    let id = READ_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("fw_read_snapshot_{id}")
 }
 
 fn rollback_savepoint(connection: &BlockingConnection, savepoint_name: &str) -> FwResult<()> {
@@ -2650,7 +3623,7 @@ mod tests {
 
     use fsqlite_types::value::SqliteValue;
 
-    use crate::error::FwError;
+    use crate::error::{FwError, FwResult};
     use crate::model::{
         AccelerationBackend, AccelerationReport, BackendKind, BackendParams, DiarizationEngine,
         DiarizationFallbackStatus, DiarizationOperationalPartitionMethod,
@@ -2663,10 +3636,80 @@ mod tests {
         SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin, SpeakerCountRange,
         SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
         SpeakerEvidenceSummary, SpeakerHintDisposition, SpeakerHintEvidenceSummary,
-        SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
+        SpeakerProfileSummary, StoredRunDetails, TranscribeRequest, TranscriptionResult,
+        TranscriptionSegment,
     };
 
-    use super::{BlockingConnection, RunStore, stored_projection_timeline, value_to_string};
+    use super::{
+        BlockingConnection, ListenRunOpen, ListenSegmentRow, RunStore, stored_projection_timeline,
+        value_to_i64, value_to_string,
+    };
+
+    #[test]
+    fn runtime_context_storage_executes_sql_without_regranting_caller_caps() {
+        use asupersync::{Budget, Cx, cx::cap, runtime::RuntimeBuilder, runtime::SpawnError};
+
+        assert!(Cx::current().is_none());
+        let runtime = RuntimeBuilder::new().worker_threads(1).build().unwrap();
+        let parent = runtime.request_cx_with_budget(Budget::INFINITE.with_cost_quota(17));
+        {
+            let _parent = Cx::set_current(Some(parent.clone()));
+            {
+                let _restricted = parent.restrict::<cap::None>().set_current_restricted();
+                super::block_on(async {
+                    let cx = Cx::current().expect("storage kept its caller");
+                    assert_eq!(cx.task_id(), parent.task_id());
+                    assert_eq!(cx.budget(), parent.budget());
+                    assert!(!cx.capabilities().spawn);
+                    assert!(matches!(
+                        cx.spawn_blocking(|_| 42),
+                        Err(SpawnError::RuntimeUnavailable)
+                    ));
+                })
+                .unwrap();
+                let connection = BlockingConnection::open(":memory:").unwrap();
+                connection
+                    .execute("CREATE TABLE caller_values (value INTEGER)")
+                    .unwrap();
+                connection
+                    .execute_with_params(
+                        "INSERT INTO caller_values VALUES (?)",
+                        &[SqliteValue::Integer(42)],
+                    )
+                    .unwrap();
+                let rows = connection.query("SELECT value FROM caller_values").unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(42)));
+                assert!(!Cx::current().unwrap().capabilities().spawn);
+                assert_eq!(Cx::current().unwrap().task_id(), parent.task_id());
+            }
+            assert_eq!(Cx::current().unwrap().capabilities(), parent.capabilities());
+            assert!(Cx::current().unwrap().checkpoint().is_ok());
+        }
+        assert!(Cx::current().is_none());
+    }
+
+    /// bd-c376: storage works on a thread whose stack is far smaller than the
+    /// fsqlite statement chain (1.75 MB in a debug build, measured): each
+    /// statement is polled with `STORAGE_POLL_STACK_RED_ZONE_BYTES` of stack,
+    /// on a heap segment when the thread itself is short. Without that guard
+    /// this thread overflows its stack and aborts the test binary.
+    #[test]
+    fn storage_statements_run_on_a_thread_with_a_small_stack() {
+        let dir = tempdir().expect("tempdir should be created");
+        let db_path = dir.path().join("small-stack.sqlite3");
+        let runs = std::thread::Builder::new()
+            .name("small-stack-storage".to_owned())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let store = RunStore::open(&db_path).expect("open the store on a small stack");
+                store.list_recent_runs(10).expect("query on a small stack")
+            })
+            .expect("spawn the small-stack thread")
+            .join()
+            .expect("the small-stack storage thread completed");
+        assert!(runs.is_empty());
+    }
 
     #[test]
     fn persists_and_lists_runs() {
@@ -2713,6 +3756,7 @@ mod tests {
                     pre_mass: Some(0.9),
                     post_mass: Some(1.0),
                     notes: vec!["normalized with frankentorch".to_owned()],
+                    raw_confidences: Vec::new(),
                 }),
                 diarization: None,
                 raw_output: json!({"ok": true}),
@@ -2743,6 +3787,8 @@ mod tests {
                 backend_identity: Some("whisper-cli".to_owned()),
                 backend_version: Some("whisper 1.2.3".to_owned()),
                 output_payload_hash: Some("output-hash".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         };
 
@@ -2826,6 +3872,72 @@ mod tests {
             evidence: vec![],
             replay: crate::model::ReplayEnvelope::default(),
         }
+    }
+
+    fn live_history_snapshot_fixture(
+        db_path: &std::path::Path,
+        run_id: &str,
+    ) -> (RunStore, RunStore) {
+        let reader = RunStore::open(db_path).expect("reader store");
+        reader
+            .listen_open_run(&super::ListenRunOpen {
+                run_id,
+                started_at_rfc3339: "2026-08-27T12:00:00Z",
+                input_path: "stdin-pcm",
+                request_json: "{}",
+            })
+            .expect("open live history fixture");
+        reader
+            .listen_flush_utterance(
+                run_id,
+                &[super::ListenSegmentRow {
+                    idx: 0,
+                    start_sec: 0.0,
+                    end_sec: 1.0,
+                    text: "before".to_owned(),
+                }],
+                &[],
+                "before",
+                "2026-08-27T12:00:01Z",
+            )
+            .expect("persist initial utterance");
+        let writer = RunStore::open(db_path).expect("writer store");
+        (reader, writer)
+    }
+
+    fn append_live_history_snapshot_mutation(writer: &RunStore, run_id: &str) -> FwResult<()> {
+        writer.listen_flush_utterance(
+            run_id,
+            &[super::ListenSegmentRow {
+                idx: 1,
+                start_sec: 1.0,
+                end_sec: 2.0,
+                text: "after".to_owned(),
+            }],
+            &[super::ListenEventRow {
+                seq: 1,
+                ts_rfc3339: "2026-08-27T12:00:02Z".to_owned(),
+                code: "listen.snapshot.after".to_owned(),
+                payload_json: "{}".to_owned(),
+            }],
+            "before after",
+            "2026-08-27T12:00:02Z",
+        )
+    }
+
+    fn assert_pre_flush_history_snapshot(details: &StoredRunDetails) {
+        assert_eq!(details.transcript, "before");
+        assert_eq!(details.segments.len(), 1);
+        assert_eq!(details.segments[0].text, "before");
+        assert!(details.events.is_empty());
+    }
+
+    fn assert_post_flush_history_snapshot(details: &StoredRunDetails) {
+        assert_eq!(details.transcript, "before after");
+        assert_eq!(details.segments.len(), 2);
+        assert_eq!(details.segments[1].text, "after");
+        assert_eq!(details.events.len(), 1);
+        assert_eq!(details.events[0].code, "listen.snapshot.after");
     }
 
     fn attach_synthetic_diarization(report: &mut RunReport, persist_profiles: bool) {
@@ -3023,6 +4135,106 @@ mod tests {
         value_to_string(rows[0].get(0))
             .parse()
             .expect("row count should be an integer")
+    }
+
+    #[test]
+    fn default_sortformer_reports_survive_a_diarization_index_rebuild() {
+        // `auto` diarization (the default) writes Sortformer reports; the
+        // rebuild that JSONL import runs must accept them like the others.
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sortformer.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let mut report = minimal_report("run-sortformer-rebuild", &db_path);
+        report.request.diarize = true;
+        report.result.segments = vec![TranscriptionSegment {
+            start_sec: Some(0.0),
+            end_sec: Some(6.0),
+            text: "test".to_owned(),
+            speaker: Some("SPEAKER_00".to_owned()),
+            confidence: Some(0.9),
+        }];
+        report.result.diarization = Some(DiarizationReport {
+            implementation: "native-sortformer-v1".to_owned(),
+            contract_version: crate::diarization::SORTFORMER_DIARIZATION_CONTRACT_VERSION
+                .to_owned(),
+            feature_schema: "sortformer-activity-80ms-v1".to_owned(),
+            speaker_evidence_mode: crate::model::DiarizationSpeakerEvidenceMode::SortformerActivity,
+            normalized_input_sha256:
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+            hint_document_sha256: None,
+            turns: vec![DiarizationTurn {
+                start_ms: 0,
+                end_ms: 6_000,
+                speaker_ref: Some("SPEAKER_00".to_owned()),
+                speaker_confidence: Some(0.9),
+                change_confidence: None,
+                overlap_suspected: false,
+                hard_hint_attributed: false,
+            }],
+            profiles: vec![SpeakerProfileSummary {
+                speaker_ref: "SPEAKER_00".to_owned(),
+                frame_count: 75,
+                voiced_duration_ms: 6_000,
+                reliability: 0.9,
+                voice_profile_count: 1,
+                channel_profile_count: 0,
+                training_accepted_count: 1,
+                training_downweighted_count: 0,
+                training_quarantined_count: 0,
+                anchored: false,
+                soft_hint_contradiction: None,
+            }],
+            hint_evidence: Vec::new(),
+            speaker_queries: Vec::new(),
+            speaker_count: SpeakerCountOutcome {
+                request: SpeakerCountRequest::Infer,
+                estimate: None,
+                status: SpeakerCountOutcomeStatus::Unresolved,
+                supported_speaker_count: 1,
+                active_speaker_refs: vec!["SPEAKER_00".to_owned()],
+                dominant_speaker_share: 1.0,
+                unknown_voiced_share: 0.0,
+                reasons: vec![SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved],
+                speaker_evidence: vec![SpeakerEvidenceSummary {
+                    speaker_ref: "SPEAKER_00".to_owned(),
+                    assigned_tracklet_count: 1,
+                    independent_tracklet_count: 1,
+                    recurrence_episode_count: 1,
+                    voiced_frame_count: 75,
+                    independent_voiced_frame_count: 75,
+                    voiced_duration_ms: 6_000,
+                    mean_assignment_confidence: 0.9,
+                    profile_reliability: 0.9,
+                    hard_anchored: false,
+                    separated_from_supported_speakers: true,
+                    reasons: vec![SpeakerEvidenceReason::SupportedByLearnedModelActivity],
+                    supported: true,
+                }],
+            },
+            fallback_status: DiarizationFallbackStatus::SpeakerCountUnresolved,
+            operational_partition: None,
+            neural_representation: None,
+            speaker_segments: Vec::new(),
+            diagnostics: Vec::new(),
+        });
+        store
+            .persist_report(&report)
+            .expect("sortformer report persists");
+        assert_eq!(table_row_count(&store, "diarization_reports"), 1);
+
+        store
+            .rebuild_diarization_index()
+            .expect("rebuild accepts the default sortformer contract");
+        assert_eq!(table_row_count(&store, "diarization_reports"), 1);
+        assert_eq!(table_row_count(&store, "diarization_turns"), 1);
+        let loaded = store
+            .load_run_details("run-sortformer-rebuild")
+            .expect("load")
+            .expect("run");
+        assert_eq!(
+            loaded.diarization.expect("report").contract_version,
+            crate::diarization::SORTFORMER_DIARIZATION_CONTRACT_VERSION
+        );
     }
 
     #[test]
@@ -3846,22 +5058,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_backend_known_variants() {
-        use super::parse_backend;
-        assert_eq!(parse_backend("whisper_cpp"), BackendKind::WhisperCpp);
-        assert_eq!(parse_backend("insanely_fast"), BackendKind::InsanelyFast);
+    fn parse_stored_backend_known_variants() {
+        use super::parse_stored_backend;
         assert_eq!(
-            parse_backend("whisper_diarization"),
+            parse_stored_backend("run-known", "whisper_cpp").expect("whisper_cpp"),
+            BackendKind::WhisperCpp
+        );
+        assert_eq!(
+            parse_stored_backend("run-known", "insanely_fast").expect("insanely_fast"),
+            BackendKind::InsanelyFast
+        );
+        assert_eq!(
+            parse_stored_backend("run-known", "whisper_diarization").expect("whisper_diarization"),
             BackendKind::WhisperDiarization
         );
     }
 
     #[test]
-    fn parse_backend_unknown_falls_back_to_auto() {
-        use super::parse_backend;
-        assert_eq!(parse_backend("unknown_backend"), BackendKind::Auto);
-        assert_eq!(parse_backend(""), BackendKind::Auto);
-        assert_eq!(parse_backend("WhisperCpp"), BackendKind::Auto); // case sensitive
+    fn parse_stored_backend_unknown_is_rejected_with_run_id() {
+        use super::parse_stored_backend;
+        for invalid in ["unknown_backend", "", "WhisperCpp"] {
+            let error = parse_stored_backend("run-unknown", invalid)
+                .expect_err("unknown backend must fail closed");
+            let message = error.to_string();
+            assert!(message.contains("run-unknown"), "missing run id: {message}");
+            assert!(message.contains(invalid), "missing backend: {message}");
+        }
     }
 
     #[test]
@@ -4124,6 +5346,28 @@ mod tests {
                 serde_json::to_string(&batched[i]).expect("ser batched"),
                 serde_json::to_string(&per_run).expect("ser per-run"),
                 "batched run `{id}` must byte-match the per-run loader"
+            );
+        }
+
+        let duplicate_ids = vec![
+            "batch-c".to_owned(),
+            "batch-a".to_owned(),
+            "batch-b".to_owned(),
+            "batch-a".to_owned(),
+        ];
+        let duplicated = store
+            .load_run_details_batch(&duplicate_ids)
+            .expect("batch load with duplicate run ids");
+        assert_eq!(duplicated.len(), duplicate_ids.len());
+        for (details, id) in duplicated.iter().zip(&duplicate_ids) {
+            let per_run = store
+                .load_run_details(id)
+                .expect("per-run duplicate load")
+                .expect("duplicate run exists");
+            assert_eq!(
+                serde_json::to_string(details).expect("serialize duplicate batched details"),
+                serde_json::to_string(&per_run).expect("serialize duplicate per-run details"),
+                "every occurrence of duplicate run `{id}` must byte-match the per-run loader"
             );
         }
     }
@@ -4461,6 +5705,8 @@ mod tests {
             backend_identity: Some("whisper-cli".to_owned()),
             backend_version: Some("whisper 1.7.2".to_owned()),
             output_payload_hash: Some("sha256_def456".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         store.persist_report(&report).expect("persist");
 
@@ -4590,17 +5836,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_backend_with_whitespace_falls_back_to_auto() {
-        use super::parse_backend;
-        assert_eq!(parse_backend(" whisper_cpp "), BackendKind::Auto);
-        assert_eq!(parse_backend(""), BackendKind::Auto);
+    fn parse_stored_backend_rejects_whitespace() {
+        use super::parse_stored_backend;
+        assert!(parse_stored_backend("run-ws", " whisper_cpp ").is_err());
+        assert!(parse_stored_backend("run-ws", "").is_err());
     }
 
     #[test]
-    fn parse_backend_case_sensitive() {
-        use super::parse_backend;
-        assert_eq!(parse_backend("Whisper_Cpp"), BackendKind::Auto);
-        assert_eq!(parse_backend("INSANELY_FAST"), BackendKind::Auto);
+    fn parse_stored_backend_is_case_sensitive() {
+        use super::parse_stored_backend;
+        assert!(parse_stored_backend("run-case", "Whisper_Cpp").is_err());
+        assert!(parse_stored_backend("run-case", "INSANELY_FAST").is_err());
     }
 
     #[test]
@@ -4684,6 +5930,7 @@ mod tests {
             pre_mass: Some(0.95),
             post_mass: Some(0.98),
             notes: vec!["test acceleration".to_owned()],
+            raw_confidences: vec![Some(0.91), None],
         });
         store.persist_report(&report).expect("persist");
 
@@ -4698,6 +5945,11 @@ mod tests {
         assert_eq!(accel.pre_mass, Some(0.95));
         assert_eq!(accel.post_mass, Some(0.98));
         assert_eq!(accel.notes, vec!["test acceleration".to_owned()]);
+        assert_eq!(
+            accel.raw_confidences,
+            vec![Some(0.91), None],
+            "raw confidences persist with the acceleration report"
+        );
     }
 
     #[test]
@@ -5786,6 +7038,415 @@ mod tests {
     }
 
     #[test]
+    fn native_listen_detail_loaders_return_ordered_durable_segments_before_close() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("listen_history.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let run_id = "listen-history-1";
+
+        store
+            .listen_open_run(&ListenRunOpen {
+                run_id,
+                started_at_rfc3339: "2026-08-27T07:00:00Z",
+                input_path: "stdin-pcm",
+                request_json: "{}",
+            })
+            .expect("open live run");
+        store
+            .listen_flush_utterance(
+                run_id,
+                &[
+                    ListenSegmentRow {
+                        idx: 2,
+                        start_sec: 2.0,
+                        end_sec: 3.25,
+                        text: "third".to_owned(),
+                    },
+                    ListenSegmentRow {
+                        idx: 0,
+                        start_sec: 0.0,
+                        end_sec: 0.75,
+                        text: "first".to_owned(),
+                    },
+                    ListenSegmentRow {
+                        idx: 1,
+                        start_sec: 0.75,
+                        end_sec: 2.0,
+                        text: "second".to_owned(),
+                    },
+                ],
+                &[],
+                "first second third",
+                "2026-08-27T07:00:03Z",
+            )
+            .expect("flush live utterance");
+
+        let expected = vec![
+            TranscriptionSegment {
+                start_sec: Some(0.0),
+                end_sec: Some(0.75),
+                text: "first".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+            TranscriptionSegment {
+                start_sec: Some(0.75),
+                end_sec: Some(2.0),
+                text: "second".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+            TranscriptionSegment {
+                start_sec: Some(2.0),
+                end_sec: Some(3.25),
+                text: "third".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+        ];
+
+        let single = store
+            .load_run_details(run_id)
+            .expect("load single details")
+            .expect("live run exists before close");
+        assert_eq!(single.backend, BackendKind::NativeListen);
+        assert_eq!(single.transcript, "first second third");
+        assert_eq!(single.segments, expected);
+
+        let batch = store
+            .load_run_details_batch(&[run_id.to_owned()])
+            .expect("load batched details");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].backend, BackendKind::NativeListen);
+        assert_eq!(batch[0].transcript, "first second third");
+        assert_eq!(batch[0].segments, expected);
+
+        let duplicate_batch = store
+            .load_run_details_batch(&[run_id.to_owned(), run_id.to_owned()])
+            .expect("load duplicate native-listen details");
+        assert_eq!(duplicate_batch.len(), 2);
+        for details in duplicate_batch {
+            assert_eq!(details.backend, BackendKind::NativeListen);
+            assert_eq!(details.transcript, "first second third");
+            assert_eq!(details.segments, expected);
+        }
+    }
+
+    #[test]
+    fn detail_loaders_reject_parent_result_backend_mismatch_before_segment_routing() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("backend_coherence.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let listen_run_id = "listen-parent-mislabeled-whisper";
+        let whisper_run_id = "whisper-parent-mislabeled-listen";
+
+        store
+            .listen_open_run(&ListenRunOpen {
+                run_id: listen_run_id,
+                started_at_rfc3339: "2026-08-27T07:10:00Z",
+                input_path: "stdin-pcm",
+                request_json: "{}",
+            })
+            .expect("open live run");
+        store
+            .listen_flush_utterance(
+                listen_run_id,
+                &[ListenSegmentRow {
+                    idx: 0,
+                    start_sec: 0.0,
+                    end_sec: 1.0,
+                    text: "durable listen segment".to_owned(),
+                }],
+                &[],
+                "durable listen segment",
+                "2026-08-27T07:10:01Z",
+            )
+            .expect("flush live utterance");
+
+        let mut whisper_report = minimal_report(whisper_run_id, &db_path);
+        whisper_report.result.segments = vec![TranscriptionSegment {
+            start_sec: Some(0.0),
+            end_sec: Some(1.0),
+            text: "embedded whisper segment".to_owned(),
+            speaker: None,
+            confidence: None,
+        }];
+        store
+            .persist_report(&whisper_report)
+            .expect("persist whisper run");
+
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
+        conn.execute_with_params(
+            "UPDATE runs SET backend = 'whisper_cpp' WHERE id = ?1",
+            &[SqliteValue::Text(listen_run_id.to_owned().into())],
+        )
+        .expect("mislabel native-listen parent");
+        conn.execute_with_params(
+            "UPDATE runs SET backend = 'native-listen' WHERE id = ?1",
+            &[SqliteValue::Text(whisper_run_id.to_owned().into())],
+        )
+        .expect("mislabel whisper parent");
+
+        for run_id in [listen_run_id, whisper_run_id] {
+            let single_error = store
+                .load_run_details(run_id)
+                .expect_err("single loader must reject backend mismatch");
+            assert!(
+                single_error.to_string().contains(run_id),
+                "single-loader error omitted run id: {single_error}"
+            );
+
+            let batch_error = store
+                .load_run_details_batch_with_configuration(
+                    &[run_id.to_owned()],
+                    true,
+                    |_| {},
+                    || Ok(()),
+                )
+                .expect_err("batched loader must reject backend mismatch");
+            let batch_message = batch_error.to_string();
+            assert!(
+                batch_message.contains(run_id),
+                "batch-loader error omitted run id: {batch_message}"
+            );
+            assert!(
+                batch_message.contains("backend mismatch"),
+                "unexpected batch-loader error: {batch_message}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_history_details_hold_one_snapshot_across_parent_and_children() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("single_history_snapshot.sqlite3");
+        let run_id = "single-history-snapshot";
+        let (reader, writer) = live_history_snapshot_fixture(&db_path, run_id);
+
+        let details = reader
+            .load_run_details_with_after_run_row(run_id, || {
+                append_live_history_snapshot_mutation(&writer, run_id)
+            })
+            .expect("snapshot load")
+            .expect("live run");
+        assert_pre_flush_history_snapshot(&details);
+
+        let fresh = reader
+            .load_run_details(run_id)
+            .expect("fresh load")
+            .expect("live run after flush");
+        assert_post_flush_history_snapshot(&fresh);
+    }
+
+    #[test]
+    fn latest_history_details_hold_one_snapshot_from_id_through_children() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("latest_history_snapshot.sqlite3");
+        let run_id = "latest-history-snapshot";
+        let (reader, writer) = live_history_snapshot_fixture(&db_path, run_id);
+
+        let details = reader
+            .load_latest_run_details_cancellable_with_after_id(None, || {
+                append_live_history_snapshot_mutation(&writer, run_id)
+            })
+            .expect("latest snapshot load")
+            .expect("latest live run");
+        assert_pre_flush_history_snapshot(&details);
+
+        let fresh = reader
+            .load_latest_run_details()
+            .expect("fresh latest load")
+            .expect("latest live run after flush");
+        assert_post_flush_history_snapshot(&fresh);
+    }
+
+    #[test]
+    fn batch_history_details_hold_one_snapshot_across_parent_and_children() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("batch_history_snapshot.sqlite3");
+        let run_id = "batch-history-snapshot";
+        let (reader, writer) = live_history_snapshot_fixture(&db_path, run_id);
+
+        let details = reader
+            .load_run_details_batch_with_after_run_rows(&[run_id.to_owned()], || {
+                append_live_history_snapshot_mutation(&writer, run_id)
+            })
+            .expect("batch snapshot load");
+        assert_eq!(details.len(), 1);
+        assert_pre_flush_history_snapshot(&details[0]);
+
+        let fresh = reader
+            .load_run_details_batch(&[run_id.to_owned()])
+            .expect("fresh batch load");
+        assert_eq!(fresh.len(), 1);
+        assert_post_flush_history_snapshot(&fresh[0]);
+    }
+
+    #[test]
+    fn batch_history_kill_switch_holds_one_snapshot_across_runs() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("batch_history_fallback_snapshot.sqlite3");
+        let run_id = "batch-history-fallback-snapshot";
+        let (reader, writer) = live_history_snapshot_fixture(&db_path, run_id);
+
+        let mut run_query_count = 0usize;
+        let details = reader
+            .load_run_details_batch_with_configuration(
+                &[run_id.to_owned()],
+                false,
+                |_| run_query_count += 1,
+                || append_live_history_snapshot_mutation(&writer, run_id),
+            )
+            .expect("fallback snapshot load");
+        assert_eq!(run_query_count, 0);
+        assert_eq!(details.len(), 1);
+        assert_pre_flush_history_snapshot(&details[0]);
+
+        let fresh = reader
+            .load_run_details(run_id)
+            .expect("fresh fallback load")
+            .expect("live run after fallback snapshot");
+        assert_post_flush_history_snapshot(&fresh);
+    }
+
+    #[test]
+    fn recent_history_details_hold_one_snapshot_from_list_through_children() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("recent_history_snapshot.sqlite3");
+        let run_id = "recent-history-snapshot";
+        let (reader, writer) = live_history_snapshot_fixture(&db_path, run_id);
+
+        let details = reader
+            .load_recent_run_details_with_after_summaries(10, || {
+                append_live_history_snapshot_mutation(&writer, run_id)
+            })
+            .expect("recent snapshot load");
+        assert_eq!(details.len(), 1);
+        assert_pre_flush_history_snapshot(&details[0]);
+
+        let fresh = reader
+            .load_recent_run_details(10)
+            .expect("fresh recent load");
+        assert_eq!(fresh.len(), 1);
+        assert_post_flush_history_snapshot(&fresh[0]);
+    }
+
+    #[test]
+    fn batch_history_deduplicates_more_ids_than_the_sql_parameter_limit() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("batch_history_parameter_limit.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let run_id = "batch-history-repeated";
+        store
+            .persist_report(&minimal_report(run_id, &db_path))
+            .expect("persist report");
+
+        let run_ids = vec![run_id.to_owned(); 32_767];
+        let mut run_query_sizes = Vec::new();
+        let details = store
+            .load_run_details_batch_with_configuration(
+                &run_ids,
+                true,
+                |parameter_count| run_query_sizes.push(parameter_count),
+                || Ok(()),
+            )
+            .expect("deduplicated batch load");
+        assert_eq!(run_query_sizes, vec![1]);
+        assert_eq!(details.len(), run_ids.len());
+        assert!(details.iter().all(|details| details.run_id == run_id));
+    }
+
+    #[test]
+    fn batch_history_chunks_unique_ids_below_the_sql_parameter_limit() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("batch_history_unique_parameter_limit.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let run_ids = (0..32_767)
+            .map(|index| format!("missing-history-run-{index}"))
+            .collect::<Vec<_>>();
+
+        let mut run_query_sizes = Vec::new();
+        let details = store
+            .load_run_details_batch_with_configuration(
+                &run_ids,
+                true,
+                |parameter_count| run_query_sizes.push(parameter_count),
+                || Ok(()),
+            )
+            .expect("chunked batch load");
+        assert_eq!(run_query_sizes, vec![32_000, 767]);
+        assert!(details.is_empty());
+    }
+
+    #[test]
+    fn history_read_snapshots_nest_inside_an_active_session() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("nested_history_snapshot.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let run_id = "nested-history-snapshot";
+        store
+            .persist_report(&minimal_report(run_id, &db_path))
+            .expect("persist report");
+
+        let session = store
+            .begin_concurrent_session("history_snapshot")
+            .expect("begin outer session");
+        let details = store
+            .load_run_details(run_id)
+            .expect("nested history load")
+            .expect("persisted run");
+        assert_eq!(details.run_id, run_id);
+        session.commit().expect("commit outer session");
+    }
+
+    #[test]
+    fn native_listen_detail_loaders_reject_invalid_durable_segment_index() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("listen_history_invalid_segment.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let run_id = "listen-history-invalid-segment";
+
+        store
+            .listen_open_run(&ListenRunOpen {
+                run_id,
+                started_at_rfc3339: "2026-08-27T07:05:00Z",
+                input_path: "stdin-pcm",
+                request_json: "{}",
+            })
+            .expect("open live run");
+
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
+        conn.execute_with_params(
+            "INSERT INTO segments (run_id, idx, start_sec, end_sec, speaker, text, confidence) \
+             VALUES (?1, -1, 0.0, 1.0, NULL, 'corrupt', NULL)",
+            &[SqliteValue::Text(run_id.to_owned().into())],
+        )
+        .expect("insert corrupt durable segment");
+
+        let single_error = store
+            .load_run_details(run_id)
+            .expect_err("single loader must reject corrupt durable segment");
+        assert!(
+            single_error
+                .to_string()
+                .contains("invalid durable segment index -1"),
+            "unexpected single-loader error: {single_error}"
+        );
+
+        let batch_error = store
+            .load_run_details_batch(&[run_id.to_owned()])
+            .expect_err("batch loader must reject corrupt durable segment");
+        assert!(
+            batch_error
+                .to_string()
+                .contains("invalid durable segment index -1"),
+            "unexpected batch-loader error: {batch_error}"
+        );
+    }
+
+    #[test]
     fn segments_loaded_from_result_json_not_segments_table() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("seg_source.sqlite3");
@@ -5816,6 +7477,17 @@ mod tests {
             .expect("exists");
         assert_eq!(details.segments.len(), 1, "segments come from result_json");
         assert_eq!(details.segments[0].text, "from json");
+
+        let batch = store
+            .load_run_details_batch(&["run-segsrc".to_owned()])
+            .expect("batch query");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].segments.len(),
+            1,
+            "ordinary batched history must keep using result_json"
+        );
+        assert_eq!(batch[0].segments[0].text, "from json");
     }
 
     #[test]
@@ -5844,6 +7516,58 @@ mod tests {
             .expect("exists");
         assert_eq!(latest.run_id, "run-late-first");
         assert_eq!(latest.transcript, "late run");
+    }
+
+    /// bd-9otn: valid RFC3339 spellings whose text order disagrees with their
+    /// instant order must still list and select chronologically.
+    #[test]
+    fn recent_and_latest_order_by_rfc3339_instant_not_text_spelling() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("instant_order.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+
+        // As text, "not-a-time" sorts above every digit-led spelling and the
+        // +02:00 spelling (instant 10:30Z) sorts above 11:00Z. By instant the
+        // order is 11:00Z, 10:30Z, 10:15:00.5Z, 10:15:00Z, then the
+        // unparseable spelling last.
+        for (run_id, started_at) in [
+            ("run-offset", "2026-03-01T12:30:00+02:00"),
+            ("run-fraction", "2026-03-01T10:15:00.5Z"),
+            ("run-plain", "2026-03-01T10:15:00Z"),
+            ("run-latest-utc", "2026-03-01T11:00:00Z"),
+            ("run-garbage", "not-a-time"),
+        ] {
+            let mut report = minimal_report(run_id, &db_path);
+            report.started_at_rfc3339 = started_at.to_owned();
+            store.persist_report(&report).expect("persist");
+        }
+
+        let listed: Vec<String> = store
+            .list_recent_runs(0)
+            .expect("list")
+            .into_iter()
+            .map(|summary| summary.run_id)
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "run-latest-utc",
+                "run-offset",
+                "run-fraction",
+                "run-plain",
+                "run-garbage"
+            ]
+        );
+        // Stored spellings are preserved verbatim.
+        let first_two = store.list_recent_runs(2).expect("list two");
+        assert_eq!(first_two.len(), 2);
+        assert_eq!(first_two[1].started_at_rfc3339, "2026-03-01T12:30:00+02:00");
+
+        let latest = store
+            .load_latest_run_details()
+            .expect("query")
+            .expect("exists");
+        assert_eq!(latest.run_id, "run-latest-utc");
     }
 
     #[test]
@@ -6090,6 +7814,219 @@ mod tests {
             .expect("should exist");
         assert_eq!(details.run_id, "run-old");
         assert_eq!(details.transcript, "hello");
+        let mutation_rows = store
+            .connection
+            .query(
+                "SELECT mutation_seq FROM sync_run_mutations \
+                 WHERE run_id = 'run-old'",
+            )
+            .expect("query migrated mutation authority");
+        assert_eq!(
+            mutation_rows.len(),
+            1,
+            "v6 migration must backfill every pre-existing run"
+        );
+    }
+
+    #[test]
+    fn fresh_schema_installs_all_sync_mutation_triggers() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sync_mutation_schema.sqlite3");
+        let store = RunStore::open(&db_path).expect("open");
+
+        let table = store
+            .connection
+            .query(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'sync_run_mutations'",
+            )
+            .expect("query mutation table");
+        assert_eq!(table.len(), 1, "mutation authority table must exist");
+
+        let triggers = store
+            .connection
+            .query(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'trigger' AND name LIKE 'fw_sync_%' ORDER BY name",
+            )
+            .expect("query mutation triggers");
+        assert_eq!(
+            triggers.len(),
+            9,
+            "runs, segments, and events each require insert/update/delete triggers"
+        );
+
+        let identity_rows = store
+            .connection
+            .query("SELECT value FROM _meta WHERE key = 'sync_database_id'")
+            .expect("query sync database identity");
+        assert_eq!(identity_rows.len(), 1, "database identity must be unique");
+        let database_id = value_to_string(identity_rows[0].get(0));
+        uuid::Uuid::parse_str(&database_id).expect("database identity must be a UUID");
+        drop(store);
+
+        let reopened = RunStore::open(&db_path).expect("reopen");
+        let reopened_rows = reopened
+            .connection
+            .query("SELECT value FROM _meta WHERE key = 'sync_database_id'")
+            .expect("query reopened database identity");
+        assert_eq!(
+            value_to_string(reopened_rows[0].get(0)),
+            database_id,
+            "database identity must remain stable across restart"
+        );
+    }
+
+    #[test]
+    fn sync_mutation_migration_rejects_malformed_existing_database_identity() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("malformed_sync_identity.sqlite3");
+        let store = RunStore::open(&db_path).expect("open current schema");
+        store
+            .connection
+            .execute(
+                "UPDATE _meta SET value = '5' WHERE key = 'schema_version'; \
+                 UPDATE _meta SET value = 'not-a-uuid' WHERE key = 'sync_database_id';",
+            )
+            .expect("prepare malformed v5 metadata");
+        drop(store);
+
+        let error = RunStore::open(&db_path)
+            .expect_err("malformed sync identity must block the v6 migration");
+        assert!(
+            error
+                .to_string()
+                .contains("v6 identity migration failed: invalid sync_database_id"),
+            "unexpected malformed identity error: {error}"
+        );
+
+        let connection = BlockingConnection::open(db_path.display().to_string())
+            .expect("inspect failed migration");
+        let version_rows = connection
+            .query("SELECT value FROM _meta WHERE key = 'schema_version';")
+            .expect("query retained schema version");
+        assert_eq!(
+            value_to_string(version_rows[0].get(0)),
+            "5",
+            "failed identity validation must not publish schema version 6"
+        );
+    }
+
+    #[test]
+    fn current_schema_rejects_missing_database_identity() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing_sync_identity.sqlite3");
+        let store = RunStore::open(&db_path).expect("open current schema");
+        store
+            .connection
+            .execute("DELETE FROM _meta WHERE key = 'sync_database_id';")
+            .expect("remove identity");
+        drop(store);
+
+        let error =
+            RunStore::open(&db_path).expect_err("schema v6 without an identity must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("database schema v6 is missing sync_database_id"),
+            "unexpected missing identity error: {error}"
+        );
+    }
+
+    #[test]
+    fn sync_mutation_sequence_tracks_aggregate_changes_and_rollbacks() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sync_mutation_changes.sqlite3");
+        let store = RunStore::open(&db_path).expect("open");
+        store
+            .persist_report(&minimal_report("mutation-run", &db_path))
+            .expect("persist parent");
+
+        let mutation_seq = || {
+            store
+                .connection
+                .query(
+                    "SELECT mutation_seq FROM sync_run_mutations \
+                     WHERE run_id = 'mutation-run'",
+                )
+                .expect("query mutation sequence")
+                .first()
+                .map(|row| value_to_i64(row.get(0)))
+                .expect("mutation sequence row")
+        };
+
+        let inserted = mutation_seq();
+        store
+            .connection
+            .execute("UPDATE runs SET transcript = 'revised' WHERE id = 'mutation-run'")
+            .expect("update parent");
+        let parent_updated = mutation_seq();
+        assert!(parent_updated > inserted);
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO segments \
+                 (run_id, idx, start_sec, end_sec, speaker, text, confidence) \
+                 VALUES ('mutation-run', 0, 0.0, 1.0, NULL, 'segment', NULL)",
+            )
+            .expect("insert segment");
+        let segment_inserted = mutation_seq();
+        assert!(segment_inserted > parent_updated);
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO events \
+                 (run_id, seq, ts_rfc3339, stage, code, message, payload_json) \
+                 VALUES ('mutation-run', 1, '2026-01-01T00:00:01Z', \
+                 'test', 'test.event', 'event', '{}')",
+            )
+            .expect("insert event");
+        let event_inserted = mutation_seq();
+        assert!(event_inserted > segment_inserted);
+
+        store
+            .connection
+            .execute("BEGIN")
+            .expect("begin rollback probe");
+        store
+            .connection
+            .execute("UPDATE segments SET text = 'rolled back' WHERE run_id = 'mutation-run'")
+            .expect("update inside transaction");
+        assert!(mutation_seq() > event_inserted);
+        store
+            .connection
+            .execute("ROLLBACK")
+            .expect("rollback mutation");
+        assert_eq!(
+            mutation_seq(),
+            event_inserted,
+            "a rolled-back child update must not advance the visible cursor authority"
+        );
+
+        store
+            .connection
+            .execute("DELETE FROM runs WHERE id = 'mutation-run'")
+            .expect("delete parent");
+        let rows = store
+            .connection
+            .query(
+                "SELECT mutation_seq FROM sync_run_mutations \
+                 WHERE run_id = 'mutation-run'",
+            )
+            .expect("query delete tombstone");
+        assert_eq!(
+            rows.len(),
+            1,
+            "parent deletion must retain its high-water mark"
+        );
+        assert!(value_to_i64(rows[0].get(0)) > event_inserted);
+        let count = store
+            .connection
+            .query("SELECT COUNT(*) FROM sync_run_mutations")
+            .expect("count bounded mutation rows");
+        assert_eq!(value_to_i64(count[0].get(0)), 1);
     }
 
     #[test]
@@ -6668,6 +8605,7 @@ mod tests {
                         "normalized via softmax".to_owned(),
                         "calibration applied".to_owned(),
                     ],
+                    raw_confidences: Vec::new(),
                 }),
                 diarization: None,
                 raw_output: json!({"model": "large-v3", "ok": true}),
@@ -6709,6 +8647,8 @@ mod tests {
                 backend_identity: Some("insanely-fast-whisper".to_owned()),
                 backend_version: Some("0.0.15".to_owned()),
                 output_payload_hash: Some("sha256_789xyz".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         }
     }
@@ -7852,8 +9792,8 @@ mod tests {
     fn schema_version_is_current() {
         assert_eq!(
             RunStore::SCHEMA_VERSION,
-            5,
-            "SCHEMA_VERSION should include typed speaker-count evidence"
+            6,
+            "SCHEMA_VERSION should include incremental-sync mutation authority"
         );
     }
 
@@ -8415,18 +10355,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_backend_all_known_and_unknown() {
-        use super::parse_backend;
-        assert_eq!(parse_backend("whisper_cpp"), BackendKind::WhisperCpp);
-        assert_eq!(parse_backend("insanely_fast"), BackendKind::InsanelyFast);
+    fn parse_stored_backend_accepts_auto_and_native_listen() {
+        use super::parse_stored_backend;
         assert_eq!(
-            parse_backend("whisper_diarization"),
-            BackendKind::WhisperDiarization
+            parse_stored_backend("run-auto", "auto").expect("auto"),
+            BackendKind::Auto
         );
-        // Unknown strings (including "auto") fall back to Auto.
-        assert_eq!(parse_backend("auto"), BackendKind::Auto);
-        assert_eq!(parse_backend("something_else"), BackendKind::Auto);
-        assert_eq!(parse_backend(""), BackendKind::Auto);
+        assert_eq!(
+            parse_stored_backend("run-listen", "native-listen").expect("native-listen"),
+            BackendKind::NativeListen
+        );
+        assert!(parse_stored_backend("run-invalid", "something_else").is_err());
     }
 
     // ── Task #212 — storage pass 2 edge-case tests ──────────────────
@@ -8617,6 +10556,7 @@ mod tests {
             pre_mass: Some(0.8),
             post_mass: Some(0.9),
             notes: vec!["test".to_owned()],
+            raw_confidences: Vec::new(),
         });
         store.persist_report(&report).expect("persist");
 
@@ -8654,6 +10594,7 @@ mod tests {
             pre_mass: Some(0.5),
             post_mass: Some(0.6),
             notes: vec!["original".to_owned()],
+            raw_confidences: Vec::new(),
         });
         store.persist_report(&report).expect("persist");
 
@@ -8665,6 +10606,7 @@ mod tests {
             pre_mass: Some(0.99),
             post_mass: Some(1.0),
             notes: vec!["overridden".to_owned()],
+            raw_confidences: Vec::new(),
         };
         let override_json = serde_json::to_string(&override_accel).expect("ser");
         store
@@ -9324,6 +11266,11 @@ mod tests {
             )],
         )
         .expect("freeze schema version");
+        conn.execute(
+            "INSERT INTO _meta (key, value) VALUES \
+             ('sync_database_id', '00000000-0000-4000-8000-000000000001');",
+        )
+        .expect("satisfy current-schema identity guard");
         conn.execute_with_params(
             "INSERT INTO runs (id, started_at, finished_at, backend, input_path, \
              normalized_wav_path, request_json, result_json, warnings_json, transcript) \

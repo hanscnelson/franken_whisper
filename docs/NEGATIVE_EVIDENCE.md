@@ -4,6 +4,149 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-10-08 - **REVERSED — the default-on quality-safe encoder int8 (2026-07-10) fails its own 0.0 WER-delta budget on a 389-utterance corpus; default is f32 again, int8 is opt-in (bd-int8-encoder-mishears-m1q9, bd-2lmj).**
+
+The 2026-07-10 promotion ("RESOLVED prior encoder-int8 default-on blocker",
+below) rested on one live transcript gate, the 11 s JFK clip. Its "full paired
+fixture corpus (9/9): WER delta 0.0000" row is
+`whisper_cpp_full_paired_fixture_corpus_wer_delta_budget`, which compares
+committed JSON files in `tests/fixtures/golden/` (hand-written text such as
+"Hello world. This is a test of the whisper speech recognition system.") and
+never runs the encoder, so it is not WER evidence for any encoder arm. Do not
+cite it as such again.
+
+Recalibration `encoder-int8-calibration-2026-10-08` (same binary, int8 and f32
+forced by `FW_ENC_ATTN_OUT_I8I32`, 61 TTS narration lines + 328 LibriSpeech
+test-clean utterances, 7,659 words): turbo int8 195 vs f32 187 word errors
+(+0.00104), tiny.en 395 vs 389 (+0.00078). Full table, scoring and cost in
+`docs/planning/DISCREPANCIES.md` DISC-010 and `docs/PERF_LEDGER.md`. The
+per-layer quantization budgets still pass (turbo worst rel_rmse 0.0827), which
+shows that a weight-error budget does not bound transcript error.
+
+**Retry predicate:** an int8 encoder variant (or this one) earns the default
+back for a model only with a calibration row whose pooled WER delta is ≤ 0.0
+on a corpus at least this size that contains these 389 utterances, scored the
+same way; for turbo, also a language-ID check under int8 on a multilingual
+corpus (bd-2lmj). Partial variants are no shortcut: `FW_ENC_INT8_FC1` and
+`FW_ENC_INT8_ATTN_IN` already changed 19 and 7 of ~250 words on track01
+against f32 (2026-07-07 entries).
+
+## 2026-08-23 - CoralCoast (hz2 Zen worker): **MEASURED / CPU LEVERS MOOT — bd-cy9u TTY codec runs 147×(encode)/6022×(decode) realtime; wire bandwidth is the binding constraint, and an adaptive controller already exists.**
+
+Probe: `examples/bdcy9u_tty_throughput.rs` — full public paths over a 60 s
+8 kHz mono fixture with INCOMPRESSIBLE pseudo-noise payload (worst case for
+the zlib stage):
+
+| Metric | Measured |
+|---|---|
+| encode (ffmpeg mulaw head + zlib + b64 + crc32/sha256 + JSON framing) | 408 ms = **147× realtime** |
+| decode (parse + verify + decompress + reassemble) | 9 ms = **6022× realtime** |
+| wire bandwidth required | **98.6 kbit/s** worst case (speech compresses lower) |
+| roundtrip | mulaw payload intact |
+
+The bead's candidate levers (cache-friendly layout, branchless CRC/FEC,
+table-driven codec) target numbers already two orders of magnitude beyond
+what any TTY/PTY link consumes (~1× realtime at 10–100 kbit/s). The binding
+constraint on slow links is WIRE BANDWIDTH, which is the domain of the
+existing tested `AdaptiveBitrateController` (bd-2xe.3), plus the retransmit
+plan/policy machinery for loss. No codec change justified.
+
+AGENT_NAME=CoralCoast. Probe committed at examples/bdcy9u_tty_throughput.rs.
+
+## 2026-08-23 - CoralCoast (ovh-a Zen worker): **NOT REPRODUCED AS A GENERAL RESULT (re-measured 2026-10-09, below) — builtin symphonia normalization beat the ffmpeg subprocess 1.4–1.7× on this worker; with a same-invocation A/A null on another host the ordering depends on the CPU budget (bd-3nw3).**
+
+Head-to-head on a 600 s stereo 44.1 kHz MP3 (`sine+pink-noise mix, 192 kbps`,
+14.4 MB) → 16 kHz mono s16 WAV, release build, warm cache, 4 runs each
+(`examples/bd3nw3_normalize_probe.rs`, committed):
+
+| Variant | elapsed_ms per run |
+|---|---|
+| builtin symphonia decode+resample | 611 / 673 / 689 / 692 |
+| ffmpeg subprocess (forced via FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE=1) | 905 / 954 / 1050 / 1207 |
+
+Builtin wins every run (~1.4–1.7×), confirming the design bet that avoiding
+the subprocess dominates for common formats. Combined with today's earlier
+REJECTED entry (quantize/write lever < 0.1% of e2e) and the previously landed
+L16 SIMD resample probe, all named bd-3nw3 levers are now dispositioned:
+buffer-reuse/arena remainders are marginal against a ~0.7 s/file normalize
+that is itself dwarfed by transcription. Bead closed with this record.
+
+AGENT_NAME=CoralCoast.
+
+### 2026-10-09 re-measurement with a same-invocation A/A null (bd-preexisting-suite-failures-84di)
+
+This row was headed VERIFIED WIN, after the 2026-07-26 ledger write gate, on
+four separate runs per arm with no benchmark binary SHA-256 and no result
+class. The probe now interleaves the arms in one invocation
+(`examples/bd3nw3_normalize_probe.rs`, 11 rounds, arm order rotated every
+round; each timed run is a child process of the same binary timing
+`normalize_to_wav` alone). Release build; input regenerated to the same shape
+(600 s stereo 44.1 kHz sine + pink noise, 192 kbps MP3, 14.4 MB); a 64-core /
+128-thread AMD Threadripper PRO 5995WX Linux host at load average ~1;
+ffmpeg 8.0.1; CPU budget set with `taskset`.
+
+Benchmark binary SHA-256: `22cfe25fd06c75525dbc912349744254975d0db08c6fa0df6d71394e36430725`
+
+Result class: NON-CAMPAIGN / INFORMATIONAL.
+
+Arms: A = builtin, A' = builtin again (same-invocation A/A null), B = forced
+ffmpeg subprocess. Ratios are per round; CI95 is a percentile bootstrap of the
+median.
+
+| CPUs | A median | B median | Same-invocation A/A null A'/A | Candidate B/A | 2x null margin | Reading |
+|---|---|---|---|---|---|---|
+| 1 | 488.5 ms | 1077.5 ms | A/A median 1.0005, CI95 [0.9963, 1.0302] | median 2.1652, CI95 [2.0833, 2.1715] | [0.9396, 1.0604] | builtin faster |
+| 4 | 506.6 ms | 435.6 ms | A/A median 0.9992, CI95 [0.9792, 1.0279] | median 0.8811, CI95 [0.8567, 0.8921] | [0.9443, 1.0557] | ffmpeg faster |
+| 16 | 507.3 ms | 655.2 ms | A/A median 0.9916, CI95 [0.9813, 1.0437] | median 1.2917, CI95 [0.9305, 1.3501] | [0.9125, 1.0875] | undecidable |
+
+The builtin path wins when normalization has one CPU and loses at four, where
+ffmpeg's threaded pipeline overlaps decode and resample. The 1.4–1.7× above
+belongs to that worker and that ffmpeg build, not to the design. No code change
+follows from this row.
+
+## 2026-08-23 - CoralCoast (M4 Pro dev host / ovh-a worker): **REJECTED — bd-3nw3 f32→i16 quantize/write lever is sub-0.1% of e2e; do not optimize.**
+
+Probe: `examples/bd3nw3_write_probe.rs` (release, ovh-a Zen worker), 30 M samples
+(≈11.3 min of 44.1 kHz mono). Results:
+
+| Path | Time |
+|---|---|
+| quantize math alone (scalar, sanitize+clamp+scale+round) | 25.6 ms |
+| full `write_mono_wav_i16` (chunked hound writer) | **57.2 ms** |
+| pre-quantized Vec\<i16\> then hound-write | 86.9 ms (WORSE — extra pass + allocation) |
+
+The entire artifact-write stage is ~0.57 ms per minute of audio — noise against
+multi-second decode/transcribe stages. Pre-quantizing (the obvious "fix") makes
+it slower. The hound per-sample `write_sample` overhead is real (~31 ms) but
+bypassing hound's data-chunk writer would mean hand-building WAV chunks for a
+sub-millisecond win. Resample lever was already landed as the L16 SIMD probe;
+the remaining unexplored bd-3nw3 surface is DECODE-side (symphonia compressed
+decode dominates batch ingest), which is upstream-crate territory.
+
+AGENT_NAME=CoralCoast. Probe committed at examples/bd3nw3_write_probe.rs.
+
+### 2026-10-09 re-measurement with a same-invocation A/A null (bd-preexisting-suite-failures-84di)
+
+This rejection landed after the 2026-07-26 ledger write gate without the
+evidence that gate requires. The probe now interleaves the arms in one
+invocation (`examples/bd3nw3_write_probe.rs`, 21 rounds, arm order rotated
+every round; all arms wrote the same 60,000,044 bytes). Release build pinned
+to 4 CPUs of a 64-core / 128-thread AMD Threadripper PRO 5995WX Linux host at
+1-minute load average ~2.3.
+
+Benchmark binary SHA-256: `692f6d3a78ee7c7e97c8f3cccc16c5cc776880b66f0d8769d4dd68901ae7a5cd`
+
+| Arm | Median of 21 rounds |
+|---|---|
+| A: production chunked writer (quantize inside the chunk loop) | 91.2 ms |
+| A': the same production writer again | 91.0 ms |
+| B: pre-quantize into `Vec<i16>`, then write | 121.5 ms |
+
+Same-invocation A/A null A'/A: median 0.9951, bootstrap CI95 [0.9915, 1.0024].
+Candidate B/A: median 1.3300, bootstrap CI95 [1.3076, 1.3376], outside the
+2x null margin [0.9830, 1.0170]. The rejection is decidable: pre-quantizing is
+1.33x slower. Quantize math alone took 27.1 ms of the 91.2 ms write.
+
 ## 2026-08-11 - M4 Pro dev host: **OBSERVED LOSS / NO ADMISSIBLE VERDICT — two-row-block simdgroup GEMM (128 threads / 4 simdgroups) trailed the 256-thread / 8-simdgroup layout.**
 
 No numerical same-invocation A/A null control was recorded, so the observation
@@ -20934,6 +21077,53 @@ separately ledgered.
 `rch exec -- cargo test -p franken_whisper --test conformance_comparator_tests`
 passed 26/26 remotely on `ovh-a`. The final source diff was reverted to main,
 leaving only this ledger entry. AGENT_NAME=Codex.
+
+## 2026-06-27 - Codex: REJECT log-mel contiguous stitch transpose (zero-gain vs current franken; 0.5379x vs OpenAI-Whisper)
+
+**Land-or-dig result:** no measured bench worktree win remained to land. The
+f16c GEMV worktree win is already present on `origin/main` and `origin/master`
+at `c38b930bb1a8a3374f3a2ca3e0c6bac22adb3dfb`; the remaining inspected
+worktrees were patch-equivalent or superseded (`franken_whisper-cod-a-main-measure`,
+`franken_whisper-cod-b-fft-clean-daa0cf9`, and
+`franken_whisper-fused-f16c`). No nested `.scratch` or `.worktrees` git
+worktree was found under the repo.
+
+**Candidate:** log-mel final stitch from per-thread frame-major local buffers
+into the global mel-major output. The attempted lever changed the final copy to
+write each destination mel row contiguously while reading the local buffer with
+stride `n_mel`. The mapping is algebraically identical and touches no FFT,
+window, mel filterbank, or accumulation arithmetic.
+
+**Bench protocol:** per-crate only with
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a`. This Cargo
+does not accept `cargo bench --release`, so the supported equivalent was used:
+`rch exec -- cargo bench -p franken_whisper --profile release --bench
+native_engine_bench mel_30s_realistic -- --sample-size 10 --warm-up-time 0.1
+--measurement-time 1`. The first remote Criterion comparison failed because the
+remote worker did not have the local baseline directory, so the accepted A/B is
+the same target-dir comparison that Criterion completed.
+
+| Run | Median | Ratio |
+| --- | ---: | ---: |
+| franken baseline (`codex-stitch-remote`) | `4.7652 ms` | `0.5241x` vs OpenAI |
+| franken candidate (contiguous stitch) | `4.6429 ms` | `0.5379x` vs OpenAI |
+| OpenAI-Whisper `whisper.audio.log_mel_spectrogram`, torch 8 threads | `2.497522 ms` | baseline |
+
+Criterion reported `change: [-3.4031% -1.1799% +0.8135%]` with
+`p = 0.34 > 0.05`, so no statistically significant franken-side improvement was
+detected. The apparent median movement is not a keep.
+
+**Verdict:** REJECT and revert the code. Current franken remains slower than the
+fresh OpenAI-Whisper preprocessing comparator on this synthetic 30s log-mel case
+(`2.497522 / 4.6429 = 0.5379x`, OpenAI/franken). The source change was reverted;
+only this evidence entry is retained.
+
+**Conformance/quality gates:** `rch exec -- timeout 300s cargo test -p
+franken_whisper --test conformance_comparator_tests` passed 26/26 remotely on
+`ovh-a` with `CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a`.
+An earlier unbounded `rch exec` wrapper sat with no child compiler/test output
+and was interrupted; the bounded rerun produced normal remote logs and passed.
+AGENT_NAME=Codex.
 
 ## 2026-06-27 - Codex: REJECT log-mel contiguous stitch transpose (zero-gain vs current franken; 0.5379x vs OpenAI-Whisper)
 

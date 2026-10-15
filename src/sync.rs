@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, BufWriter, Read as _, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use chrono::Utc;
 use flate2::Compression;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 // The JSONL sync drives the database synchronously from the CLI. `fsqlite`'s
 // own `Connection` is async as of the frankensqlite async migration, so this
@@ -104,6 +105,7 @@ impl ImportExec for Connection {
 const SCHEMA_VERSION: &str = "1.1";
 const EXPORT_FORMAT_VERSION: &str = "1.0";
 const LOCK_STALE_SECONDS: i64 = 300; // 5 minutes
+const MAX_SYNC_VALIDATION_CHILD_MISMATCHES: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -153,9 +155,23 @@ pub struct SyncLock {
 
 impl SyncLock {
     pub fn acquire(state_root: &Path, operation: &str) -> FwResult<Self> {
+        Self::acquire_with_after_create(state_root, operation, || {})
+    }
+
+    fn acquire_with_after_create(
+        state_root: &Path,
+        operation: &str,
+        after_create: impl FnOnce(),
+    ) -> FwResult<Self> {
         let locks_dir = state_root.join("locks");
         fs::create_dir_all(&locks_dir)?;
         let path = locks_dir.join("sync.lock");
+
+        // Serialize check -> archive -> create across processes (bd-ci9x).
+        // Released (dropped) once the new lock file exists: from then on the
+        // file itself excludes contenders, and a contender that sees it
+        // partially written fails closed below.
+        let acquisition_guard = lock_acquisition_guard(&locks_dir)?;
 
         if path.exists()
             && let Some(info) = read_lock_info(&path)?
@@ -189,6 +205,8 @@ impl SyncLock {
                     path.display()
                 ))
             })?;
+        drop(acquisition_guard);
+        after_create();
         file.write_all(payload.as_bytes())?;
         file.sync_all()?;
 
@@ -249,11 +267,70 @@ impl Drop for SyncLock {
     }
 }
 
+/// How long a contender waits for another process's (sub-millisecond)
+/// check -> archive -> create critical section before failing closed.
+const LOCK_ACQUISITION_GUARD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Take the OS advisory lock on `locks/sync.lock.guard` that makes lock
+/// acquisition atomic across processes (bd-ci9x). Without it, two contenders
+/// that both judged the same dead holder's lock stale could each "archive"
+/// it — the second renaming away the FIRST contender's freshly created lock —
+/// and both proceed as writers. The OS releases the guard when the returned
+/// file is dropped or the process dies, so a crash can never wedge it.
+fn lock_acquisition_guard(locks_dir: &Path) -> FwResult<fs::File> {
+    let guard_path = locks_dir.join("sync.lock.guard");
+    let guard = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&guard_path)
+        .map_err(|error| {
+            FwError::Storage(format!(
+                "failed to open sync lock guard {}: {error}",
+                guard_path.display()
+            ))
+        })?;
+    let deadline = std::time::Instant::now() + LOCK_ACQUISITION_GUARD_WAIT;
+    loop {
+        match guard.try_lock() {
+            Ok(()) => return Ok(guard),
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(FwError::Storage(format!(
+                    "timed out waiting for sync lock guard {}",
+                    guard_path.display()
+                )));
+            }
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(FwError::Storage(format!(
+                    "failed to lock sync lock guard {}: {error}",
+                    guard_path.display()
+                )));
+            }
+        }
+    }
+}
+
 fn lock_info_matches(a: &LockInfo, b: &LockInfo) -> bool {
     a.pid == b.pid && a.created_at_rfc3339 == b.created_at_rfc3339 && a.operation == b.operation
 }
 
 fn read_lock_info(path: &Path) -> FwResult<Option<LockInfo>> {
+    read_lock_info_at(path, SystemTime::now())
+}
+
+fn read_lock_info_at(path: &Path, now: SystemTime) -> FwResult<Option<LockInfo>> {
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| {
+            FwError::Storage(format!(
+                "failed to inspect sync lock {}: {error}",
+                path.display()
+            ))
+        })?;
     let bytes = fs::read(path).map_err(|error| {
         FwError::Storage(format!(
             "failed to read sync lock {}: {error}",
@@ -263,19 +340,35 @@ fn read_lock_info(path: &Path) -> FwResult<Option<LockInfo>> {
     let contents = match String::from_utf8(bytes) {
         Ok(contents) => contents,
         Err(_) => {
-            archive_stale_lock(path, "corrupt")?;
-            return Ok(None);
+            return handle_unreadable_lock(path, modified, now, "non-UTF-8");
         }
     };
 
     match serde_json::from_str::<LockInfo>(&contents) {
         Ok(info) => Ok(Some(info)),
-        Err(_) => {
-            // Corrupt lock file — archive and proceed.
-            archive_stale_lock(path, "corrupt")?;
-            Ok(None)
-        }
+        Err(_) => handle_unreadable_lock(path, modified, now, "invalid JSON"),
     }
+}
+
+fn handle_unreadable_lock(
+    path: &Path,
+    modified: SystemTime,
+    now: SystemTime,
+    detail: &str,
+) -> FwResult<Option<LockInfo>> {
+    let age_seconds = now
+        .duration_since(modified)
+        .map(|age| age.as_secs())
+        .unwrap_or(0);
+    if age_seconds > LOCK_STALE_SECONDS as u64 {
+        archive_stale_lock(path, "corrupt")?;
+        return Ok(None);
+    }
+
+    Err(FwError::Storage(format!(
+        "sync lock {} is {detail} but only {age_seconds}s old; refusing to archive a potentially active partial lock",
+        path.display()
+    )))
 }
 
 fn is_lock_stale(info: &LockInfo) -> bool {
@@ -403,30 +496,92 @@ pub fn export(db_path: &Path, output_dir: &Path, state_root: &Path) -> FwResult<
     export_inner(db_path, output_dir)
 }
 
+/// [`export`], then compress the archive per `compression`, all under ONE
+/// sync lock: no concurrent export or import can interleave with (or read)
+/// the window between publishing plain JSONL and replacing it with `.gz`.
+/// Returns the manifest plus the compressed file names (empty for
+/// [`CompressionMode::None`]).
+pub fn export_with_compression(
+    db_path: &Path,
+    output_dir: &Path,
+    state_root: &Path,
+    compression: CompressionMode,
+) -> FwResult<(SyncManifest, Vec<String>)> {
+    let _lock = SyncLock::acquire(state_root, "export")?;
+    let manifest = export_inner(db_path, output_dir)?;
+    let compressed = match compression {
+        CompressionMode::None => Vec::new(),
+        CompressionMode::Gzip => gzip_export_files(output_dir)?,
+    };
+    Ok((manifest, compressed))
+}
+
+fn with_read_snapshot<T>(
+    connection: &Connection,
+    operation: impl FnOnce() -> FwResult<T>,
+) -> FwResult<T> {
+    connection
+        .execute("BEGIN;")
+        .map_err(|error| FwError::Storage(error.to_string()))?;
+
+    match operation() {
+        Ok(value) => {
+            if let Err(error) = connection.execute("COMMIT;") {
+                let _ = connection.execute("ROLLBACK;");
+                return Err(FwError::Storage(error.to_string()));
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = connection.execute("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
 fn export_inner(db_path: &Path, output_dir: &Path) -> FwResult<SyncManifest> {
+    export_inner_with_after_runs(db_path, output_dir, || {})
+}
+
+fn export_inner_with_after_runs(
+    db_path: &Path,
+    output_dir: &Path,
+    after_runs: impl FnOnce(),
+) -> FwResult<SyncManifest> {
     fs::create_dir_all(output_dir)?;
 
     let connection = Connection::open(db_path.display().to_string())
         .map_err(|error| FwError::Storage(error.to_string()))?;
     verify_schema_exists(&connection)?;
 
-    // Export runs
-    let runs_tmp = output_dir.join("runs.jsonl.tmp");
-    let runs_final = output_dir.join("runs.jsonl");
-    let (runs_count, runs_sha256) = export_table_runs(&connection, &runs_tmp)?;
-    atomic_rename(&runs_tmp, &runs_final)?;
+    let (
+        (runs_count, runs_sha256),
+        (segments_count, segments_sha256),
+        (events_count, events_sha256),
+    ) = with_read_snapshot(&connection, || {
+        // Export runs
+        let runs_tmp = output_dir.join("runs.jsonl.tmp");
+        let runs_final = output_dir.join("runs.jsonl");
+        let runs = export_table_runs(&connection, &runs_tmp)?;
+        atomic_rename(&runs_tmp, &runs_final)?;
 
-    // Export segments
-    let segments_tmp = output_dir.join("segments.jsonl.tmp");
-    let segments_final = output_dir.join("segments.jsonl");
-    let (segments_count, segments_sha256) = export_table_segments(&connection, &segments_tmp)?;
-    atomic_rename(&segments_tmp, &segments_final)?;
+        after_runs();
 
-    // Export events
-    let events_tmp = output_dir.join("events.jsonl.tmp");
-    let events_final = output_dir.join("events.jsonl");
-    let (events_count, events_sha256) = export_table_events(&connection, &events_tmp)?;
-    atomic_rename(&events_tmp, &events_final)?;
+        // Export segments
+        let segments_tmp = output_dir.join("segments.jsonl.tmp");
+        let segments_final = output_dir.join("segments.jsonl");
+        let segments = export_table_segments(&connection, &segments_tmp)?;
+        atomic_rename(&segments_tmp, &segments_final)?;
+
+        // Export events
+        let events_tmp = output_dir.join("events.jsonl.tmp");
+        let events_final = output_dir.join("events.jsonl");
+        let events = export_table_events(&connection, &events_tmp)?;
+        atomic_rename(&events_tmp, &events_final)?;
+
+        Ok((runs, segments, events))
+    })?;
+    remove_stale_compressed_jsonl(output_dir, &["runs", "segments", "events"])?;
 
     // Checksums streamed while writing (HashingWriter) — no second pass to re-read
     // the JSONL files. Identical digest to `sha256_file` of the written bytes.
@@ -556,16 +711,24 @@ fn export_table_events(connection: &Connection, path: &Path) -> FwResult<(u64, S
 // Incremental Export (changed records only)
 // ---------------------------------------------------------------------------
 
-/// Tracks the position of the last incremental export so subsequent calls
-/// only emit records that appeared after the cursor.
+/// Tracks the database mutation high-water mark of the last incremental
+/// export so unchanged subsequent calls do not re-emit an aggregate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncCursor {
-    /// RFC-3339 `finished_at` timestamp of the last exported run.
+    /// Monotonic sequence assigned by SQLite triggers to the newest parent or
+    /// child mutation observed by the completed export snapshot.
+    #[serde(default)]
+    pub last_mutation_seq: i64,
+    /// Stable identity of the database lineage that assigned the mutation
+    /// sequence. Cursors without an identity are legacy and force one safe
+    /// full re-export; a different identity fails closed.
+    #[serde(default)]
+    pub database_id: Option<String>,
+    /// Informational domain timestamp of the final exported run. Selection is
+    /// never based on this caller-controlled value.
     pub last_export_rfc3339: String,
-    /// Stable run-id tie-breaker for `last_export_rfc3339`.
-    ///
-    /// This allows incremental export to include runs that share the same
-    /// timestamp without re-exporting prior rows indefinitely.
+    /// Informational run ID paired with `last_export_rfc3339` for diagnostics
+    /// and compatibility with cursor files created before schema v6.
     #[serde(default)]
     pub last_export_run_id: Option<String>,
     /// Number of runs exported in the last batch.
@@ -577,7 +740,7 @@ pub struct SyncCursor {
 pub enum ExportMode {
     /// Export every record in the database.
     Full,
-    /// Export only records whose `(finished_at, id)` tuple is strictly greater
+    /// Export only run aggregates whose database mutation sequence is greater
     /// than the cursor position, or all records when no cursor exists.
     Incremental,
 }
@@ -597,15 +760,46 @@ pub struct IncrementalExportManifest {
     pub cursor_used: Option<SyncCursor>,
     /// Updated cursor that should be persisted and passed to the next call.
     pub cursor_after: SyncCursor,
+    /// Explicit channel of runs deleted at the source since the cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_runs: Option<DeletedRunsChannel>,
+}
+
+/// Format version of `deleted_runs.jsonl`; importers fail closed on any other.
+pub const DELETED_RUNS_FORMAT_VERSION: &str = "deleted-runs-v1";
+const DELETED_RUNS_STEM: &str = "deleted_runs";
+
+/// Manifest entry declaring an archive's explicit deleted-run channel
+/// (bd-768k).
+///
+/// An incremental snapshot carries only changed aggregates, so a run's absence
+/// from it never implies deletion. A run whose newest database mutation is its
+/// own deletion is instead published as a [`DeletedRunRecord`] in
+/// `deleted_runs.jsonl`, and an importer removes exactly the listed aggregates.
+/// Archives without this entry delete nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedRunsChannel {
+    pub format_version: String,
+    pub file: String,
+    pub count: u64,
+    pub sha256: String,
+}
+
+/// One line of `deleted_runs.jsonl`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeletedRunRecord {
+    pub run_id: String,
+    /// Source-lineage mutation sequence of the deletion (see [`SyncCursor`]).
+    pub mutation_seq: i64,
 }
 
 const CURSOR_FILENAME: &str = "sync_cursor.json";
 const EMPTY_INCREMENTAL_CURSOR_TS: &str = "";
 
-/// Perform an incremental export: only records whose `(finished_at, id)` tuple
-/// is strictly greater than the cursor position are emitted. When no cursor
-/// file exists inside `state_root`, all records are exported (equivalent to a
-/// full export) and a new cursor file is written.
+/// Perform an incremental export using the database-owned mutation sequence.
+/// When no cursor file exists inside `state_root`, all records are exported
+/// (equivalent to a full export) and a new cursor file is written.
 pub fn export_incremental(
     db_path: &Path,
     output_dir: &Path,
@@ -615,12 +809,48 @@ pub fn export_incremental(
     export_incremental_inner(db_path, output_dir, state_root)
 }
 
+/// [`export_incremental`] plus compression under the same single sync lock;
+/// see [`export_with_compression`].
+pub fn export_incremental_with_compression(
+    db_path: &Path,
+    output_dir: &Path,
+    state_root: &Path,
+    compression: CompressionMode,
+) -> FwResult<(IncrementalExportManifest, Vec<String>)> {
+    let _lock = SyncLock::acquire(state_root, "export_incremental")?;
+    let manifest = export_incremental_inner(db_path, output_dir, state_root)?;
+    let compressed = match compression {
+        CompressionMode::None => Vec::new(),
+        CompressionMode::Gzip => gzip_export_files(output_dir)?,
+    };
+    Ok((manifest, compressed))
+}
+
 fn export_incremental_inner(
     db_path: &Path,
     output_dir: &Path,
     state_root: &Path,
 ) -> FwResult<IncrementalExportManifest> {
+    export_incremental_inner_with_after_runs(db_path, output_dir, state_root, || {})
+}
+
+fn export_incremental_inner_with_after_runs(
+    db_path: &Path,
+    output_dir: &Path,
+    state_root: &Path,
+    after_runs: impl FnOnce(),
+) -> FwResult<IncrementalExportManifest> {
     fs::create_dir_all(output_dir)?;
+
+    // Preserve export's fail-closed behavior for a missing/non-schema DB, then
+    // let RunStore apply the current schema migration before opening the
+    // dedicated read connection. Incremental export is a public library API
+    // and cannot assume some earlier RunStore user already installed v6.
+    let preflight = Connection::open(db_path.display().to_string())
+        .map_err(|error| FwError::Storage(error.to_string()))?;
+    verify_schema_exists(&preflight)?;
+    drop(preflight);
+    drop(RunStore::open(db_path)?);
 
     let connection = Connection::open(db_path.display().to_string())
         .map_err(|error| FwError::Storage(error.to_string()))?;
@@ -629,29 +859,49 @@ fn export_incremental_inner(
     let cursor_path = state_root.join(CURSOR_FILENAME);
     let cursor_used = load_cursor(&cursor_path)?;
 
-    // --- runs ---
-    let runs_tmp = output_dir.join("runs.jsonl.tmp");
-    let runs_final = output_dir.join("runs.jsonl");
-    let (runs_count, runs_sha256) =
-        export_table_runs_incremental(&connection, &runs_tmp, cursor_used.as_ref())?;
-    atomic_rename(&runs_tmp, &runs_final)?;
+    let (
+        runs_export,
+        (segments_count, segments_sha256),
+        (events_count, events_sha256),
+        (deleted_count, deleted_sha256),
+    ) = with_read_snapshot(&connection, || {
+        // --- runs ---
+        let runs_tmp = output_dir.join("runs.jsonl.tmp");
+        let runs_final = output_dir.join("runs.jsonl");
+        let runs_export =
+            export_table_runs_incremental_snapshot(&connection, &runs_tmp, cursor_used.as_ref())?;
+        atomic_rename(&runs_tmp, &runs_final)?;
 
-    // Collect the run_ids that were exported so segments/events can be scoped.
-    let run_ids = collect_exported_run_ids(&connection, cursor_used.as_ref())?;
+        after_runs();
 
-    // --- segments ---
-    let segments_tmp = output_dir.join("segments.jsonl.tmp");
-    let segments_final = output_dir.join("segments.jsonl");
-    let (segments_count, segments_sha256) =
-        export_table_segments_for_runs(&connection, &segments_tmp, &run_ids)?;
-    atomic_rename(&segments_tmp, &segments_final)?;
+        // --- segments ---
+        let segments_tmp = output_dir.join("segments.jsonl.tmp");
+        let segments_final = output_dir.join("segments.jsonl");
+        let segments =
+            export_table_segments_for_runs(&connection, &segments_tmp, &runs_export.run_ids)?;
+        atomic_rename(&segments_tmp, &segments_final)?;
 
-    // --- events ---
-    let events_tmp = output_dir.join("events.jsonl.tmp");
-    let events_final = output_dir.join("events.jsonl");
-    let (events_count, events_sha256) =
-        export_table_events_for_runs(&connection, &events_tmp, &run_ids)?;
-    atomic_rename(&events_tmp, &events_final)?;
+        // --- events ---
+        let events_tmp = output_dir.join("events.jsonl.tmp");
+        let events_final = output_dir.join("events.jsonl");
+        let events = export_table_events_for_runs(&connection, &events_tmp, &runs_export.run_ids)?;
+        atomic_rename(&events_tmp, &events_final)?;
+
+        // --- deleted runs (explicit tombstones, bd-768k) ---
+        let deleted_tmp = output_dir.join(format!("{DELETED_RUNS_STEM}.jsonl.tmp"));
+        let deleted_final = output_dir.join(format!("{DELETED_RUNS_STEM}.jsonl"));
+        let deleted =
+            export_deleted_runs_snapshot(&connection, &deleted_tmp, cursor_used.as_ref())?;
+        atomic_rename(&deleted_tmp, &deleted_final)?;
+
+        Ok((runs_export, segments, events, deleted))
+    })?;
+    remove_stale_compressed_jsonl(
+        output_dir,
+        &["runs", "segments", "events", DELETED_RUNS_STEM],
+    )?;
+    let runs_count = runs_export.count;
+    let runs_sha256 = runs_export.sha256;
 
     // Checksums streamed while writing (HashingWriter) — no re-read pass. Same digest
     // as `sha256_file` of the written bytes.
@@ -661,18 +911,20 @@ fn export_incremental_inner(
         events_jsonl_sha256: events_sha256,
     };
 
-    // Determine the new cursor: the maximum `(finished_at, id)` tuple among
-    // exported runs, or retain the prior cursor when nothing was exported.
-    let (new_cursor_ts, new_cursor_run_id) =
-        match max_export_position(&connection, cursor_used.as_ref())? {
-            Some((ts, run_id)) => (ts, Some(run_id)),
-            None => cursor_used
-                .as_ref()
-                .map(|c| (c.last_export_rfc3339.clone(), c.last_export_run_id.clone()))
-                .unwrap_or_else(|| (EMPTY_INCREMENTAL_CURSOR_TS.to_owned(), None)),
-        };
+    // The high-water mark is read inside the same snapshot as all three output
+    // tables. It therefore advances past every mutation represented by the
+    // published aggregate files, including mutations of child rows.
+    let (new_cursor_ts, new_cursor_run_id) = match runs_export.last_position {
+        Some((ts, run_id)) => (ts, Some(run_id)),
+        None => cursor_used
+            .as_ref()
+            .map(|c| (c.last_export_rfc3339.clone(), c.last_export_run_id.clone()))
+            .unwrap_or_else(|| (EMPTY_INCREMENTAL_CURSOR_TS.to_owned(), None)),
+    };
 
     let cursor_after = SyncCursor {
+        last_mutation_seq: runs_export.high_water_mark,
+        database_id: Some(runs_export.database_id),
         last_export_rfc3339: new_cursor_ts,
         last_export_run_id: new_cursor_run_id,
         last_run_count: runs_count,
@@ -692,6 +944,12 @@ fn export_incremental_inner(
         checksums,
         cursor_used: cursor_used.clone(),
         cursor_after: cursor_after.clone(),
+        deleted_runs: Some(DeletedRunsChannel {
+            format_version: DELETED_RUNS_FORMAT_VERSION.to_owned(),
+            file: format!("{DELETED_RUNS_STEM}.jsonl"),
+            count: deleted_count,
+            sha256: deleted_sha256,
+        }),
     };
 
     let manifest_path = output_dir.join("manifest.json");
@@ -714,6 +972,11 @@ fn load_cursor(path: &Path) -> FwResult<Option<SyncCursor>> {
     let contents = fs::read_to_string(path)?;
     let cursor: SyncCursor = serde_json::from_str(&contents)
         .map_err(|error| FwError::Storage(format!("invalid sync cursor: {error}")))?;
+    if cursor.last_mutation_seq < 0 {
+        return Err(FwError::Storage(
+            "invalid sync cursor: last_mutation_seq must be non-negative".to_owned(),
+        ));
+    }
     Ok(Some(cursor))
 }
 
@@ -729,28 +992,151 @@ fn save_cursor(path: &Path, cursor: &SyncCursor) -> FwResult<()> {
     Ok(())
 }
 
-fn export_table_runs_incremental(
+struct IncrementalRunsSnapshot {
+    count: u64,
+    sha256: String,
+    run_ids: Vec<String>,
+    last_position: Option<(String, String)>,
+    high_water_mark: i64,
+    database_id: String,
+}
+
+struct MutationAuthority {
+    database_id: String,
+    high_water_mark: i64,
+}
+
+fn load_mutation_authority(connection: &Connection) -> FwResult<MutationAuthority> {
+    let identity_rows = connection
+        .query("SELECT value FROM _meta WHERE key = 'sync_database_id'")
+        .map_err(|error| FwError::Storage(error.to_string()))?;
+    let database_id = identity_rows
+        .first()
+        .map(|row| value_to_string_sqlite(row.get(0)))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            FwError::Storage("incremental export requires a non-empty sync_database_id".to_owned())
+        })?;
+    uuid::Uuid::parse_str(&database_id).map_err(|error| {
+        FwError::Storage(format!("invalid sync_database_id `{database_id}`: {error}"))
+    })?;
+
+    let high_water_mark = connection
+        .query("SELECT COALESCE(MAX(mutation_seq), 0) FROM sync_run_mutations")
+        .map_err(|error| FwError::Storage(error.to_string()))?
+        .first()
+        .and_then(|row| row.get(0).and_then(|value| value.as_integer()))
+        .ok_or_else(|| {
+            FwError::Storage(
+                "incremental export mutation high-water mark is not an integer".to_owned(),
+            )
+        })?;
+
+    Ok(MutationAuthority {
+        database_id,
+        high_water_mark,
+    })
+}
+
+fn validated_cursor_mutation_seq(
+    cursor: Option<&SyncCursor>,
+    authority: &MutationAuthority,
+) -> FwResult<Option<i64>> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+
+    let Some(cursor_database_id) = cursor.database_id.as_deref() else {
+        // Pre-identity cursors cannot safely interpret their database-local
+        // numeric sequence. Sequence zero re-exports every current aggregate.
+        return Ok(Some(0));
+    };
+    if cursor_database_id != authority.database_id {
+        return Err(FwError::Storage(format!(
+            "sync cursor database identity mismatch: cursor={cursor_database_id}, database={}",
+            authority.database_id
+        )));
+    }
+    if !(0..=authority.high_water_mark).contains(&cursor.last_mutation_seq) {
+        return Err(FwError::Storage(format!(
+            "invalid sync cursor: mutation sequence {} is outside database range 0..={}",
+            cursor.last_mutation_seq, authority.high_water_mark
+        )));
+    }
+    Ok(Some(cursor.last_mutation_seq))
+}
+
+/// Write every run whose newest mutation after the cursor is its own deletion.
+///
+/// The `runs` delete trigger refreshes the run's `sync_run_mutations` row, and
+/// a later re-insert refreshes it again, so "mutation row present, run row
+/// absent" identifies exactly the runs that are deleted as of this snapshot.
+fn export_deleted_runs_snapshot(
     connection: &Connection,
     path: &Path,
     cursor: Option<&SyncCursor>,
 ) -> FwResult<(u64, String)> {
-    let (sql, params) = match cursor {
-        Some(c) => (
-            "SELECT id, started_at, finished_at, backend, input_path, \
-             normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json \
-             FROM runs \
-             WHERE finished_at > ?1 OR (finished_at = ?1 AND id > ?2) \
-             ORDER BY finished_at ASC, id ASC"
+    let authority = load_mutation_authority(connection)?;
+    let cursor_mutation_seq = validated_cursor_mutation_seq(cursor, &authority)?;
+    let base = "SELECT m.run_id, m.mutation_seq FROM sync_run_mutations AS m \
+                WHERE NOT EXISTS (SELECT 1 FROM runs AS r WHERE r.id = m.run_id)";
+    let rows = match cursor_mutation_seq {
+        Some(last_mutation_seq) => connection.query_with_params(
+            &format!("{base} AND m.mutation_seq > ?1 ORDER BY m.mutation_seq ASC, m.run_id ASC"),
+            &[SqliteValue::Integer(last_mutation_seq)],
+        ),
+        None => connection.query(&format!("{base} ORDER BY m.mutation_seq ASC, m.run_id ASC")),
+    }
+    .map_err(|error| FwError::Storage(error.to_string()))?;
+
+    let mut file = HashingWriter::new(BufWriter::new(fs::File::create(path)?));
+    let mut count = 0u64;
+    for row in rows {
+        let mutation_seq = match row.get(1) {
+            Some(SqliteValue::Integer(value)) => *value,
+            _ => {
+                return Err(FwError::Storage(
+                    "deleted-run mutation sequence is not an integer".to_owned(),
+                ));
+            }
+        };
+        let record = DeletedRunRecord {
+            run_id: value_to_string_sqlite(row.get(0)),
+            mutation_seq,
+        };
+        writeln!(file, "{}", serde_json::to_string(&record)?)?;
+        count += 1;
+    }
+    file.flush()?;
+    file.get_ref().get_ref().sync_all()?;
+    Ok((count, file.finalize_hex()))
+}
+
+fn export_table_runs_incremental_snapshot(
+    connection: &Connection,
+    path: &Path,
+    cursor: Option<&SyncCursor>,
+) -> FwResult<IncrementalRunsSnapshot> {
+    let authority = load_mutation_authority(connection)?;
+    let cursor_mutation_seq = validated_cursor_mutation_seq(cursor, &authority)?;
+
+    let (sql, params) = match cursor_mutation_seq {
+        Some(last_mutation_seq) => (
+            "SELECT r.id, r.started_at, r.finished_at, r.backend, r.input_path, \
+             r.normalized_wav_path, r.request_json, r.result_json, r.warnings_json, r.transcript, r.replay_json, r.acceleration_json \
+             FROM runs AS r \
+             JOIN sync_run_mutations AS m ON m.run_id = r.id \
+             WHERE m.mutation_seq > ?1 \
+             ORDER BY r.finished_at ASC, r.id ASC"
                 .to_owned(),
-            vec![
-                SqliteValue::Text(c.last_export_rfc3339.clone().into()),
-                SqliteValue::Text(c.last_export_run_id.clone().unwrap_or_default().into()),
-            ],
+            vec![SqliteValue::Integer(last_mutation_seq)],
         ),
         None => (
-            "SELECT id, started_at, finished_at, backend, input_path, \
-             normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json \
-             FROM runs ORDER BY finished_at ASC, id ASC"
+            "SELECT r.id, r.started_at, r.finished_at, r.backend, r.input_path, \
+             r.normalized_wav_path, r.request_json, r.result_json, r.warnings_json, r.transcript, r.replay_json, r.acceleration_json \
+             FROM runs AS r \
+             JOIN sync_run_mutations AS m ON m.run_id = r.id \
+             ORDER BY r.finished_at ASC, r.id ASC"
                 .to_owned(),
             vec![],
         ),
@@ -771,8 +1157,12 @@ fn export_table_runs_incremental(
     // buffered; these incremental ones were not). Byte-identical output.
     let mut file = HashingWriter::new(BufWriter::new(fs::File::create(path)?));
     let mut count = 0u64;
+    let mut run_ids = Vec::with_capacity(rows.len());
+    let mut last_position = None;
 
     for row in rows {
+        let run_id = value_to_string_sqlite(row.get(0));
+        let finished_at = value_to_string_sqlite(row.get(2));
         let obj = serde_json::json!({
             "id": value_to_json(row.get(0)),
             "started_at": value_to_json(row.get(1)),
@@ -788,33 +1178,61 @@ fn export_table_runs_incremental(
             "acceleration_json": value_to_json(row.get(11)),
         });
         writeln!(file, "{}", serde_json::to_string(&obj)?)?;
+        let replaces_last = last_position.as_ref().is_none_or(|(last_ts, last_id)| {
+            finished_at > *last_ts || (finished_at == *last_ts && run_id > *last_id)
+        });
+        if replaces_last {
+            last_position = Some((finished_at, run_id.clone()));
+        }
+        run_ids.push(run_id);
         count += 1;
     }
     file.flush()?;
     file.get_ref().get_ref().sync_all()?;
 
-    Ok((count, file.finalize_hex()))
+    Ok(IncrementalRunsSnapshot {
+        count,
+        sha256: file.finalize_hex(),
+        run_ids,
+        last_position,
+        high_water_mark: authority.high_water_mark,
+        database_id: authority.database_id,
+    })
+}
+
+#[cfg(test)]
+fn export_table_runs_incremental(
+    connection: &Connection,
+    path: &Path,
+    cursor: Option<&SyncCursor>,
+) -> FwResult<(u64, String)> {
+    let snapshot = export_table_runs_incremental_snapshot(connection, path, cursor)?;
+    Ok((snapshot.count, snapshot.sha256))
 }
 
 /// Collect all run IDs that match the incremental filter, so we can scope
 /// segments and events to those runs.
+#[cfg(test)]
 fn collect_exported_run_ids(
     connection: &Connection,
     cursor: Option<&SyncCursor>,
 ) -> FwResult<Vec<String>> {
-    let (sql, params) = match cursor {
-        Some(c) => (
-            "SELECT id FROM runs \
-             WHERE finished_at > ?1 OR (finished_at = ?1 AND id > ?2) \
-             ORDER BY finished_at ASC, id ASC"
+    let authority = load_mutation_authority(connection)?;
+    let cursor_mutation_seq = validated_cursor_mutation_seq(cursor, &authority)?;
+    let (sql, params) = match cursor_mutation_seq {
+        Some(last_mutation_seq) => (
+            "SELECT r.id FROM runs AS r \
+             JOIN sync_run_mutations AS m ON m.run_id = r.id \
+             WHERE m.mutation_seq > ?1 \
+             ORDER BY r.finished_at ASC, r.id ASC"
                 .to_owned(),
-            vec![
-                SqliteValue::Text(c.last_export_rfc3339.clone().into()),
-                SqliteValue::Text(c.last_export_run_id.clone().unwrap_or_default().into()),
-            ],
+            vec![SqliteValue::Integer(last_mutation_seq)],
         ),
         None => (
-            "SELECT id FROM runs ORDER BY finished_at ASC, id ASC".to_owned(),
+            "SELECT r.id FROM runs AS r \
+             JOIN sync_run_mutations AS m ON m.run_id = r.id \
+             ORDER BY r.finished_at ASC, r.id ASC"
+                .to_owned(),
             vec![],
         ),
     };
@@ -964,25 +1382,29 @@ fn export_table_events_for_runs(
     Ok((count, file.finalize_hex()))
 }
 
-/// Find the maximum `(finished_at, id)` tuple among runs matching the
-/// incremental filter.
+/// Find the greatest domain tuple among aggregates mutated after `cursor`.
+/// Selection uses only the database-owned sequence; the returned domain tuple
+/// mirrors the informational position stored by the production exporter.
+#[cfg(test)]
 fn max_export_position(
     connection: &Connection,
     cursor: Option<&SyncCursor>,
 ) -> FwResult<Option<(String, String)>> {
-    let (sql, params) = match cursor {
-        Some(c) => (
-            "SELECT finished_at, id FROM runs \
-             WHERE finished_at > ?1 OR (finished_at = ?1 AND id > ?2) \
-             ORDER BY finished_at DESC, id DESC LIMIT 1"
+    let authority = load_mutation_authority(connection)?;
+    let cursor_mutation_seq = validated_cursor_mutation_seq(cursor, &authority)?;
+    let (sql, params) = match cursor_mutation_seq {
+        Some(last_mutation_seq) => (
+            "SELECT r.finished_at, r.id FROM runs AS r \
+             JOIN sync_run_mutations AS m ON m.run_id = r.id \
+             WHERE m.mutation_seq > ?1 \
+             ORDER BY r.finished_at DESC, r.id DESC LIMIT 1"
                 .to_owned(),
-            vec![
-                SqliteValue::Text(c.last_export_rfc3339.clone().into()),
-                SqliteValue::Text(c.last_export_run_id.clone().unwrap_or_default().into()),
-            ],
+            vec![SqliteValue::Integer(last_mutation_seq)],
         ),
         None => (
-            "SELECT finished_at, id FROM runs ORDER BY finished_at DESC, id DESC LIMIT 1"
+            "SELECT r.finished_at, r.id FROM runs AS r \
+             JOIN sync_run_mutations AS m ON m.run_id = r.id \
+             ORDER BY r.finished_at DESC, r.id DESC LIMIT 1"
                 .to_owned(),
             vec![],
         ),
@@ -1034,6 +1456,9 @@ pub struct ImportResult {
     pub runs_imported: u64,
     pub segments_imported: u64,
     pub events_imported: u64,
+    /// Run aggregates removed because the archive's explicit deleted-run
+    /// channel listed them (see [`DeletedRunsChannel`]).
+    pub runs_deleted: u64,
     pub conflicts: Vec<SyncConflict>,
 }
 
@@ -1042,6 +1467,23 @@ pub struct SyncConflict {
     pub table: String,
     pub key: String,
     pub reason: String,
+}
+
+#[derive(Debug)]
+struct JsonlInputPaths {
+    runs: PathBuf,
+    segments: PathBuf,
+    events: PathBuf,
+}
+
+impl JsonlInputPaths {
+    fn resolve(input_dir: &Path) -> Self {
+        Self {
+            runs: resolve_jsonl_path(input_dir, "runs"),
+            segments: resolve_jsonl_path(input_dir, "segments"),
+            events: resolve_jsonl_path(input_dir, "events"),
+        }
+    }
 }
 
 pub fn import(
@@ -1058,6 +1500,20 @@ fn import_inner(
     db_path: &Path,
     input_dir: &Path,
     conflict_policy: ConflictPolicy,
+) -> FwResult<ImportResult> {
+    import_inner_with_batch_mode(
+        db_path,
+        input_dir,
+        conflict_policy,
+        sync_batch_import_enabled(),
+    )
+}
+
+fn import_inner_with_batch_mode(
+    db_path: &Path,
+    input_dir: &Path,
+    conflict_policy: ConflictPolicy,
+    batch_import_enabled: bool,
 ) -> FwResult<ImportResult> {
     // Validate manifest
     let manifest_path = input_dir.join("manifest.json");
@@ -1076,8 +1532,12 @@ fn import_inner(
     // Validate export format version (exact major match)
     validate_export_format_version(&manifest)?;
 
-    // Validate checksums
-    validate_checksums(&manifest, input_dir)?;
+    // Resolve the physical inputs once. Checksum validation and row import must
+    // consume the same plain-or-gzip files even if the directory changes later.
+    let input_paths = validate_checksums(&manifest, input_dir)?;
+    // Deletions are honored only when the manifest explicitly declares the
+    // channel; a missing or partial snapshot never implies deletion.
+    let deleted_runs = load_deleted_runs_channel(&manifest_text, input_dir)?;
 
     // Open DB and ensure schema exists
     if let Some(parent) = db_path.parent()
@@ -1094,7 +1554,14 @@ fn import_inner(
         .execute("BEGIN;")
         .map_err(|error| FwError::Storage(error.to_string()))?;
 
-    let result = import_tables(connection, input_dir, &manifest, conflict_policy);
+    let result = import_tables(
+        connection,
+        &input_paths,
+        &manifest,
+        &deleted_runs,
+        conflict_policy,
+        batch_import_enabled,
+    );
 
     match result {
         Ok(import_result) => {
@@ -1136,21 +1603,23 @@ fn import_inner(
 
 fn import_tables(
     connection: &Connection,
-    input_dir: &Path,
+    input_paths: &JsonlInputPaths,
     manifest: &SyncManifest,
+    deleted_runs: &[DeletedRunRecord],
     conflict_policy: ConflictPolicy,
+    batch_import_enabled: bool,
 ) -> FwResult<ImportResult> {
     let mut conflicts = Vec::new();
     let mut run_tracking = RunImportTracking::default();
 
     // Import runs first (referential parent)
-    let runs_path = input_dir.join("runs.jsonl");
     let runs_imported = import_runs(
         connection,
-        &runs_path,
+        &input_paths.runs,
         conflict_policy,
         &mut conflicts,
         &mut run_tracking,
+        batch_import_enabled,
     )
     .map_err(|error| FwError::Storage(format!("runs import failed: {error}")))?;
 
@@ -1163,15 +1632,16 @@ fn import_tables(
     }
 
     // Import segments
-    let segments_path = input_dir.join("segments.jsonl");
     let segments_imported = import_segments(
         connection,
-        &segments_path,
+        &input_paths.segments,
         conflict_policy,
         &mut conflicts,
         &run_tracking.imported_run_ids,
         &run_tracking.overwritten_run_ids,
+        &run_tracking.inserted_run_ids,
         &run_tracking.overwritten_segment_idxs_before,
+        batch_import_enabled,
     )
     .map_err(|error| FwError::Storage(format!("segments import failed: {error}")))?;
 
@@ -1183,15 +1653,16 @@ fn import_tables(
     }
 
     // Import events
-    let events_path = input_dir.join("events.jsonl");
     let events_imported = import_events(
         connection,
-        &events_path,
+        &input_paths.events,
         conflict_policy,
         &mut conflicts,
         &run_tracking.imported_run_ids,
         &run_tracking.overwritten_run_ids,
+        &run_tracking.inserted_run_ids,
         &run_tracking.overwritten_event_seqs_before,
+        batch_import_enabled,
     )
     .map_err(|error| FwError::Storage(format!("events import failed: {error}")))?;
 
@@ -1202,17 +1673,167 @@ fn import_tables(
         )));
     }
 
+    let runs_deleted = apply_deleted_runs(
+        connection,
+        deleted_runs,
+        &run_tracking.imported_run_ids,
+        conflict_policy,
+        &mut conflicts,
+    )
+    .map_err(|error| FwError::Storage(format!("deleted-runs import failed: {error}")))?;
+
     Ok(ImportResult {
         runs_imported,
         segments_imported,
         events_imported,
+        runs_deleted,
         conflicts,
     })
+}
+
+/// Read and verify the archive's declared deleted-run channel, if any.
+///
+/// Fails closed on an unknown format version, a file name other than the
+/// canonical one, a missing file, a checksum or count mismatch, malformed or
+/// duplicate records, and negative mutation sequences.
+fn load_deleted_runs_channel(
+    manifest_text: &str,
+    input_dir: &Path,
+) -> FwResult<Vec<DeletedRunRecord>> {
+    #[derive(Deserialize)]
+    struct DeletedRunsSection {
+        #[serde(default)]
+        deleted_runs: Option<DeletedRunsChannel>,
+    }
+    let section: DeletedRunsSection = serde_json::from_str(manifest_text)
+        .map_err(|error| FwError::Storage(format!("invalid manifest: {error}")))?;
+    let Some(channel) = section.deleted_runs else {
+        return Ok(Vec::new());
+    };
+    if channel.format_version != DELETED_RUNS_FORMAT_VERSION {
+        return Err(FwError::Storage(format!(
+            "unsupported deleted-runs format `{}` (expected `{DELETED_RUNS_FORMAT_VERSION}`)",
+            channel.format_version
+        )));
+    }
+    let canonical_file = format!("{DELETED_RUNS_STEM}.jsonl");
+    if channel.file != canonical_file {
+        return Err(FwError::Storage(format!(
+            "deleted-runs channel must name `{canonical_file}`, not `{}`",
+            channel.file
+        )));
+    }
+    let path = resolve_jsonl_path(input_dir, DELETED_RUNS_STEM);
+    if !path.exists() {
+        return Err(FwError::Storage(format!(
+            "missing export file: {canonical_file} or {canonical_file}.gz in {}",
+            input_dir.display()
+        )));
+    }
+    let actual = sha256_jsonl_file(&path)?;
+    if actual != channel.sha256 {
+        return Err(FwError::Storage(format!(
+            "checksum mismatch for {} (logical {canonical_file} bytes): expected {}, got {actual}",
+            path.display(),
+            channel.sha256
+        )));
+    }
+
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, line) in open_jsonl_reader(&path)?.lines().enumerate() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record: DeletedRunRecord = serde_json::from_str(line).map_err(|error| {
+            FwError::Storage(format!(
+                "{canonical_file} line {}: invalid record: {error}",
+                index + 1
+            ))
+        })?;
+        if record.run_id.is_empty() || record.mutation_seq < 0 {
+            return Err(FwError::Storage(format!(
+                "{canonical_file} line {}: run_id must be non-empty and mutation_seq non-negative",
+                index + 1
+            )));
+        }
+        if !seen.insert(record.run_id.clone()) {
+            return Err(FwError::Storage(format!(
+                "{canonical_file} line {}: duplicate run_id `{}`",
+                index + 1,
+                record.run_id
+            )));
+        }
+        records.push(record);
+    }
+    if records.len() as u64 != channel.count {
+        return Err(FwError::Storage(format!(
+            "row count mismatch for {canonical_file}: expected {}, found {}",
+            channel.count,
+            records.len()
+        )));
+    }
+    Ok(records)
+}
+
+/// Remove the run aggregates the archive explicitly lists as deleted.
+///
+/// A run listed as deleted cannot also be carried by the same snapshot. Under
+/// [`ConflictPolicy::Skip`] an existing target run is preserved and reported as
+/// a conflict; every other policy mirrors the source deletion. Runs absent from
+/// the target are already in the deleted state.
+fn apply_deleted_runs(
+    connection: &Connection,
+    deleted_runs: &[DeletedRunRecord],
+    archive_run_ids: &HashSet<String>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+) -> FwResult<u64> {
+    let mut deleted = 0u64;
+    for record in deleted_runs {
+        if archive_run_ids.contains(&record.run_id) {
+            return Err(FwError::Storage(format!(
+                "archive both carries and deletes run `{}`",
+                record.run_id
+            )));
+        }
+        let params = [SqliteValue::Text(record.run_id.clone().into())];
+        let exists = !connection
+            .query_with_params("SELECT 1 FROM runs WHERE id = ?1", &params)
+            .map_err(|error| FwError::Storage(error.to_string()))?
+            .is_empty();
+        if !exists {
+            continue;
+        }
+        if conflict_policy == ConflictPolicy::Skip {
+            conflicts.push(SyncConflict {
+                table: "runs".to_owned(),
+                key: record.run_id.clone(),
+                reason: "run deleted at source; existing target run preserved by skip policy"
+                    .to_owned(),
+            });
+            continue;
+        }
+        for sql in [
+            "DELETE FROM segments WHERE run_id = ?1",
+            "DELETE FROM events WHERE run_id = ?1",
+            "DELETE FROM runs WHERE id = ?1",
+        ] {
+            connection
+                .import_exec(sql, &params)
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+        }
+        deleted += 1;
+    }
+    Ok(deleted)
 }
 
 #[derive(Default)]
 struct RunImportTracking {
     imported_run_ids: HashSet<String>,
+    inserted_run_ids: HashSet<String>,
     overwritten_run_ids: HashSet<String>,
     overwritten_segment_idxs_before: HashMap<String, HashSet<i64>>,
     overwritten_event_seqs_before: HashMap<String, HashSet<i64>>,
@@ -1224,12 +1845,12 @@ fn import_runs(
     conflict_policy: ConflictPolicy,
     conflicts: &mut Vec<SyncConflict>,
     tracking: &mut RunImportTracking,
+    batch_import_enabled: bool,
 ) -> FwResult<u64> {
-    let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
+    let reader = open_jsonl_reader(path)?;
     let mut count = 0u64;
 
-    if sync_batch_import_enabled() {
+    if batch_import_enabled {
         // Batched: pre-fetch the existing rows for a chunk of ids with one
         // `WHERE id IN (…)` query, then run the SAME `apply_run_row` conflict logic
         // per line ⇒ byte-identical to the per-line path. Chunked to bound memory.
@@ -1243,6 +1864,9 @@ fn import_runs(
             }
             let row: serde_json::Value = serde_json::from_str(line)?;
             let id = json_str(&row, "id")?;
+            let backend = json_str(&row, "backend")?;
+            let result_json = json_str(&row, "result_json")?;
+            crate::storage::validate_run_backend_json(&id, &backend, &result_json)?;
             chunk.push((id, row));
             if chunk.len() >= chunk_size {
                 count +=
@@ -1259,6 +1883,9 @@ fn import_runs(
             }
             let row: serde_json::Value = serde_json::from_str(line)?;
             let id = json_str(&row, "id")?;
+            let backend = json_str(&row, "backend")?;
+            let result_json = json_str(&row, "result_json")?;
+            crate::storage::validate_run_backend_json(&id, &backend, &result_json)?;
 
             // Per-line existing lookup (the N+1 the batched path collapses).
             let existing_rows = connection
@@ -1286,12 +1913,32 @@ fn import_runs(
     Ok(count)
 }
 
+/// Convert one `runs` JSONL row into the database column order shared by INSERT,
+/// UPDATE, and the batched import seen-map.
+fn run_cols_from_json(id: &str, row: &serde_json::Value) -> FwResult<Vec<SqliteValue>> {
+    Ok(vec![
+        SqliteValue::Text(id.to_owned().into()),
+        SqliteValue::Text(json_str(row, "started_at")?.into()),
+        SqliteValue::Text(json_str(row, "finished_at")?.into()),
+        SqliteValue::Text(json_str(row, "backend")?.into()),
+        SqliteValue::Text(json_str(row, "input_path")?.into()),
+        SqliteValue::Text(json_str(row, "normalized_wav_path")?.into()),
+        SqliteValue::Text(json_str(row, "request_json")?.into()),
+        SqliteValue::Text(json_str(row, "result_json")?.into()),
+        SqliteValue::Text(json_str(row, "warnings_json")?.into()),
+        SqliteValue::Text(json_str(row, "transcript")?.into()),
+        SqliteValue::Text(json_string_or_default(row, "replay_json", "{}").into()),
+        SqliteValue::Text(json_string_or_default(row, "acceleration_json", "{}").into()),
+    ])
+}
+
 /// Process one `runs` JSONL row against `existing` (the current DB/seen row, or
 /// `None`), applying the identical-compare + [`ConflictPolicy`]. **Shared by the
 /// per-line and batched import paths** so their imported rows are byte-identical —
 /// the only difference is where `existing` comes from (a per-line `SELECT` vs a
-/// prefetched `WHERE id IN (…)` map). Returns `Some(inserted_cols)` when a row was
-/// INSERTed (so the batched caller can update its intra-chunk seen-map), else `None`.
+/// prefetched `WHERE id IN (…)` map). Returns `Some(written_cols)` when a row was
+/// INSERTed or updated (so the batched caller can update its intra-chunk seen-map),
+/// else `None`.
 fn apply_run_row(
     connection: &Connection,
     id: &str,
@@ -1357,6 +2004,28 @@ fn apply_run_row(
                     .entry(id.to_owned())
                     .or_default()
                     .extend(existing_event_seqs);
+                tracking.overwritten_run_ids.insert(id.to_owned());
+
+                if conflict_policy == ConflictPolicy::Overwrite {
+                    // Preserve child rows as the comparison authority for the
+                    // upcoming segment/event imports. The enclosing transaction
+                    // rolls this parent update back if either child payload differs.
+                    let cols = run_cols_from_json(id, row)?;
+                    connection
+                        .import_exec(
+                            "UPDATE runs SET started_at = ?2, finished_at = ?3, backend = ?4, \
+                             input_path = ?5, normalized_wav_path = ?6, request_json = ?7, \
+                             result_json = ?8, warnings_json = ?9, transcript = ?10, \
+                             replay_json = ?11, acceleration_json = ?12 WHERE id = ?1",
+                            &cols,
+                        )
+                        .map_err(|error| {
+                            FwError::Storage(format!(
+                                "overwrite update runs `{id}` failed: {error}"
+                            ))
+                        })?;
+                    return Ok(Some(cols));
+                }
 
                 connection
                     .import_exec(
@@ -1384,26 +2053,12 @@ fn apply_run_row(
                     .map_err(|error| {
                         FwError::Storage(format!("overwrite delete runs `{id}` failed: {error}"))
                     })?;
-                tracking.overwritten_run_ids.insert(id.to_owned());
                 // Fall through to INSERT.
             }
         }
     }
 
-    let cols = vec![
-        SqliteValue::Text(id.to_owned().into()),
-        SqliteValue::Text(json_str(row, "started_at")?.into()),
-        SqliteValue::Text(json_str(row, "finished_at")?.into()),
-        SqliteValue::Text(json_str(row, "backend")?.into()),
-        SqliteValue::Text(json_str(row, "input_path")?.into()),
-        SqliteValue::Text(json_str(row, "normalized_wav_path")?.into()),
-        SqliteValue::Text(json_str(row, "request_json")?.into()),
-        SqliteValue::Text(json_str(row, "result_json")?.into()),
-        SqliteValue::Text(json_str(row, "warnings_json")?.into()),
-        SqliteValue::Text(json_str(row, "transcript")?.into()),
-        SqliteValue::Text(json_string_or_default(row, "replay_json", "{}").into()),
-        SqliteValue::Text(json_string_or_default(row, "acceleration_json", "{}").into()),
-    ];
+    let cols = run_cols_from_json(id, row)?;
     connection
         .import_exec(
             "INSERT INTO runs (id, started_at, finished_at, backend, input_path, \
@@ -1412,6 +2067,7 @@ fn apply_run_row(
             &cols,
         )
         .map_err(|error| FwError::Storage(format!("insert runs `{id}` failed: {error}")))?;
+    tracking.inserted_run_ids.insert(id.to_owned());
 
     Ok(Some(cols))
 }
@@ -1472,7 +2128,7 @@ fn flush_run_chunk(
             conflicts,
             tracking,
         )? {
-            existing_map.insert(id, inserted); // seen-map: later dup in chunk sees this insert
+            existing_map.insert(id, inserted); // seen-map: later dup sees this write
         }
         count += 1;
     }
@@ -1535,6 +2191,25 @@ fn record_segment_pre(
             .insert(idx);
     }
     Ok(())
+}
+
+/// Validate a child row that belongs to a target run which existed before this
+/// import. `Skip` is a whole-aggregate policy: accepted rows still count toward
+/// manifest reconciliation, but none may query, compare, or mutate child state.
+fn skip_preexisting_child_row(
+    run_id: &str,
+    row: &serde_json::Value,
+    conflict_policy: ConflictPolicy,
+    inserted_run_ids: &HashSet<String>,
+    required_fields: &[&str],
+) -> FwResult<bool> {
+    if conflict_policy != ConflictPolicy::Skip || inserted_run_ids.contains(run_id) {
+        return Ok(false);
+    }
+    for field in required_fields {
+        json_str(row, field)?;
+    }
+    Ok(true)
 }
 
 /// Apply one `segments` JSONL row against `existing` (current DB/seen row, or
@@ -1636,6 +2311,10 @@ fn apply_segment_row(
 /// intra-chunk seen-map (updated on every INSERT), reproducing the per-line invariant
 /// that a duplicate `(run_id, idx)` later in the file sees the earlier line's insert.
 /// Drains `chunk`. Returns the number of lines processed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "segment batching keeps parent-policy sets explicit and borrowed"
+)]
 fn flush_segment_chunk(
     connection: &Connection,
     chunk: &mut Vec<(String, i64, serde_json::Value)>,
@@ -1644,6 +2323,7 @@ fn flush_segment_chunk(
     state: &mut SegmentImportState,
     imported_run_ids: &HashSet<String>,
     overwritten_run_ids: &HashSet<String>,
+    inserted_run_ids: &HashSet<String>,
 ) -> FwResult<u64> {
     if chunk.is_empty() {
         return Ok(0);
@@ -1653,31 +2333,36 @@ fn flush_segment_chunk(
     let unique_run_ids: Vec<String> = chunk
         .iter()
         .map(|(run_id, _, _)| run_id.clone())
+        .filter(|run_id| {
+            conflict_policy != ConflictPolicy::Skip || inserted_run_ids.contains(run_id)
+        })
         .filter(|run_id| seen.insert(run_id.clone()))
         .collect();
-    let placeholders = (1..=unique_run_ids.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id IN ({placeholders})"
-    );
-    let params: Vec<SqliteValue> = unique_run_ids
-        .iter()
-        .map(|run_id| SqliteValue::Text(run_id.clone().into()))
-        .collect();
-    let rows = connection
-        .query_with_params(&sql, &params)
-        .map_err(|error| {
-            FwError::Storage(format!("batch query segments existing failed: {error}"))
-        })?;
-
     let mut existing_map: HashMap<(String, i64), Vec<SqliteValue>> = HashMap::new();
-    for r in &rows {
-        let cols = segment_row_to_cols(r);
-        let run_id = value_to_string_sqlite(cols.first());
-        if let Some(SqliteValue::Integer(idx)) = cols.get(1) {
-            existing_map.insert((run_id, *idx), cols);
+    if !unique_run_ids.is_empty() {
+        let placeholders = (1..=unique_run_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id IN ({placeholders})"
+        );
+        let params: Vec<SqliteValue> = unique_run_ids
+            .iter()
+            .map(|run_id| SqliteValue::Text(run_id.clone().into()))
+            .collect();
+        let rows = connection
+            .query_with_params(&sql, &params)
+            .map_err(|error| {
+                FwError::Storage(format!("batch query segments existing failed: {error}"))
+            })?;
+
+        for row in &rows {
+            let cols = segment_row_to_cols(row);
+            let run_id = value_to_string_sqlite(cols.first());
+            if let Some(SqliteValue::Integer(idx)) = cols.get(1) {
+                existing_map.insert((run_id, *idx), cols);
+            }
         }
     }
 
@@ -1694,6 +2379,11 @@ fn flush_segment_chunk(
             overwritten_run_ids,
             state,
         )?;
+        if skip_preexisting_child_row(&run_id, &row, conflict_policy, inserted_run_ids, &["text"])?
+        {
+            count += 1;
+            continue;
+        }
         let existing = existing_map.get(&(run_id.clone(), idx)).cloned();
         if let Some(cols) = apply_segment_row(
             connection,
@@ -1713,6 +2403,10 @@ fn flush_segment_chunk(
     Ok(count)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "segment import keeps parent-policy sets explicit and borrowed"
+)]
 fn import_segments(
     connection: &Connection,
     path: &Path,
@@ -1720,14 +2414,15 @@ fn import_segments(
     conflicts: &mut Vec<SyncConflict>,
     imported_run_ids: &HashSet<String>,
     overwritten_run_ids: &HashSet<String>,
+    inserted_run_ids: &HashSet<String>,
     overwritten_segment_idxs_before: &HashMap<String, HashSet<i64>>,
+    batch_import_enabled: bool,
 ) -> FwResult<u64> {
-    let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
+    let reader = open_jsonl_reader(path)?;
     let mut count = 0u64;
     let mut state = SegmentImportState::default();
 
-    if sync_batch_import_enabled() {
+    if batch_import_enabled {
         let chunk_size = sync_query_batch_size().max(1);
         let mut chunk: Vec<(String, i64, serde_json::Value)> = Vec::with_capacity(chunk_size);
         for line in reader.lines() {
@@ -1752,6 +2447,7 @@ fn import_segments(
                     &mut state,
                     imported_run_ids,
                     overwritten_run_ids,
+                    inserted_run_ids,
                 )?;
             }
         }
@@ -1763,6 +2459,7 @@ fn import_segments(
             &mut state,
             imported_run_ids,
             overwritten_run_ids,
+            inserted_run_ids,
         )?;
     } else {
         for line in reader.lines() {
@@ -1790,6 +2487,16 @@ fn import_segments(
                 overwritten_run_ids,
                 &mut state,
             )?;
+            if skip_preexisting_child_row(
+                &run_id,
+                &row,
+                conflict_policy,
+                inserted_run_ids,
+                &["text"],
+            )? {
+                count += 1;
+                continue;
+            }
 
             let existing_rows = connection
                 .query_with_params(
@@ -1967,6 +2674,10 @@ fn apply_event_row(
 
 /// Batched-import worker for `events` (mirror of [`flush_segment_chunk`]; composite
 /// `(run_id, seq)` key, prefetched by `run_id`, seen-map for intra-chunk dups).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "event batching keeps parent-policy sets explicit and borrowed"
+)]
 fn flush_event_chunk(
     connection: &Connection,
     chunk: &mut Vec<(String, i64, serde_json::Value)>,
@@ -1975,6 +2686,7 @@ fn flush_event_chunk(
     state: &mut EventImportState,
     imported_run_ids: &HashSet<String>,
     overwritten_run_ids: &HashSet<String>,
+    inserted_run_ids: &HashSet<String>,
 ) -> FwResult<u64> {
     if chunk.is_empty() {
         return Ok(0);
@@ -1984,31 +2696,36 @@ fn flush_event_chunk(
     let unique_run_ids: Vec<String> = chunk
         .iter()
         .map(|(run_id, _, _)| run_id.clone())
+        .filter(|run_id| {
+            conflict_policy != ConflictPolicy::Skip || inserted_run_ids.contains(run_id)
+        })
         .filter(|run_id| seen.insert(run_id.clone()))
         .collect();
-    let placeholders = (1..=unique_run_ids.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events WHERE run_id IN ({placeholders})"
-    );
-    let params: Vec<SqliteValue> = unique_run_ids
-        .iter()
-        .map(|run_id| SqliteValue::Text(run_id.clone().into()))
-        .collect();
-    let rows = connection
-        .query_with_params(&sql, &params)
-        .map_err(|error| {
-            FwError::Storage(format!("batch query events existing failed: {error}"))
-        })?;
-
     let mut existing_map: HashMap<(String, i64), Vec<SqliteValue>> = HashMap::new();
-    for r in &rows {
-        let cols = event_row_to_cols(r);
-        let run_id = value_to_string_sqlite(cols.first());
-        if let Some(SqliteValue::Integer(seq)) = cols.get(1) {
-            existing_map.insert((run_id, *seq), cols);
+    if !unique_run_ids.is_empty() {
+        let placeholders = (1..=unique_run_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events WHERE run_id IN ({placeholders})"
+        );
+        let params: Vec<SqliteValue> = unique_run_ids
+            .iter()
+            .map(|run_id| SqliteValue::Text(run_id.clone().into()))
+            .collect();
+        let rows = connection
+            .query_with_params(&sql, &params)
+            .map_err(|error| {
+                FwError::Storage(format!("batch query events existing failed: {error}"))
+            })?;
+
+        for row in &rows {
+            let cols = event_row_to_cols(row);
+            let run_id = value_to_string_sqlite(cols.first());
+            if let Some(SqliteValue::Integer(seq)) = cols.get(1) {
+                existing_map.insert((run_id, *seq), cols);
+            }
         }
     }
 
@@ -2025,6 +2742,16 @@ fn flush_event_chunk(
             overwritten_run_ids,
             state,
         )?;
+        if skip_preexisting_child_row(
+            &run_id,
+            &row,
+            conflict_policy,
+            inserted_run_ids,
+            &["ts_rfc3339", "stage", "code", "message", "payload_json"],
+        )? {
+            count += 1;
+            continue;
+        }
         let existing = existing_map.get(&(run_id.clone(), seq)).cloned();
         if let Some(cols) = apply_event_row(
             connection,
@@ -2044,6 +2771,10 @@ fn flush_event_chunk(
     Ok(count)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "event import keeps parent-policy sets explicit and borrowed"
+)]
 fn import_events(
     connection: &Connection,
     path: &Path,
@@ -2051,14 +2782,15 @@ fn import_events(
     conflicts: &mut Vec<SyncConflict>,
     imported_run_ids: &HashSet<String>,
     overwritten_run_ids: &HashSet<String>,
+    inserted_run_ids: &HashSet<String>,
     overwritten_event_seqs_before: &HashMap<String, HashSet<i64>>,
+    batch_import_enabled: bool,
 ) -> FwResult<u64> {
-    let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
+    let reader = open_jsonl_reader(path)?;
     let mut count = 0u64;
     let mut state = EventImportState::default();
 
-    if sync_batch_import_enabled() {
+    if batch_import_enabled {
         let chunk_size = sync_query_batch_size().max(1);
         let mut chunk: Vec<(String, i64, serde_json::Value)> = Vec::with_capacity(chunk_size);
         for line in reader.lines() {
@@ -2083,6 +2815,7 @@ fn import_events(
                     &mut state,
                     imported_run_ids,
                     overwritten_run_ids,
+                    inserted_run_ids,
                 )?;
             }
         }
@@ -2094,6 +2827,7 @@ fn import_events(
             &mut state,
             imported_run_ids,
             overwritten_run_ids,
+            inserted_run_ids,
         )?;
     } else {
         for line in reader.lines() {
@@ -2121,6 +2855,16 @@ fn import_events(
                 overwritten_run_ids,
                 &mut state,
             )?;
+            if skip_preexisting_child_row(
+                &run_id,
+                &row,
+                conflict_policy,
+                inserted_run_ids,
+                &["ts_rfc3339", "stage", "code", "message", "payload_json"],
+            )? {
+                count += 1;
+                continue;
+            }
 
             let existing_rows = connection
                 .query_with_params(
@@ -2378,25 +3122,46 @@ fn validate_export_format_version(manifest: &SyncManifest) -> FwResult<()> {
     Ok(())
 }
 
-fn validate_checksums(manifest: &SyncManifest, input_dir: &Path) -> FwResult<()> {
+fn validate_checksums(manifest: &SyncManifest, input_dir: &Path) -> FwResult<JsonlInputPaths> {
+    let input_paths = JsonlInputPaths::resolve(input_dir);
+    validate_checksums_for_paths(manifest, &input_paths)?;
+    Ok(input_paths)
+}
+
+fn validate_checksums_for_paths(
+    manifest: &SyncManifest,
+    input_paths: &JsonlInputPaths,
+) -> FwResult<()> {
     let checks = [
-        ("runs.jsonl", &manifest.checksums.runs_jsonl_sha256),
-        ("segments.jsonl", &manifest.checksums.segments_jsonl_sha256),
-        ("events.jsonl", &manifest.checksums.events_jsonl_sha256),
+        (
+            "runs.jsonl",
+            &input_paths.runs,
+            &manifest.checksums.runs_jsonl_sha256,
+        ),
+        (
+            "segments.jsonl",
+            &input_paths.segments,
+            &manifest.checksums.segments_jsonl_sha256,
+        ),
+        (
+            "events.jsonl",
+            &input_paths.events,
+            &manifest.checksums.events_jsonl_sha256,
+        ),
     ];
 
-    for (filename, expected) in checks {
-        let path = input_dir.join(filename);
+    for (logical_filename, path, expected) in checks {
         if !path.exists() {
             return Err(FwError::Storage(format!(
-                "missing export file: {}",
-                path.display()
+                "missing export file: {logical_filename} or {logical_filename}.gz in {}",
+                path.parent().unwrap_or_else(|| Path::new(".")).display()
             )));
         }
-        let actual = sha256_file(&path)?;
+        let actual = sha256_jsonl_file(path)?;
         if &actual != expected {
             return Err(FwError::Storage(format!(
-                "checksum mismatch for {filename}: expected {expected}, got {actual}"
+                "checksum mismatch for {} (logical {logical_filename} bytes): expected {expected}, got {actual}",
+                path.display()
             )));
         }
     }
@@ -2558,15 +3323,24 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
+#[cfg(test)]
 fn sha256_file(path: &Path) -> FwResult<String> {
-    let mut file = fs::File::open(path)?;
+    sha256_reader(fs::File::open(path)?)
+}
+
+/// Hash the logical JSONL bytes, transparently decompressing a `.gz` input.
+fn sha256_jsonl_file(path: &Path) -> FwResult<String> {
+    sha256_reader(open_jsonl_reader(path)?)
+}
+
+fn sha256_reader(mut reader: impl Read) -> FwResult<String> {
     let mut hasher = Sha256::new();
     // 64 KiB read buffer (matches the native-engine hasher): 8× fewer `read()`
     // syscalls than the previous 8 KiB when checksumming large export/import JSONL.
     // Same SHA regardless of chunk size.
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buf)?;
+        let read = reader.read(&mut buf)?;
         if read == 0 {
             break;
         }
@@ -2854,7 +3628,7 @@ pub fn compress_jsonl(input_path: &Path, output_path: &Path) -> FwResult<()> {
 pub fn decompress_jsonl(input_path: &Path, output_path: &Path) -> FwResult<()> {
     let tmp = output_path.with_extension("tmp");
     let input = fs::File::open(input_path)?;
-    let mut decoder = GzDecoder::new(BufReader::new(input));
+    let mut decoder = MultiGzDecoder::new(BufReader::new(input));
     let mut writer = BufWriter::new(fs::File::create(&tmp)?);
 
     std::io::copy(&mut decoder, &mut writer)?;
@@ -2866,12 +3640,76 @@ pub fn decompress_jsonl(input_path: &Path, output_path: &Path) -> FwResult<()> {
     Ok(())
 }
 
+/// Gzip every JSONL file an export wrote into `output_dir` (`runs`,
+/// `segments`, `events`, and `deleted_runs` when present), replacing each
+/// plain file with its `.jsonl.gz` counterpart. Manifest checksums cover the
+/// uncompressed logical bytes, so the archive validates unchanged. Returns the
+/// compressed file names.
+///
+/// # Errors
+///
+/// Propagates I/O failures; a plain file is removed only after its compressed
+/// replacement has been durably published.
+fn gzip_export_files(output_dir: &Path) -> FwResult<Vec<String>> {
+    let mut compressed = Vec::new();
+    for stem in ["runs", "segments", "events", DELETED_RUNS_STEM] {
+        let plain = output_dir.join(format!("{stem}.jsonl"));
+        if !plain.exists() {
+            continue;
+        }
+        let gz_name = format!("{stem}.jsonl.gz");
+        compress_jsonl(&plain, &output_dir.join(&gz_name))?;
+        fs::remove_file(&plain)?;
+        compressed.push(gz_name);
+    }
+    sync_parent_dir(&output_dir.join("manifest.json"))?;
+    Ok(compressed)
+}
+
+/// Remove a `{stem}.jsonl.gz` left in `output_dir` by an earlier compressed
+/// export before a plain export publishes its manifest. Readers prefer the
+/// `.gz` spelling, so a stale compressed file would shadow the freshly
+/// written `{stem}.jsonl` and make the new archive fail its checksums.
+fn remove_stale_compressed_jsonl(output_dir: &Path, stems: &[&str]) -> FwResult<()> {
+    let mut removed = false;
+    for stem in stems {
+        match fs::remove_file(output_dir.join(format!("{stem}.jsonl.gz"))) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if removed {
+        sync_parent_dir(&output_dir.join("manifest.json"))?;
+    }
+    Ok(())
+}
+
+/// Whether the archive in `input_dir` is an incremental (partial) snapshot,
+/// as declared by its manifest's `export_mode`.
+///
+/// # Errors
+///
+/// Returns an error when `manifest.json` is missing or is not valid JSON.
+pub fn archive_is_incremental(input_dir: &Path) -> FwResult<bool> {
+    let manifest_text = fs::read_to_string(input_dir.join("manifest.json"))?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+        .map_err(|error| FwError::Storage(format!("invalid manifest: {error}")))?;
+    Ok(manifest
+        .get("export_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("incremental"))
+}
+
 /// Open a JSONL file for reading, transparently decompressing if the path
 /// ends with `.gz`.
 fn open_jsonl_reader(path: &Path) -> FwResult<Box<dyn BufRead>> {
     let file = fs::File::open(path)?;
     if path.extension().is_some_and(|ext| ext == "gz") {
-        let decoder = GzDecoder::new(BufReader::new(file));
+        // Multi-member aware: bgzip/pigz output and concatenated gzip files
+        // are valid `.gz` streams; a single-member decoder would stop at the
+        // first member and silently truncate the logical JSONL.
+        let decoder = MultiGzDecoder::new(BufReader::new(file));
         Ok(Box::new(BufReader::new(decoder)))
     } else {
         Ok(Box::new(BufReader::new(file)))
@@ -2904,20 +3742,70 @@ pub struct SyncValidationReport {
     pub missing_from_db: Vec<String>,
     /// Run IDs where the record exists in both but data differs.
     pub mismatched_records: Vec<String>,
+    /// Bounded child-row diagnostics keyed by `run_id/idx` or `run_id/seq`.
+    pub child_mismatches: Vec<SyncConflict>,
+    /// `true` when additional child-row diagnostics exceeded the report cap.
+    pub child_mismatches_truncated: bool,
     /// `true` when the database and JSONL export are in perfect agreement.
     pub is_valid: bool,
+}
+
+type ChildValidationKey = (String, i64);
+
+#[derive(Debug, PartialEq)]
+struct SegmentValidationRow {
+    start_sec: Option<f64>,
+    end_sec: Option<f64>,
+    speaker: Option<String>,
+    text: String,
+    confidence: Option<f64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EventValidationRow {
+    ts_rfc3339: String,
+    stage: String,
+    code: String,
+    message: String,
+    payload_json: String,
 }
 
 /// Validate that a SQLite database and a JSONL export directory are in sync.
 ///
 /// Opens the database, reads the runs/segments/events JSONL files from
-/// `jsonl_dir`, and compares run counts, run IDs, segment counts, and event
-/// counts. Supports reading both plain `.jsonl` and compressed `.jsonl.gz`
-/// files (the `.gz` variant is preferred when both exist).
+/// `jsonl_dir`, and compares every persisted run, segment, and event field.
+/// Supports reading both plain `.jsonl` and compressed `.jsonl.gz` files (the
+/// `.gz` variant is preferred when both exist). All database reads share one
+/// read transaction so a concurrent writer cannot produce a torn comparison.
 pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidationReport> {
+    validate_sync_with_after_run_ids(db_path, jsonl_dir, || Ok(()))
+}
+
+fn validate_sync_with_after_run_ids<F>(
+    db_path: &Path,
+    jsonl_dir: &Path,
+    after_run_ids: F,
+) -> FwResult<SyncValidationReport>
+where
+    F: FnOnce() -> FwResult<()>,
+{
     let connection = Connection::open(db_path.display().to_string())
         .map_err(|error| FwError::Storage(error.to_string()))?;
-    verify_schema_exists(&connection)?;
+    with_read_snapshot(&connection, || {
+        validate_sync_snapshot(&connection, jsonl_dir, after_run_ids)
+    })
+}
+
+fn validate_sync_snapshot<F>(
+    connection: &Connection,
+    jsonl_dir: &Path,
+    after_run_ids: F,
+) -> FwResult<SyncValidationReport>
+where
+    F: FnOnce() -> FwResult<()>,
+{
+    verify_schema_exists(connection)?;
+    let input_paths = require_validation_jsonl_inputs(jsonl_dir)?;
 
     // --- Collect DB run IDs ---
     let db_run_rows = connection
@@ -2927,28 +3815,29 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
         .iter()
         .map(|row| value_to_string_sqlite(row.get(0)))
         .collect();
+    after_run_ids()?;
 
-    // --- Collect DB counts ---
-    let db_segment_count = count_table(&connection, "segments")?;
-    let db_event_count = count_table(&connection, "events")?;
+    // --- Collect child rows from this same DB snapshot ---
+    let db_segment_map = load_db_segment_map(connection)?;
+    let db_event_map = load_db_event_map(connection)?;
+    let db_segment_count = db_segment_map.len() as u64;
+    let db_event_count = db_event_map.len() as u64;
 
     // --- Read JSONL runs ONCE (the map + the id set) ---
     // `runs.jsonl` was previously read twice — `collect_jsonl_ids` here and
     // `load_jsonl_run_map` later. Load the map once and derive the id set from its
     // keys: both include exactly the lines with a string `id` (skipping empty lines,
     // parsing every line), so `map.keys()` == `collect_jsonl_ids(runs, "id")` and the
-    // parse-error behavior is identical (runs.jsonl is the only JSON-parsed file;
-    // segments/events use `count_jsonl_lines`, which does not parse).
-    let runs_path = resolve_jsonl_path(jsonl_dir, "runs");
-    let jsonl_run_map = load_jsonl_run_map(&runs_path)?;
+    // parse-error behavior is identical.
+    let jsonl_run_map = load_jsonl_run_map(&input_paths.runs)?;
     let jsonl_run_ids: HashSet<String> = jsonl_run_map.keys().cloned().collect();
 
-    // --- Count JSONL segments and events ---
-    let segments_path = resolve_jsonl_path(jsonl_dir, "segments");
-    let jsonl_segment_count = count_jsonl_lines(&segments_path)?;
+    // --- Parse and validate JSONL children ---
+    let jsonl_segment_map = load_jsonl_segment_map(&input_paths.segments)?;
+    let jsonl_segment_count = jsonl_segment_map.len() as u64;
 
-    let events_path = resolve_jsonl_path(jsonl_dir, "events");
-    let jsonl_event_count = count_jsonl_lines(&events_path)?;
+    let jsonl_event_map = load_jsonl_event_map(&input_paths.events)?;
+    let jsonl_event_count = jsonl_event_map.len() as u64;
 
     // --- Compare ---
     let mut missing_from_jsonl: Vec<String> =
@@ -2961,7 +3850,7 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
     // --- Compare record content for shared run IDs ---
     // (`jsonl_run_map` already loaded above — no second read of runs.jsonl.)
     let shared_ids: Vec<&String> = db_run_ids.intersection(&jsonl_run_ids).collect();
-    let mut mismatched_records: Vec<String> = Vec::new();
+    let mut mismatched_run_ids: HashSet<String> = HashSet::new();
 
     // Prefetch the DB rows for all shared ids with one `WHERE id IN (…)` per chunk
     // instead of one `SELECT … WHERE id = ?1` per shared run (query *setup* dominates
@@ -2998,38 +3887,57 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
         if let Some(db_row) = db_run_map.get(*id)
             && let Some(jsonl_value) = jsonl_run_map.get(*id)
         {
-            let matches = value_to_string_sqlite(db_row.get(1))
-                == json_str_or_empty(jsonl_value, "started_at")
-                && value_to_string_sqlite(db_row.get(2))
-                    == json_str_or_empty(jsonl_value, "finished_at")
-                && value_to_string_sqlite(db_row.get(3))
-                    == json_str_or_empty(jsonl_value, "backend")
-                && value_to_string_sqlite(db_row.get(4))
-                    == json_str_or_empty(jsonl_value, "input_path")
-                && value_to_string_sqlite(db_row.get(5))
-                    == json_str_or_empty(jsonl_value, "normalized_wav_path")
-                && value_to_string_sqlite(db_row.get(6))
-                    == json_str_or_empty(jsonl_value, "request_json")
-                && value_to_string_sqlite(db_row.get(7))
-                    == json_str_or_empty(jsonl_value, "result_json")
-                && value_to_string_sqlite(db_row.get(8))
-                    == json_str_or_empty(jsonl_value, "warnings_json")
-                && value_to_string_sqlite(db_row.get(9))
-                    == json_str_or_empty(jsonl_value, "transcript")
+            let matches = [
+                "started_at",
+                "finished_at",
+                "backend",
+                "input_path",
+                "normalized_wav_path",
+                "request_json",
+                "result_json",
+                "warnings_json",
+                "transcript",
+            ]
+            .iter()
+            .enumerate()
+            .all(|(offset, key)| run_field_matches(db_row.get(offset + 1), jsonl_value, key))
                 && value_to_string_sqlite(db_row.get(10))
                     == json_string_or_default(jsonl_value, "replay_json", "{}")
                 && value_to_string_sqlite(db_row.get(11))
                     == json_string_or_default(jsonl_value, "acceleration_json", "{}");
             if !matches {
-                mismatched_records.push((*id).clone());
+                mismatched_run_ids.insert((*id).clone());
             }
         }
     }
+
+    let mut child_mismatches = Vec::new();
+    let mut child_mismatches_truncated = false;
+    collect_child_mismatches(
+        &db_segment_map,
+        &jsonl_segment_map,
+        "segments",
+        &mut child_mismatches,
+        &mut child_mismatches_truncated,
+    );
+    collect_child_mismatches(
+        &db_event_map,
+        &jsonl_event_map,
+        "events",
+        &mut child_mismatches,
+        &mut child_mismatches_truncated,
+    );
+
+    // Parent-row mismatches retain the existing run-ID diagnostic contract;
+    // child-row diagnostics are structured and bounded separately.
+    let mut mismatched_records: Vec<String> = mismatched_run_ids.into_iter().collect();
     mismatched_records.sort();
 
     let is_valid = missing_from_jsonl.is_empty()
         && missing_from_db.is_empty()
         && mismatched_records.is_empty()
+        && child_mismatches.is_empty()
+        && !child_mismatches_truncated
         && db_run_ids.len() as u64 == jsonl_run_ids.len() as u64
         && db_segment_count == jsonl_segment_count
         && db_event_count == jsonl_event_count;
@@ -3044,8 +3952,246 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
         missing_from_jsonl,
         missing_from_db,
         mismatched_records,
+        child_mismatches,
+        child_mismatches_truncated,
         is_valid,
     })
+}
+
+fn load_db_segment_map(
+    connection: &Connection,
+) -> FwResult<HashMap<ChildValidationKey, SegmentValidationRow>> {
+    let rows = connection
+        .query(
+            "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence \
+             FROM segments ORDER BY run_id ASC, idx ASC",
+        )
+        .map_err(|error| FwError::Storage(error.to_string()))?;
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let run_id = sqlite_required_text(row.get(0), "segments.run_id")?;
+        let idx = sqlite_required_i64(row.get(1), "segments.idx")?;
+        let value = SegmentValidationRow {
+            start_sec: sqlite_nullable_f64(row.get(2), "segments.start_sec")?,
+            end_sec: sqlite_nullable_f64(row.get(3), "segments.end_sec")?,
+            speaker: sqlite_nullable_text(row.get(4), "segments.speaker")?,
+            text: sqlite_required_text(row.get(5), "segments.text")?,
+            confidence: sqlite_nullable_f64(row.get(6), "segments.confidence")?,
+        };
+        if map.insert((run_id, idx), value).is_some() {
+            return Err(FwError::Storage(
+                "duplicate composite key in SQLite segments table".to_owned(),
+            ));
+        }
+    }
+    Ok(map)
+}
+
+fn load_db_event_map(
+    connection: &Connection,
+) -> FwResult<HashMap<ChildValidationKey, EventValidationRow>> {
+    let rows = connection
+        .query(
+            "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
+             FROM events ORDER BY run_id ASC, seq ASC",
+        )
+        .map_err(|error| FwError::Storage(error.to_string()))?;
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let run_id = sqlite_required_text(row.get(0), "events.run_id")?;
+        let seq = sqlite_required_i64(row.get(1), "events.seq")?;
+        let value = EventValidationRow {
+            ts_rfc3339: sqlite_required_text(row.get(2), "events.ts_rfc3339")?,
+            stage: sqlite_required_text(row.get(3), "events.stage")?,
+            code: sqlite_required_text(row.get(4), "events.code")?,
+            message: sqlite_required_text(row.get(5), "events.message")?,
+            payload_json: sqlite_required_text(row.get(6), "events.payload_json")?,
+        };
+        if map.insert((run_id, seq), value).is_some() {
+            return Err(FwError::Storage(
+                "duplicate composite key in SQLite events table".to_owned(),
+            ));
+        }
+    }
+    Ok(map)
+}
+
+fn load_jsonl_segment_map(
+    path: &Path,
+) -> FwResult<HashMap<ChildValidationKey, SegmentValidationRow>> {
+    let mut map = HashMap::new();
+    if !path.exists() {
+        return Ok(map);
+    }
+    for (line_index, line) in open_jsonl_reader(path)?.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = serde_json::from_str(trimmed)?;
+        let run_id = json_str(&row, "run_id")?;
+        let idx = json_required_i64(&row, "idx", "segments")?;
+        let value = SegmentValidationRow {
+            start_sec: json_nullable_f64(&row, "start_sec", "segments")?,
+            end_sec: json_nullable_f64(&row, "end_sec", "segments")?,
+            speaker: json_nullable_text(&row, "speaker", "segments")?,
+            text: json_str(&row, "text")?,
+            confidence: json_nullable_f64(&row, "confidence", "segments")?,
+        };
+        let key = (run_id, idx);
+        if map.insert(key.clone(), value).is_some() {
+            return Err(FwError::Storage(format!(
+                "duplicate composite key {}/{} in segments JSONL at line {}",
+                key.0,
+                key.1,
+                line_index + 1
+            )));
+        }
+    }
+    Ok(map)
+}
+
+fn load_jsonl_event_map(path: &Path) -> FwResult<HashMap<ChildValidationKey, EventValidationRow>> {
+    let mut map = HashMap::new();
+    if !path.exists() {
+        return Ok(map);
+    }
+    for (line_index, line) in open_jsonl_reader(path)?.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = serde_json::from_str(trimmed)?;
+        let run_id = json_str(&row, "run_id")?;
+        let seq = json_required_i64(&row, "seq", "events")?;
+        let value = EventValidationRow {
+            ts_rfc3339: json_str(&row, "ts_rfc3339")?,
+            stage: json_str(&row, "stage")?,
+            code: json_str(&row, "code")?,
+            message: json_str(&row, "message")?,
+            payload_json: json_str(&row, "payload_json")?,
+        };
+        let key = (run_id, seq);
+        if map.insert(key.clone(), value).is_some() {
+            return Err(FwError::Storage(format!(
+                "duplicate composite key {}/{} in events JSONL at line {}",
+                key.0,
+                key.1,
+                line_index + 1
+            )));
+        }
+    }
+    Ok(map)
+}
+
+fn collect_child_mismatches<T: PartialEq>(
+    db_rows: &HashMap<ChildValidationKey, T>,
+    jsonl_rows: &HashMap<ChildValidationKey, T>,
+    table: &str,
+    diagnostics: &mut Vec<SyncConflict>,
+    diagnostics_truncated: &mut bool,
+) {
+    let mut keys: HashSet<ChildValidationKey> = db_rows.keys().cloned().collect();
+    keys.extend(jsonl_rows.keys().cloned());
+    let mut keys: Vec<ChildValidationKey> = keys.into_iter().collect();
+    keys.sort();
+
+    for key in keys {
+        let run_id = &key.0;
+        let index = key.1;
+        let reason = match (db_rows.get(&key), jsonl_rows.get(&key)) {
+            (Some(db), Some(jsonl)) if db == jsonl => continue,
+            (Some(_), Some(_)) => "payload differs",
+            (Some(_), None) => "missing from JSONL",
+            (None, Some(_)) => "missing from database",
+            (None, None) => continue,
+        };
+        if diagnostics.len() < MAX_SYNC_VALIDATION_CHILD_MISMATCHES {
+            diagnostics.push(SyncConflict {
+                table: table.to_owned(),
+                key: format!("{run_id}/{index}"),
+                reason: reason.to_owned(),
+            });
+        } else {
+            *diagnostics_truncated = true;
+        }
+    }
+}
+
+fn sqlite_required_text(value: Option<&SqliteValue>, field: &str) -> FwResult<String> {
+    match value {
+        Some(SqliteValue::Text(text)) => Ok(text.to_string()),
+        _ => Err(FwError::Storage(format!(
+            "invalid non-text value in SQLite field `{field}`"
+        ))),
+    }
+}
+
+fn sqlite_required_i64(value: Option<&SqliteValue>, field: &str) -> FwResult<i64> {
+    match value {
+        Some(SqliteValue::Integer(number)) => Ok(*number),
+        _ => Err(FwError::Storage(format!(
+            "invalid non-integer value in SQLite field `{field}`"
+        ))),
+    }
+}
+
+fn sqlite_nullable_f64(value: Option<&SqliteValue>, field: &str) -> FwResult<Option<f64>> {
+    match value {
+        Some(SqliteValue::Float(number)) if number.is_finite() => Ok(Some(*number)),
+        Some(SqliteValue::Integer(number)) => Ok(Some(*number as f64)),
+        Some(SqliteValue::Null) => Ok(None),
+        _ => Err(FwError::Storage(format!(
+            "invalid numeric value in SQLite field `{field}`"
+        ))),
+    }
+}
+
+fn sqlite_nullable_text(value: Option<&SqliteValue>, field: &str) -> FwResult<Option<String>> {
+    match value {
+        Some(SqliteValue::Text(text)) => Ok(Some(text.to_string())),
+        Some(SqliteValue::Null) => Ok(None),
+        _ => Err(FwError::Storage(format!(
+            "invalid text value in SQLite field `{field}`"
+        ))),
+    }
+}
+
+fn json_required_i64(value: &serde_json::Value, key: &str, table: &str) -> FwResult<i64> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| FwError::Storage(format!("invalid `{key}` in {table} JSONL row")))
+}
+
+fn json_nullable_f64(value: &serde_json::Value, key: &str, table: &str) -> FwResult<Option<f64>> {
+    match value.get(key) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(number)) => number
+            .as_f64()
+            .filter(|number| number.is_finite())
+            .map(Some)
+            .ok_or_else(|| FwError::Storage(format!("invalid `{key}` in {table} JSONL row"))),
+        _ => Err(FwError::Storage(format!(
+            "invalid `{key}` in {table} JSONL row"
+        ))),
+    }
+}
+
+fn json_nullable_text(
+    value: &serde_json::Value,
+    key: &str,
+    table: &str,
+) -> FwResult<Option<String>> {
+    match value.get(key) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text.clone())),
+        _ => Err(FwError::Storage(format!(
+            "invalid `{key}` in {table} JSONL row"
+        ))),
+    }
 }
 
 /// Resolve a JSONL file path, preferring `.jsonl.gz` over `.jsonl`.
@@ -3058,7 +4204,25 @@ fn resolve_jsonl_path(dir: &Path, stem: &str) -> PathBuf {
     }
 }
 
+fn require_validation_jsonl_inputs(dir: &Path) -> FwResult<JsonlInputPaths> {
+    let input_paths = JsonlInputPaths::resolve(dir);
+    for (logical_name, path) in [
+        ("runs.jsonl", &input_paths.runs),
+        ("segments.jsonl", &input_paths.segments),
+        ("events.jsonl", &input_paths.events),
+    ] {
+        if !path.exists() {
+            return Err(FwError::Storage(format!(
+                "missing sync validation input: {logical_name} or {logical_name}.gz in {}",
+                dir.display()
+            )));
+        }
+    }
+    Ok(input_paths)
+}
+
 /// Count the rows in a table via `SELECT COUNT(*)`.
+#[cfg(test)]
 fn count_table(connection: &Connection, table: &str) -> FwResult<u64> {
     let table_ident = sql_ident_sync(table);
     let sql = format!("SELECT COUNT(*) FROM {table_ident}");
@@ -3102,6 +4266,7 @@ fn collect_jsonl_ids(path: &Path, key: &str) -> FwResult<HashSet<String>> {
 }
 
 /// Count non-empty lines in a JSONL file.
+#[cfg(test)]
 fn count_jsonl_lines(path: &Path) -> FwResult<u64> {
     if !path.exists() {
         return Ok(0);
@@ -3126,28 +4291,48 @@ fn load_jsonl_run_map(
         return Ok(map);
     }
     let reader = open_jsonl_reader(path)?;
-    for line in reader.lines() {
+    for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         let value: serde_json::Value = serde_json::from_str(trimmed)?;
-        if let Some(id_str) = value.get("id").and_then(serde_json::Value::as_str) {
-            map.insert(id_str.to_owned(), value);
+        // A canonical run row without a string id cannot be matched against the
+        // database; dropping it would let a damaged archive validate (bd-8l6f).
+        let Some(id_str) = value.get("id").and_then(serde_json::Value::as_str) else {
+            return Err(FwError::Storage(format!(
+                "run row without a string `id` in runs JSONL at line {}",
+                line_index + 1
+            )));
+        };
+        if map.contains_key(id_str) {
+            return Err(FwError::Storage(format!(
+                "duplicate run id {id_str:?} in runs JSONL at line {}",
+                line_index + 1
+            )));
         }
+        map.insert(id_str.to_owned(), value);
     }
     Ok(map)
 }
 
-/// Extract a string field from a JSON value, returning an empty string on
-/// missing or non-string values.
-fn json_str_or_empty(value: &serde_json::Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_owned()
+/// Exact JSONL-vs-SQLite comparison for one exported run column: the key must
+/// be present, a JSON string matches only the identical TEXT value, and JSON
+/// null matches only SQL NULL. A missing key or a changed type is a mismatch
+/// (bd-8l6f) instead of collapsing to "" on both sides.
+fn run_field_matches(
+    db_value: Option<&SqliteValue>,
+    jsonl_row: &serde_json::Value,
+    key: &str,
+) -> bool {
+    match (jsonl_row.get(key), db_value) {
+        (Some(serde_json::Value::String(text)), Some(SqliteValue::Text(_))) => {
+            value_to_string_sqlite(db_value) == *text
+        }
+        (Some(serde_json::Value::Null), None | Some(SqliteValue::Null)) => true,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3362,6 +4547,8 @@ mod tests {
                 backend_identity: Some("whisper-cli".to_owned()),
                 backend_version: Some("whisper 1.2.3".to_owned()),
                 output_payload_hash: Some("sync-output-hash".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         }
     }
@@ -3652,12 +4839,44 @@ mod tests {
         estimate
     }
 
-    fn test_cursor(ts: &str, run_id: Option<&str>) -> SyncCursor {
+    fn test_cursor(
+        connection: &Connection,
+        last_mutation_seq: i64,
+        ts: &str,
+        run_id: Option<&str>,
+    ) -> SyncCursor {
         SyncCursor {
+            last_mutation_seq,
+            database_id: Some(
+                load_mutation_authority(connection)
+                    .expect("load mutation authority")
+                    .database_id,
+            ),
             last_export_rfc3339: ts.to_owned(),
             last_export_run_id: run_id.map(str::to_owned),
             last_run_count: 0,
         }
+    }
+
+    fn run_mutation_seq(connection: &Connection, run_id: &str) -> i64 {
+        connection
+            .query_with_params(
+                "SELECT mutation_seq FROM sync_run_mutations WHERE run_id = ?1",
+                &[SqliteValue::Text(run_id.to_owned().into())],
+            )
+            .expect("query run mutation sequence")
+            .first()
+            .and_then(|row| row.get(0).and_then(|value| value.as_integer()))
+            .expect("run mutation sequence")
+    }
+
+    fn mutation_high_water(connection: &Connection) -> i64 {
+        connection
+            .query("SELECT COALESCE(MAX(mutation_seq), 0) FROM sync_run_mutations")
+            .expect("query mutation high-water mark")
+            .first()
+            .and_then(|row| row.get(0).and_then(|value| value.as_integer()))
+            .expect("mutation high-water mark")
     }
 
     #[test]
@@ -3682,6 +4901,121 @@ mod tests {
         assert!(export_dir.join("runs.jsonl").exists());
         assert!(export_dir.join("segments.jsonl").exists());
         assert!(export_dir.join("events.jsonl").exists());
+    }
+
+    #[test]
+    fn import_rejects_parent_result_backend_mismatch_before_persisting_run() {
+        let dir = tempdir().expect("tempdir");
+        let export_dir = dir.path().join("incoherent-export");
+        let fixture_db = dir.path().join("fixture.sqlite3");
+        let report = fixture_report("sync-backend-mismatch", &fixture_db);
+        let run_row = json!({
+            "id": report.run_id,
+            "started_at": report.started_at_rfc3339,
+            "finished_at": report.finished_at_rfc3339,
+            "backend": "native-listen",
+            "input_path": report.input_path,
+            "normalized_wav_path": report.normalized_wav_path,
+            "request_json": serde_json::to_string(&report.request).expect("request json"),
+            "result_json": serde_json::to_string(&report.result).expect("result json"),
+            "warnings_json": serde_json::to_string(&report.warnings).expect("warnings json"),
+            "transcript": report.result.transcript,
+            "replay_json": serde_json::to_string(&report.replay).expect("replay json"),
+            "acceleration_json": "{}",
+        });
+        write_jsonl_snapshot(&export_dir, &[run_row], &[], &[]);
+
+        for batch_import_enabled in [false, true] {
+            let db_path = dir
+                .path()
+                .join(format!("import-{batch_import_enabled}.sqlite3"));
+            let error = import_inner_with_batch_mode(
+                &db_path,
+                &export_dir,
+                ConflictPolicy::Reject,
+                batch_import_enabled,
+            )
+            .expect_err("incoherent parent/result backends must fail import");
+            let message = error.to_string();
+            assert!(
+                message.contains("sync-backend-mismatch"),
+                "import error omitted run id: {message}"
+            );
+            assert!(
+                message.contains("backend mismatch"),
+                "unexpected import error: {message}"
+            );
+
+            let store = RunStore::open(&db_path).expect("open rolled-back import database");
+            assert!(
+                store.list_recent_runs(1).expect("list runs").is_empty(),
+                "incoherent run must not survive the failed import"
+            );
+        }
+    }
+
+    #[test]
+    fn full_export_uses_one_snapshot_across_parent_and_child_queries() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("full_snapshot.sqlite3");
+        let export_dir = dir.path().join("export");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("full-snapshot-first", &db_path))
+            .expect("persist first report");
+
+        let (runs_exported_tx, runs_exported_rx) = std::sync::mpsc::sync_channel(0);
+        let (writer_committed_tx, writer_committed_rx) = std::sync::mpsc::sync_channel(0);
+        let export_db_path = db_path.clone();
+        let export_output_dir = export_dir.clone();
+        let export_thread = std::thread::spawn(move || {
+            export_inner_with_after_runs(&export_db_path, &export_output_dir, || {
+                runs_exported_tx.send(()).expect("signal runs exported");
+                writer_committed_rx
+                    .recv()
+                    .expect("wait for concurrent writer");
+            })
+        });
+
+        runs_exported_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("wait for runs export");
+        store
+            .persist_report(&fixture_report("full-snapshot-second", &db_path))
+            .expect("persist concurrent report");
+        writer_committed_tx
+            .send(())
+            .expect("release snapshot export");
+
+        let manifest = export_thread
+            .join()
+            .expect("snapshot export thread")
+            .expect("snapshot export");
+        assert_eq!(manifest.row_counts.runs, 1);
+        assert_eq!(manifest.row_counts.segments, 2);
+        assert_eq!(manifest.row_counts.events, 2);
+
+        for (file_name, run_id_key) in [
+            ("runs.jsonl", "id"),
+            ("segments.jsonl", "run_id"),
+            ("events.jsonl", "run_id"),
+        ] {
+            let rows: Vec<serde_json::Value> = fs::read_to_string(export_dir.join(file_name))
+                .expect("read snapshot file")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("parse snapshot row"))
+                .collect();
+            assert!(
+                !rows.is_empty(),
+                "{file_name} should contain first run rows"
+            );
+            assert!(
+                rows.iter()
+                    .all(|row| row[run_id_key] == "full-snapshot-first"),
+                "{file_name} must wholly exclude the concurrent run"
+            );
+        }
     }
 
     #[test]
@@ -4092,7 +5426,8 @@ mod tests {
         );
         assert!(
             error.to_string().contains(
-                "expected exactly acoustic-diarization-v3 or neural-diarization-common-v2"
+                "expected exactly acoustic-diarization-v3, neural-diarization-common-v2 or \
+                 sortformer-diarization-v1"
             ),
             "unknown acoustic contract versions must remain fail-closed: {error}"
         );
@@ -4304,33 +5639,92 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_lock_is_archived_and_replaced() {
+    fn fresh_corrupt_lock_fails_closed_without_archiving() {
         let dir = tempdir().expect("tempdir");
         let state_root = dir.path().join("state");
         let locks_dir = state_root.join("locks");
         fs::create_dir_all(&locks_dir).expect("locks dir");
-        fs::write(locks_dir.join("sync.lock"), "{not-json").expect("write corrupt lock");
+        let lock_path = locks_dir.join("sync.lock");
+        fs::write(&lock_path, "{not-json").expect("write corrupt lock");
 
-        let lock = SyncLock::acquire(&state_root, "test").expect("acquire should recover");
-        lock.release().expect("release");
+        let error = SyncLock::acquire(&state_root, "test")
+            .err()
+            .expect("fresh corrupt lock must block acquisition");
+        assert!(
+            error
+                .to_string()
+                .contains("potentially active partial lock"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&lock_path).expect("fresh corrupt lock remains"),
+            "{not-json"
+        );
 
         let archived = fs::read_dir(&locks_dir)
             .expect("read dir")
             .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().to_string())
             .any(|name| name.starts_with("sync.lock.corrupt."));
-        assert!(archived, "corrupt lock should be archived");
+        assert!(!archived, "fresh corrupt lock must not be archived");
     }
 
     #[test]
-    fn non_utf8_lock_is_archived_and_replaced() {
+    fn fresh_non_utf8_lock_fails_closed_without_archiving() {
         let dir = tempdir().expect("tempdir");
         let state_root = dir.path().join("state");
         let locks_dir = state_root.join("locks");
         fs::create_dir_all(&locks_dir).expect("locks dir");
-        fs::write(locks_dir.join("sync.lock"), [0xff, 0xfe, 0xfd]).expect("write non-utf8 lock");
+        let lock_path = locks_dir.join("sync.lock");
+        let lock_bytes = [0xff, 0xfe, 0xfd];
+        fs::write(&lock_path, lock_bytes).expect("write non-utf8 lock");
 
-        let lock = SyncLock::acquire(&state_root, "test").expect("acquire should recover");
+        let error = SyncLock::acquire(&state_root, "test")
+            .err()
+            .expect("fresh non-UTF-8 lock must block acquisition");
+        assert!(
+            error
+                .to_string()
+                .contains("potentially active partial lock"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(&lock_path).expect("fresh non-UTF-8 lock remains"),
+            lock_bytes
+        );
+
+        let archived = fs::read_dir(&locks_dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .any(|name| name.starts_with("sync.lock.corrupt."));
+        assert!(!archived, "fresh non-UTF-8 lock must not be archived");
+    }
+
+    #[test]
+    fn stale_corrupt_lock_is_archived_and_replaced() {
+        let dir = tempdir().expect("tempdir");
+        let state_root = dir.path().join("state");
+        let locks_dir = state_root.join("locks");
+        fs::create_dir_all(&locks_dir).expect("locks dir");
+        let lock_path = locks_dir.join("sync.lock");
+        fs::write(&lock_path, "{not-json").expect("write corrupt lock");
+
+        let modified = fs::metadata(&lock_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("lock modified time");
+        let after_stale_threshold = modified
+            .checked_add(std::time::Duration::from_secs(
+                LOCK_STALE_SECONDS as u64 + 1,
+            ))
+            .expect("representable stale time");
+        assert!(
+            read_lock_info_at(&lock_path, after_stale_threshold)
+                .expect("stale corrupt lock should be recoverable")
+                .is_none()
+        );
+
+        let lock = SyncLock::acquire(&state_root, "test").expect("acquire after recovery");
         lock.release().expect("release");
 
         let archived = fs::read_dir(&locks_dir)
@@ -4338,7 +5732,123 @@ mod tests {
             .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().to_string())
             .any(|name| name.starts_with("sync.lock.corrupt."));
-        assert!(archived, "non-utf8 lock should be archived");
+        assert!(archived, "stale corrupt lock should be archived");
+    }
+
+    #[test]
+    fn partial_lock_creation_window_fails_closed() {
+        let dir = tempdir().expect("tempdir");
+        let state_root = dir.path().join("state");
+        let first_state_root = state_root.clone();
+        let (created_tx, created_rx) = std::sync::mpsc::sync_channel(0);
+        let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(0);
+
+        let first = std::thread::spawn(move || {
+            SyncLock::acquire_with_after_create(&first_state_root, "first", || {
+                created_tx.send(()).expect("signal lock creation");
+                continue_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("release partial-lock barrier");
+            })
+        });
+
+        created_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("first acquisition should create lock");
+        let lock_path = state_root.join("locks/sync.lock");
+        let second = SyncLock::acquire(&state_root, "second");
+        let partial_lock_remained = lock_path.exists();
+        let archived_during_race = fs::read_dir(lock_path.parent().expect("locks dir"))
+            .expect("read locks dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .any(|name| name.starts_with("sync.lock.corrupt."));
+
+        continue_tx.send(()).expect("continue first acquisition");
+        let first_lock = first
+            .join()
+            .expect("first acquisition thread should not panic")
+            .expect("first acquisition should complete");
+        first_lock.release().expect("release first lock");
+
+        let error = second
+            .err()
+            .expect("fresh partial lock must block second acquisition");
+        assert!(
+            error
+                .to_string()
+                .contains("potentially active partial lock"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            partial_lock_remained,
+            "contender must not rename the first acquisition's partial lock"
+        );
+        assert!(
+            !archived_during_race,
+            "contender must not archive the first acquisition's partial lock"
+        );
+    }
+
+    #[test]
+    fn concurrent_stale_lock_takeover_grants_exactly_one_writer() {
+        // bd-ci9x: every contender judges the dead holder's lock stale at the
+        // same moment. Without the acquisition guard a later contender could
+        // archive an earlier contender's FRESH lock and also proceed.
+        const CONTENDERS: usize = 8;
+        for round in 0..20 {
+            let dir = tempdir().expect("tempdir");
+            let state_root = dir.path().join("state");
+            let locks_dir = state_root.join("locks");
+            fs::create_dir_all(&locks_dir).expect("locks dir");
+            let stale = LockInfo {
+                pid: u32::MAX - 1,
+                created_at_rfc3339: "2000-01-01T00:00:00Z".to_owned(),
+                operation: "export".to_owned(),
+            };
+            fs::write(
+                locks_dir.join("sync.lock"),
+                serde_json::to_string_pretty(&stale).expect("serialize"),
+            )
+            .expect("write stale lock");
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONTENDERS));
+            let handles: Vec<_> = (0..CONTENDERS)
+                .map(|index| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let state_root = state_root.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        SyncLock::acquire(&state_root, &format!("contender-{index}"))
+                    })
+                })
+                .collect();
+            // Keep every granted lock alive until all contenders finished, so
+            // a release can never make room for a second grant.
+            let results: Vec<FwResult<SyncLock>> = handles
+                .into_iter()
+                .map(|handle| handle.join().expect("contender thread"))
+                .collect();
+            let granted = results.iter().filter(|result| result.is_ok()).count();
+            assert_eq!(
+                granted, 1,
+                "round {round}: exactly one writer may hold the lock"
+            );
+            let stale_archives = fs::read_dir(&locks_dir)
+                .expect("read dir")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("sync.lock.stale.")
+                })
+                .count();
+            assert_eq!(
+                stale_archives, 1,
+                "round {round}: only the dead holder's lock may be archived"
+            );
+        }
     }
 
     #[test]
@@ -5545,6 +7055,150 @@ mod tests {
             text.contains("overwrite would require updating conflicting segment row"),
             "unexpected error: {text}"
         );
+    }
+
+    #[test]
+    fn import_overwrite_changed_parent_with_identical_children_updates_parent() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("source.sqlite3");
+        let target_db = dir.path().join("target.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let source_store = RunStore::open(&source_db).expect("source store");
+        let mut source_report = fixture_report("overwrite-parent-1", &source_db);
+        source_report.result.transcript = "updated parent payload".to_owned();
+        source_store
+            .persist_report(&source_report)
+            .expect("persist source");
+
+        let target_store = RunStore::open(&target_db).expect("target store");
+        target_store
+            .persist_report(&fixture_report("overwrite-parent-1", &target_db))
+            .expect("persist target");
+
+        export(&source_db, &export_dir, &state_root).expect("export source");
+        import(
+            &target_db,
+            &export_dir,
+            &state_root,
+            ConflictPolicy::Overwrite,
+        )
+        .expect("non-strict overwrite should update only the parent");
+
+        let details = target_store
+            .load_run_details("overwrite-parent-1")
+            .expect("load target")
+            .expect("target run should remain");
+        assert_eq!(details.transcript, "updated parent payload");
+        assert_eq!(details.segments, source_report.result.segments);
+        assert_eq!(details.events.len(), source_report.events.len());
+        for (actual, expected) in details.events.iter().zip(&source_report.events) {
+            assert_eq!(actual.seq, expected.seq);
+            assert_eq!(actual.ts_rfc3339, expected.ts_rfc3339);
+            assert_eq!(actual.stage, expected.stage);
+            assert_eq!(actual.code, expected.code);
+            assert_eq!(actual.message, expected.message);
+            assert_eq!(actual.payload, expected.payload);
+        }
+    }
+
+    #[test]
+    fn import_overwrite_changed_parent_and_segment_rolls_back_atomically() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("source.sqlite3");
+        let target_db = dir.path().join("target.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let source_store = RunStore::open(&source_db).expect("source store");
+        let mut source_report = fixture_report("overwrite-atomic-1", &source_db);
+        source_report.result.transcript = "source parent payload".to_owned();
+        source_report.result.segments[0].text = "source child payload".to_owned();
+        source_store
+            .persist_report(&source_report)
+            .expect("persist source");
+
+        let target_store = RunStore::open(&target_db).expect("target store");
+        let mut target_report = fixture_report("overwrite-atomic-1", &target_db);
+        target_report.result.transcript = "target parent payload".to_owned();
+        target_report.result.segments[0].text = "target child payload".to_owned();
+        target_store
+            .persist_report(&target_report)
+            .expect("persist target");
+
+        export(&source_db, &export_dir, &state_root).expect("export source");
+        let error = import(
+            &target_db,
+            &export_dir,
+            &state_root,
+            ConflictPolicy::Overwrite,
+        )
+        .expect_err("non-strict overwrite must compare the retained target child");
+        assert!(
+            error
+                .to_string()
+                .contains("overwrite would require updating conflicting segment row"),
+            "unexpected error: {error}"
+        );
+
+        let details = target_store
+            .load_run_details("overwrite-atomic-1")
+            .expect("load target after rollback")
+            .expect("target run should remain");
+        assert_eq!(details.transcript, "target parent payload");
+        assert_eq!(details.segments[0].text, "target child payload");
+        assert_eq!(details.segments.len(), target_report.result.segments.len());
+        assert_eq!(details.events.len(), target_report.events.len());
+    }
+
+    #[test]
+    fn import_overwrite_changed_parent_and_event_rolls_back_atomically() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("source.sqlite3");
+        let target_db = dir.path().join("target.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let source_store = RunStore::open(&source_db).expect("source store");
+        let mut source_report = fixture_report("overwrite-event-atomic-1", &source_db);
+        source_report.result.transcript = "source parent payload".to_owned();
+        source_report.events[0].message = "source event payload".to_owned();
+        source_store
+            .persist_report(&source_report)
+            .expect("persist source");
+
+        let target_store = RunStore::open(&target_db).expect("target store");
+        let mut target_report = fixture_report("overwrite-event-atomic-1", &target_db);
+        target_report.result.transcript = "target parent payload".to_owned();
+        target_report.events[0].message = "target event payload".to_owned();
+        target_store
+            .persist_report(&target_report)
+            .expect("persist target");
+
+        export(&source_db, &export_dir, &state_root).expect("export source");
+        let error = import(
+            &target_db,
+            &export_dir,
+            &state_root,
+            ConflictPolicy::Overwrite,
+        )
+        .expect_err("non-strict overwrite must compare the retained target event");
+        assert!(
+            error
+                .to_string()
+                .contains("overwrite would require updating conflicting event row"),
+            "unexpected error: {error}"
+        );
+
+        let details = target_store
+            .load_run_details("overwrite-event-atomic-1")
+            .expect("load target after rollback")
+            .expect("target run should remain");
+        assert_eq!(details.transcript, "target parent payload");
+        assert_eq!(details.events[0].message, "target event payload");
+        assert_eq!(details.segments.len(), target_report.result.segments.len());
+        assert_eq!(details.events.len(), target_report.events.len());
     }
 
     #[test]
@@ -8990,8 +10644,132 @@ mod tests {
             manifest.cursor_used.is_none(),
             "first export has no prior cursor"
         );
+        assert!(manifest.cursor_after.last_mutation_seq > 0);
         assert!(!manifest.cursor_after.last_export_rfc3339.is_empty());
         assert_eq!(manifest.cursor_after.last_run_count, 1);
+    }
+
+    #[test]
+    fn incremental_export_uses_one_snapshot_and_next_delta_cannot_skip_writer() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("incr_snapshot.sqlite3");
+        let state_root = dir.path().join("state");
+        let first_export_dir = dir.path().join("export1");
+        let second_export_dir = dir.path().join("export2");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        let mut first_report = fixture_report("snapshot-first", &db_path);
+        first_report.finished_at_rfc3339 = "2026-01-01T00:00:05Z".to_owned();
+        store
+            .persist_report(&first_report)
+            .expect("persist first report");
+
+        let (runs_exported_tx, runs_exported_rx) = std::sync::mpsc::sync_channel(0);
+        let (writer_committed_tx, writer_committed_rx) = std::sync::mpsc::sync_channel(0);
+        let export_db_path = db_path.clone();
+        let export_state_root = state_root.clone();
+        let export_output_dir = first_export_dir.clone();
+        let export_thread = std::thread::spawn(move || {
+            export_incremental_inner_with_after_runs(
+                &export_db_path,
+                &export_output_dir,
+                &export_state_root,
+                || {
+                    runs_exported_tx.send(()).expect("signal runs exported");
+                    writer_committed_rx
+                        .recv()
+                        .expect("wait for concurrent writer");
+                },
+            )
+        });
+
+        runs_exported_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("wait for runs export");
+        let mut second_report = fixture_report("snapshot-second", &db_path);
+        second_report.finished_at_rfc3339 = "2026-06-15T12:00:05Z".to_owned();
+        store
+            .persist_report(&second_report)
+            .expect("persist concurrent report");
+        writer_committed_tx
+            .send(())
+            .expect("release snapshot export");
+
+        let first_manifest = export_thread
+            .join()
+            .expect("snapshot export thread")
+            .expect("snapshot export");
+        assert_eq!(first_manifest.row_counts.runs, 1);
+        assert_eq!(first_manifest.row_counts.segments, 2);
+        assert_eq!(first_manifest.row_counts.events, 2);
+        assert_eq!(
+            first_manifest.cursor_after.last_export_run_id.as_deref(),
+            Some("snapshot-first")
+        );
+
+        for (file_name, run_id_key) in [
+            ("runs.jsonl", "id"),
+            ("segments.jsonl", "run_id"),
+            ("events.jsonl", "run_id"),
+        ] {
+            let rows: Vec<serde_json::Value> = fs::read_to_string(first_export_dir.join(file_name))
+                .expect("read first snapshot file")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("parse first snapshot row"))
+                .collect();
+            assert!(
+                !rows.is_empty(),
+                "{file_name} should contain first run rows"
+            );
+            assert!(
+                rows.iter().all(|row| row[run_id_key] == "snapshot-first"),
+                "{file_name} must wholly exclude the concurrent run"
+            );
+        }
+
+        let second_manifest = export_incremental_inner(&db_path, &second_export_dir, &state_root)
+            .expect("next delta export");
+        assert_eq!(second_manifest.row_counts.runs, 1);
+        assert_eq!(second_manifest.row_counts.segments, 2);
+        assert_eq!(second_manifest.row_counts.events, 2);
+        assert_eq!(
+            second_manifest
+                .cursor_used
+                .as_ref()
+                .and_then(|cursor| cursor.last_export_run_id.as_deref()),
+            Some("snapshot-first")
+        );
+        assert_eq!(
+            second_manifest.cursor_after.last_export_run_id.as_deref(),
+            Some("snapshot-second")
+        );
+        assert!(
+            second_manifest.cursor_after.last_mutation_seq
+                > second_manifest
+                    .cursor_used
+                    .as_ref()
+                    .expect("prior snapshot cursor")
+                    .last_mutation_seq,
+            "the concurrent commit must remain beyond the first snapshot high-water mark"
+        );
+
+        for (file_name, run_id_key) in [
+            ("runs.jsonl", "id"),
+            ("segments.jsonl", "run_id"),
+            ("events.jsonl", "run_id"),
+        ] {
+            let rows: Vec<serde_json::Value> =
+                fs::read_to_string(second_export_dir.join(file_name))
+                    .expect("read next delta file")
+                    .lines()
+                    .map(|line| serde_json::from_str(line).expect("parse next delta row"))
+                    .collect();
+            assert!(!rows.is_empty(), "{file_name} should contain next run rows");
+            assert!(
+                rows.iter().all(|row| row[run_id_key] == "snapshot-second"),
+                "{file_name} must wholly include only the concurrent run in the next delta"
+            );
+        }
     }
 
     #[test]
@@ -9041,7 +10819,7 @@ mod tests {
 
         let store = RunStore::open(&db_path).expect("store open");
 
-        // First run: timestamp T1
+        // First run establishes a non-empty mutation cursor.
         let mut report1 = fixture_report("incr-old", &db_path);
         report1.finished_at_rfc3339 = "2026-01-01T00:00:05Z".to_owned();
         store.persist_report(&report1).expect("persist 1");
@@ -9052,7 +10830,7 @@ mod tests {
             export_incremental(&db_path, &export_dir_1, &state_root).expect("first export");
         assert_eq!(manifest1.row_counts.runs, 1);
 
-        // Second run: timestamp T2 > T1
+        // A later database mutation must form the next delta.
         let mut report2 = fixture_report("incr-new", &db_path);
         report2.finished_at_rfc3339 = "2026-06-15T12:00:05Z".to_owned();
         store.persist_report(&report2).expect("persist 2");
@@ -9086,6 +10864,158 @@ mod tests {
     }
 
     #[test]
+    fn incremental_export_backdated_insert_after_cursor_exports_exactly_once() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("incr_backdated_insert.sqlite3");
+        let state_root = dir.path().join("state");
+        let store = RunStore::open(&db_path).expect("store open");
+
+        let mut anchor = fixture_report("cursor-anchor", &db_path);
+        anchor.finished_at_rfc3339 = "2026-08-01T00:00:05Z".to_owned();
+        store.persist_report(&anchor).expect("persist anchor");
+        let first = export_incremental(&db_path, &dir.path().join("export1"), &state_root)
+            .expect("first export");
+        assert_eq!(first.row_counts.runs, 1);
+
+        let mut backdated = fixture_report("backdated-after-cursor", &db_path);
+        backdated.finished_at_rfc3339 = "2020-01-01T00:00:05Z".to_owned();
+        store
+            .persist_report(&backdated)
+            .expect("persist backdated run");
+
+        let second_export = dir.path().join("export2");
+        let second = export_incremental(&db_path, &second_export, &state_root)
+            .expect("export backdated delta");
+        assert_eq!(second.row_counts.runs, 1);
+        assert!(
+            second.cursor_after.last_mutation_seq > first.cursor_after.last_mutation_seq,
+            "database mutation sequence must advance independently of finished_at"
+        );
+        let row: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(second_export.join("runs.jsonl"))
+                .expect("read backdated run")
+                .trim(),
+        )
+        .expect("parse backdated run");
+        assert_eq!(row["id"], "backdated-after-cursor");
+        assert_eq!(row["finished_at"], "2020-01-01T00:00:05Z");
+
+        let third = export_incremental(&db_path, &dir.path().join("export3"), &state_root)
+            .expect("no-change export");
+        assert_eq!(third.row_counts.runs, 0, "successful delta exports once");
+        assert_eq!(
+            third.cursor_after.last_mutation_seq, second.cursor_after.last_mutation_seq,
+            "no-change export must retain the exact high-water mark"
+        );
+    }
+
+    #[test]
+    fn incremental_export_parent_update_after_cursor_exports_exactly_once() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("incr_parent_update.sqlite3");
+        let state_root = dir.path().join("state");
+        let store = RunStore::open(&db_path).expect("store open");
+
+        store
+            .persist_report(&fixture_report("updated-parent", &db_path))
+            .expect("persist run");
+        export_incremental(&db_path, &dir.path().join("export1"), &state_root)
+            .expect("first export");
+
+        let writer = Connection::open(db_path.display().to_string()).expect("writer open");
+        writer
+            .execute(
+                "UPDATE runs SET finished_at = '2020-01-01T00:00:05Z', \
+                 transcript = 'revised transcript' WHERE id = 'updated-parent'",
+            )
+            .expect("update exported parent");
+
+        let second_export = dir.path().join("export2");
+        let second = export_incremental(&db_path, &second_export, &state_root)
+            .expect("export parent update");
+        assert_eq!(second.row_counts.runs, 1);
+        let row: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(second_export.join("runs.jsonl"))
+                .expect("read updated parent")
+                .trim(),
+        )
+        .expect("parse updated parent");
+        assert_eq!(row["id"], "updated-parent");
+        assert_eq!(row["transcript"], "revised transcript");
+
+        let third = export_incremental(&db_path, &dir.path().join("export3"), &state_root)
+            .expect("no-change export");
+        assert_eq!(third.row_counts.runs, 0, "parent update must not repeat");
+    }
+
+    #[test]
+    fn incremental_export_child_only_update_exports_complete_aggregate_once() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("incr_child_update.sqlite3");
+        let state_root = dir.path().join("state");
+        let store = RunStore::open(&db_path).expect("store open");
+
+        store
+            .persist_report(&fixture_report("updated-child", &db_path))
+            .expect("persist run");
+        export_incremental(&db_path, &dir.path().join("export1"), &state_root)
+            .expect("first export");
+
+        let writer = Connection::open(db_path.display().to_string()).expect("writer open");
+        writer
+            .execute(
+                "UPDATE segments SET text = 'revised segment' \
+                 WHERE run_id = 'updated-child' AND idx = 0",
+            )
+            .expect("update exported segment");
+        writer
+            .execute(
+                "UPDATE events SET message = 'revised event' \
+                 WHERE run_id = 'updated-child' AND seq = 1",
+            )
+            .expect("update exported event");
+
+        let second_export = dir.path().join("export2");
+        let second =
+            export_incremental(&db_path, &second_export, &state_root).expect("export child update");
+        assert_eq!(second.row_counts.runs, 1);
+        assert_eq!(second.row_counts.segments, 2);
+        assert_eq!(second.row_counts.events, 2);
+
+        let segments: Vec<serde_json::Value> =
+            fs::read_to_string(second_export.join("segments.jsonl"))
+                .expect("read segments")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("parse segment"))
+                .collect();
+        assert!(segments.iter().any(|row| row["text"] == "revised segment"));
+        let events: Vec<serde_json::Value> = fs::read_to_string(second_export.join("events.jsonl"))
+            .expect("read events")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse event"))
+            .collect();
+        assert!(events.iter().any(|row| row["message"] == "revised event"));
+
+        let third = export_incremental(&db_path, &dir.path().join("export3"), &state_root)
+            .expect("no-change export");
+        assert_eq!(third.row_counts.runs, 0, "child update must not repeat");
+        assert_eq!(third.row_counts.segments, 0);
+        assert_eq!(third.row_counts.events, 0);
+
+        writer
+            .execute("DELETE FROM segments WHERE run_id = 'updated-child' AND idx = 1")
+            .expect("delete exported segment");
+        let fourth = export_incremental(&db_path, &dir.path().join("export4"), &state_root)
+            .expect("export child deletion");
+        assert_eq!(fourth.row_counts.runs, 1);
+        assert_eq!(
+            fourth.row_counts.segments, 1,
+            "child deletion must export the complete surviving child set"
+        );
+        assert_eq!(fourth.row_counts.events, 2);
+    }
+
+    #[test]
     fn incremental_export_no_new_records_produces_zero_counts() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("incr_noop.sqlite3");
@@ -9111,6 +11041,104 @@ mod tests {
     }
 
     #[test]
+    fn incremental_export_rejects_cursor_ahead_of_database_high_water() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("incr_cursor_ahead.sqlite3");
+        let state_root = dir.path().join("state");
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("cursor-ahead", &db_path))
+            .expect("persist run");
+
+        let connection = Connection::open(db_path.display().to_string()).expect("connection");
+        let forged_sequence = mutation_high_water(&connection) + 1;
+        let cursor_path = state_root.join(CURSOR_FILENAME);
+        save_cursor(
+            &cursor_path,
+            &test_cursor(
+                &connection,
+                forged_sequence,
+                "2099-01-01T00:00:00Z",
+                Some("unrelated-database"),
+            ),
+        )
+        .expect("write mismatched cursor");
+
+        let error = export_incremental(&db_path, &dir.path().join("export"), &state_root)
+            .expect_err("cursor from a newer or different database must fail closed");
+        assert!(
+            error.to_string().contains("outside database range"),
+            "unexpected cursor mismatch error: {error}"
+        );
+        let retained = load_cursor(&cursor_path)
+            .expect("reload cursor")
+            .expect("cursor retained");
+        assert_eq!(retained.last_mutation_seq, forged_sequence);
+    }
+
+    #[test]
+    fn incremental_export_rejects_in_range_cursor_from_different_database() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("cursor_source.sqlite3");
+        let target_db = dir.path().join("cursor_target.sqlite3");
+        let source_state = dir.path().join("source_state");
+        let target_state = dir.path().join("target_state");
+
+        let source = RunStore::open(&source_db).expect("open cursor source");
+        source
+            .persist_report(&fixture_report("source-run", &source_db))
+            .expect("persist source run");
+        let source_manifest =
+            export_incremental(&source_db, &dir.path().join("source_export"), &source_state)
+                .expect("export source cursor");
+
+        let target = RunStore::open(&target_db).expect("open cursor target");
+        for run_id in ["target-run-a", "target-run-b"] {
+            target
+                .persist_report(&fixture_report(run_id, &target_db))
+                .expect("persist target run");
+        }
+        let target_connection =
+            Connection::open(target_db.display().to_string()).expect("open target connection");
+        let target_authority =
+            load_mutation_authority(&target_connection).expect("load target authority");
+        assert!(
+            source_manifest.cursor_after.last_mutation_seq <= target_authority.high_water_mark,
+            "the foreign cursor must be numerically in range to exercise the identity guard"
+        );
+        assert_ne!(
+            source_manifest.cursor_after.database_id.as_deref(),
+            Some(target_authority.database_id.as_str()),
+            "independent databases must have distinct identities"
+        );
+
+        let cursor_path = target_state.join(CURSOR_FILENAME);
+        save_cursor(&cursor_path, &source_manifest.cursor_after).expect("install foreign cursor");
+        let target_export = dir.path().join("target_export");
+        let error = export_incremental(&target_db, &target_export, &target_state)
+            .expect_err("an in-range foreign cursor must fail closed");
+        assert!(
+            error.to_string().contains("database identity mismatch"),
+            "unexpected foreign cursor error: {error}"
+        );
+        assert!(
+            !target_export.join("manifest.json").exists(),
+            "identity mismatch must be rejected before snapshot publication"
+        );
+        assert!(
+            !target_export.join("runs.jsonl").exists(),
+            "identity mismatch must not publish a partial runs delta"
+        );
+        let retained = load_cursor(&cursor_path)
+            .expect("reload foreign cursor")
+            .expect("foreign cursor retained");
+        assert_eq!(
+            retained.database_id,
+            source_manifest.cursor_after.database_id
+        );
+    }
+
+    #[test]
     fn incremental_export_empty_db_produces_zero_counts_and_creates_cursor() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("incr_empty.sqlite3");
@@ -9124,6 +11152,7 @@ mod tests {
         assert_eq!(manifest.row_counts.segments, 0);
         assert_eq!(manifest.row_counts.events, 0);
         assert!(manifest.cursor_used.is_none());
+        assert_eq!(manifest.cursor_after.last_mutation_seq, 0);
         assert_eq!(
             manifest.cursor_after.last_export_rfc3339,
             EMPTY_INCREMENTAL_CURSOR_TS
@@ -9210,7 +11239,7 @@ mod tests {
 
         let store = RunStore::open(&db_path).expect("store open");
 
-        // Insert three runs with ascending timestamps.
+        // Insert three runs before the first cursor is established.
         for (i, ts) in [
             "2026-01-01T00:00:00Z",
             "2026-02-01T00:00:00Z",
@@ -9228,11 +11257,19 @@ mod tests {
         let export_dir_1 = dir.path().join("export1");
         let m1 = export_incremental(&db_path, &export_dir_1, &state_root).expect("export 1");
         assert_eq!(m1.row_counts.runs, 3);
+        drop(store);
+
+        // Reopen both the database and the on-disk cursor to exercise restart.
+        let store = RunStore::open(&db_path).expect("reopen store");
 
         // Second export: no new runs.
         let export_dir_2 = dir.path().join("export2");
         let m2 = export_incremental(&db_path, &export_dir_2, &state_root).expect("export 2");
         assert_eq!(m2.row_counts.runs, 0);
+        assert_eq!(
+            m2.cursor_used.as_ref().unwrap().last_mutation_seq,
+            m1.cursor_after.last_mutation_seq,
+        );
         assert_eq!(
             m2.cursor_used.as_ref().unwrap().last_export_rfc3339,
             m1.cursor_after.last_export_rfc3339,
@@ -9318,6 +11355,8 @@ mod tests {
     #[test]
     fn sync_cursor_serde_round_trip() {
         let cursor = SyncCursor {
+            last_mutation_seq: 42,
+            database_id: Some("00000000-0000-0000-0000-000000000042".to_owned()),
             last_export_rfc3339: "2026-06-15T12:00:00Z".to_owned(),
             last_export_run_id: Some("run-42".to_owned()),
             last_run_count: 42,
@@ -9325,6 +11364,8 @@ mod tests {
         let json = serde_json::to_string_pretty(&cursor).expect("serialize");
         let parsed: SyncCursor = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.last_export_rfc3339, "2026-06-15T12:00:00Z");
+        assert_eq!(parsed.last_mutation_seq, 42);
+        assert_eq!(parsed.database_id, cursor.database_id);
         assert_eq!(parsed.last_export_run_id.as_deref(), Some("run-42"));
         assert_eq!(parsed.last_run_count, 42);
     }
@@ -9333,6 +11374,8 @@ mod tests {
     fn sync_cursor_deserializes_legacy_shape_without_run_id() {
         let legacy = r#"{"last_export_rfc3339":"2026-06-15T12:00:00Z","last_run_count":42}"#;
         let parsed: SyncCursor = serde_json::from_str(legacy).expect("deserialize legacy cursor");
+        assert_eq!(parsed.last_mutation_seq, 0);
+        assert!(parsed.database_id.is_none());
         assert_eq!(parsed.last_export_rfc3339, "2026-06-15T12:00:00Z");
         assert!(parsed.last_export_run_id.is_none());
         assert_eq!(parsed.last_run_count, 42);
@@ -9357,11 +11400,16 @@ mod tests {
                 events_jsonl_sha256: "ccc".to_owned(),
             },
             cursor_used: Some(SyncCursor {
+                last_mutation_seq: 5,
+                database_id: Some("00000000-0000-0000-0000-000000000005".to_owned()),
                 last_export_rfc3339: "2026-01-01T00:00:00Z".to_owned(),
                 last_export_run_id: Some("run-5".to_owned()),
                 last_run_count: 5,
             }),
+            deleted_runs: None,
             cursor_after: SyncCursor {
+                last_mutation_seq: 6,
+                database_id: Some("00000000-0000-0000-0000-000000000005".to_owned()),
                 last_export_rfc3339: "2026-06-15T12:00:00Z".to_owned(),
                 last_export_run_id: Some("run-6".to_owned()),
                 last_run_count: 1,
@@ -9389,6 +11437,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("cursor_rt.json");
         let cursor = SyncCursor {
+            last_mutation_seq: 7,
+            database_id: Some("00000000-0000-0000-0000-000000000007".to_owned()),
             last_export_rfc3339: "2026-03-15T08:30:00Z".to_owned(),
             last_export_run_id: Some("run-7".to_owned()),
             last_run_count: 7,
@@ -9396,6 +11446,8 @@ mod tests {
         save_cursor(&path, &cursor).expect("save");
         let loaded = load_cursor(&path).expect("load").expect("should exist");
         assert_eq!(loaded.last_export_rfc3339, "2026-03-15T08:30:00Z");
+        assert_eq!(loaded.last_mutation_seq, 7);
+        assert_eq!(loaded.database_id, cursor.database_id);
         assert_eq!(loaded.last_export_run_id.as_deref(), Some("run-7"));
         assert_eq!(loaded.last_run_count, 7);
     }
@@ -9412,6 +11464,22 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("invalid sync cursor")
+        );
+    }
+
+    #[test]
+    fn load_cursor_rejects_negative_mutation_sequence() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("negative_cursor.json");
+        fs::write(
+            &path,
+            r#"{"last_mutation_seq":-1,"last_export_rfc3339":"","last_run_count":0}"#,
+        )
+        .expect("write negative cursor");
+        let error = load_cursor(&path).expect_err("negative cursor must fail closed");
+        assert!(
+            error.to_string().contains("must be non-negative"),
+            "unexpected negative cursor error: {error}"
         );
     }
 
@@ -9435,7 +11503,7 @@ mod tests {
         let m1 = export_incremental(&db_path, &export_dir, &state_root).expect("export");
         assert_eq!(m1.row_counts.runs, 2);
 
-        // Second export: no new runs (cursor_after == the shared timestamp).
+        // Second export: no new mutations despite the shared domain timestamp.
         let export_dir_2 = dir.path().join("export2");
         let m2 = export_incremental(&db_path, &export_dir_2, &state_root).expect("export 2");
         assert_eq!(m2.row_counts.runs, 0);
@@ -9449,7 +11517,7 @@ mod tests {
 
         let store = RunStore::open(&db_path).expect("store open");
 
-        let mut first = fixture_report("same-ts-a", &db_path);
+        let mut first = fixture_report("same-ts-z", &db_path);
         first.finished_at_rfc3339 = "2026-01-01T00:00:05Z".to_owned();
         store.persist_report(&first).expect("persist first");
 
@@ -9458,7 +11526,7 @@ mod tests {
             export_incremental(&db_path, &export_dir_1, &state_root).expect("export 1");
         assert_eq!(first_manifest.row_counts.runs, 1);
 
-        let mut second = fixture_report("same-ts-z", &db_path);
+        let mut second = fixture_report("same-ts-a", &db_path);
         second.finished_at_rfc3339 = "2026-01-01T00:00:05Z".to_owned();
         store.persist_report(&second).expect("persist second");
 
@@ -9477,7 +11545,11 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), 1);
         let row: serde_json::Value = serde_json::from_str(lines[0]).expect("parse");
-        assert_eq!(row["id"].as_str(), Some("same-ts-z"));
+        assert_eq!(
+            row["id"].as_str(),
+            Some("same-ts-a"),
+            "a same-clock mutation must not depend on lexicographic ID order"
+        );
     }
 
     #[test]
@@ -9504,7 +11576,7 @@ mod tests {
     }
 
     #[test]
-    fn max_started_at_with_filter_beyond_all_timestamps_returns_none() {
+    fn max_export_position_at_mutation_high_water_returns_none() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("ts_filter.sqlite3");
         let store = RunStore::open(&db_path).expect("open");
@@ -9513,10 +11585,15 @@ mod tests {
 
         let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
-        // With cursor far in the future, no runs match -> None.
-        let far_future = test_cursor("2099-12-31T23:59:59Z", Some("zzzzzz"));
+        // A cursor at the database high-water mark has no matching mutations.
+        let far_future = test_cursor(
+            &conn,
+            mutation_high_water(&conn),
+            "2099-12-31T23:59:59Z",
+            Some("zzzzzz"),
+        );
         let result = max_export_position(&conn, Some(&far_future)).expect("should succeed");
-        assert_eq!(result, None, "no runs after far-future timestamp");
+        assert_eq!(result, None, "no runs after the mutation high-water mark");
 
         // With no filter, should return the run's finished_at + id tuple.
         let result = max_export_position(&conn, None).expect("should succeed");
@@ -9583,6 +11660,8 @@ mod tests {
         );
 
         let cursor = SyncCursor {
+            last_mutation_seq: 7,
+            database_id: Some("00000000-0000-0000-0000-000000000007".to_owned()),
             last_export_rfc3339: "2026-01-01T00:00:00Z".to_owned(),
             last_export_run_id: Some("run-a".to_owned()),
             last_run_count: 7,
@@ -9773,6 +11852,326 @@ mod tests {
     }
 
     #[test]
+    fn validate_sync_detects_same_count_child_payload_mutations() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validate-child-content.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("child-content", &db_path))
+            .expect("persist");
+        export(&db_path, &export_dir, &state_root).expect("export");
+        assert!(
+            validate_sync(&db_path, &export_dir)
+                .expect("validate untouched export")
+                .is_valid
+        );
+
+        let segments_path = export_dir.join("segments.jsonl");
+        let mut segments = fs::read_to_string(&segments_path)
+            .expect("read segments")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("segment row"))
+            .collect::<Vec<_>>();
+        let segment_count = segments.len();
+        segments[0]["text"] = json!("same-count segment mutation");
+        fs::write(
+            &segments_path,
+            segments
+                .iter()
+                .map(|row| serde_json::to_string(row).expect("serialize segment"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write segments");
+
+        let events_path = export_dir.join("events.jsonl");
+        let mut events = fs::read_to_string(&events_path)
+            .expect("read events")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event row"))
+            .collect::<Vec<_>>();
+        let event_count = events.len();
+        events[0]["message"] = json!("same-count event mutation");
+        fs::write(
+            &events_path,
+            events
+                .iter()
+                .map(|row| serde_json::to_string(row).expect("serialize event"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write events");
+
+        let validation = validate_sync(&db_path, &export_dir).expect("validate mutations");
+        assert!(!validation.is_valid);
+        assert_eq!(validation.db_segment_count, segment_count as u64);
+        assert_eq!(validation.jsonl_segment_count, segment_count as u64);
+        assert_eq!(validation.db_event_count, event_count as u64);
+        assert_eq!(validation.jsonl_event_count, event_count as u64);
+        assert!(validation.mismatched_records.is_empty());
+        assert!(validation.child_mismatches.iter().any(|mismatch| {
+            mismatch.table == "segments"
+                && mismatch.key == "child-content/0"
+                && mismatch.reason == "payload differs"
+        }));
+        assert!(validation.child_mismatches.iter().any(|mismatch| {
+            mismatch.table == "events"
+                && mismatch.key == "child-content/1"
+                && mismatch.reason == "payload differs"
+        }));
+        assert!(!validation.child_mismatches_truncated);
+    }
+
+    #[test]
+    fn validate_sync_distinguishes_null_speaker_from_empty_text() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validate-child-null.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("child-null", &db_path))
+            .expect("persist");
+        export(&db_path, &export_dir, &state_root).expect("export");
+
+        let segments_path = export_dir.join("segments.jsonl");
+        let mut rows = fs::read_to_string(&segments_path)
+            .expect("read segments")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("segment row"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows[1]["speaker"], serde_json::Value::Null);
+        rows[1]["speaker"] = json!("");
+        fs::write(
+            &segments_path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).expect("serialize segment"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write segments");
+
+        let validation = validate_sync(&db_path, &export_dir).expect("validate null mutation");
+        assert!(!validation.is_valid);
+        assert!(validation.child_mismatches.iter().any(|mismatch| {
+            mismatch.table == "segments"
+                && mismatch.key == "child-null/1"
+                && mismatch.reason == "payload differs"
+        }));
+    }
+
+    #[test]
+    fn validate_sync_distinguishes_null_confidence_from_zero() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validate-child-null-confidence.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("child-null-confidence", &db_path))
+            .expect("persist");
+        export(&db_path, &export_dir, &state_root).expect("export");
+
+        let segments_path = export_dir.join("segments.jsonl");
+        let mut rows = fs::read_to_string(&segments_path)
+            .expect("read segments")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("segment row"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows[1]["confidence"], serde_json::Value::Null);
+        rows[1]["confidence"] = json!(0.0);
+        fs::write(
+            &segments_path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).expect("serialize segment"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write segments");
+
+        let validation = validate_sync(&db_path, &export_dir).expect("validate zero mutation");
+        assert!(!validation.is_valid);
+        assert!(validation.child_mismatches.iter().any(|mismatch| {
+            mismatch.table == "segments"
+                && mismatch.key == "child-null-confidence/1"
+                && mismatch.reason == "payload differs"
+        }));
+    }
+
+    #[test]
+    fn validate_sync_rejects_malformed_and_duplicate_child_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validate-child-shape.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("child-shape", &db_path))
+            .expect("persist");
+        export(&db_path, &export_dir, &state_root).expect("export");
+
+        let segments_path = export_dir.join("segments.jsonl");
+        let original = fs::read_to_string(&segments_path).expect("read segments");
+        let mut rows = original
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("segment row"))
+            .collect::<Vec<_>>();
+        rows[0]
+            .as_object_mut()
+            .expect("segment object")
+            .remove("text");
+        fs::write(
+            &segments_path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).expect("serialize segment"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write malformed segments");
+        let malformed = validate_sync(&db_path, &export_dir)
+            .expect_err("missing child payload field must fail closed");
+        assert!(malformed.to_string().contains("text"));
+
+        let original_rows = original.lines().collect::<Vec<_>>();
+        assert!(original_rows.len() >= 2, "fixture must have two segments");
+        fs::write(
+            &segments_path,
+            format!("{}\n{}\n", original_rows[0], original_rows[0]),
+        )
+        .expect("write duplicate segments");
+        let duplicate =
+            validate_sync(&db_path, &export_dir).expect_err("duplicate child key must fail closed");
+        let duplicate_message = duplicate.to_string();
+        assert!(duplicate_message.contains("duplicate composite key"));
+        assert!(duplicate_message.contains("child-shape/0"));
+
+        fs::write(&segments_path, &original).expect("restore segments");
+        let events_path = export_dir.join("events.jsonl");
+        let events = fs::read_to_string(&events_path).expect("read events");
+        let first_event = events.lines().next().expect("fixture has event");
+        fs::write(&events_path, format!("{first_event}\n{first_event}\n"))
+            .expect("write duplicate events");
+        let duplicate_event =
+            validate_sync(&db_path, &export_dir).expect_err("duplicate event key must fail closed");
+        let duplicate_event_message = duplicate_event.to_string();
+        assert!(duplicate_event_message.contains("duplicate composite key"));
+        assert!(duplicate_event_message.contains("child-shape/1"));
+    }
+
+    #[test]
+    fn validate_sync_ignores_child_row_order() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validate-child-order.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("child-order", &db_path))
+            .expect("persist");
+        export(&db_path, &export_dir, &state_root).expect("export");
+
+        for filename in ["segments.jsonl", "events.jsonl"] {
+            let path = export_dir.join(filename);
+            let content = fs::read_to_string(&path).expect("read child rows");
+            let mut lines = content.lines().collect::<Vec<_>>();
+            lines.reverse();
+            fs::write(&path, lines.join("\n") + "\n").expect("reverse child rows");
+        }
+
+        let validation = validate_sync(&db_path, &export_dir).expect("validate reordered rows");
+        assert!(
+            validation.is_valid,
+            "row order is not part of sync identity"
+        );
+    }
+
+    #[test]
+    fn validate_sync_reads_one_database_snapshot_during_concurrent_commit() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validate-snapshot.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("snapshot-run", &db_path))
+            .expect("persist");
+        export(&db_path, &export_dir, &state_root).expect("export");
+        let writer = Connection::open(db_path.display().to_string()).expect("writer open");
+
+        let during_commit = validate_sync_with_after_run_ids(&db_path, &export_dir, || {
+            writer
+                .execute(
+                    "UPDATE segments SET text = 'committed after snapshot' \
+                     WHERE run_id = 'snapshot-run' AND idx = 0",
+                )
+                .expect("concurrent WAL commit");
+            Ok(())
+        })
+        .expect("validate pinned snapshot");
+        assert!(
+            during_commit.is_valid,
+            "validation must compare the pre-commit snapshot consistently"
+        );
+
+        let after_commit = validate_sync(&db_path, &export_dir).expect("validate committed state");
+        assert!(
+            !after_commit.is_valid,
+            "a later validation must observe the committed child mutation"
+        );
+        assert!(
+            after_commit
+                .child_mismatches
+                .iter()
+                .any(|mismatch| mismatch.table == "segments")
+        );
+    }
+
+    #[test]
+    fn child_mismatch_diagnostics_are_bounded_without_hiding_invalidity() {
+        let db_rows = (0..=MAX_SYNC_VALIDATION_CHILD_MISMATCHES)
+            .map(|idx| {
+                (
+                    (format!("run-{idx:03}"), idx as i64),
+                    EventValidationRow {
+                        ts_rfc3339: "2026-01-01T00:00:00Z".to_owned(),
+                        stage: "test".to_owned(),
+                        code: "test.event".to_owned(),
+                        message: "message".to_owned(),
+                        payload_json: "{}".to_owned(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let jsonl_rows = HashMap::new();
+        let mut diagnostics = Vec::new();
+        let mut truncated = false;
+
+        collect_child_mismatches(
+            &db_rows,
+            &jsonl_rows,
+            "events",
+            &mut diagnostics,
+            &mut truncated,
+        );
+
+        assert_eq!(diagnostics.len(), MAX_SYNC_VALIDATION_CHILD_MISMATCHES);
+        assert!(truncated);
+    }
+
+    #[test]
     fn validate_sync_empty_db_and_empty_jsonl() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("val_empty.sqlite3");
@@ -9793,6 +12192,65 @@ mod tests {
     }
 
     #[test]
+    fn validate_sync_requires_all_canonical_jsonl_inputs() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validation-inputs.sqlite3");
+        let _store = RunStore::open(&db_path).expect("store open");
+
+        for missing_stem in ["runs", "segments", "events"] {
+            let export_dir = dir.path().join(format!("missing-{missing_stem}"));
+            fs::create_dir_all(&export_dir).expect("create incomplete export");
+            for present_stem in ["runs", "segments", "events"] {
+                if present_stem != missing_stem {
+                    fs::write(export_dir.join(format!("{present_stem}.jsonl")), "")
+                        .expect("write empty canonical input");
+                }
+            }
+
+            let error = validate_sync(&db_path, &export_dir)
+                .expect_err("incomplete validation input must fail closed");
+            let message = error.to_string();
+            assert!(
+                message.contains("missing sync validation input"),
+                "unexpected missing-input error: {message}"
+            );
+            assert!(
+                message.contains(&format!("{missing_stem}.jsonl")),
+                "missing-input error omitted logical file: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_sync_rejects_same_and_different_duplicate_run_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("duplicate-runs.sqlite3");
+        let _store = RunStore::open(&db_path).expect("store open");
+        let first = json!({"id": "duplicate-run", "marker": "first"});
+
+        for (case, second) in [
+            ("same", first.clone()),
+            (
+                "different",
+                json!({"id": "duplicate-run", "marker": "second"}),
+            ),
+        ] {
+            let export_dir = dir.path().join(format!("duplicate-{case}"));
+            write_jsonl_snapshot(&export_dir, &[first.clone(), second], &[], &[]);
+
+            let error = validate_sync(&db_path, &export_dir)
+                .expect_err("duplicate run IDs must fail before comparison");
+            let message = error.to_string();
+            assert!(
+                message.contains("duplicate run id")
+                    && message.contains("duplicate-run")
+                    && message.contains("line 2"),
+                "unexpected duplicate-run error: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn validate_sync_report_serde_round_trip() {
         let report = SyncValidationReport {
             db_run_count: 5,
@@ -9804,6 +12262,12 @@ mod tests {
             missing_from_jsonl: vec!["run-5".to_owned()],
             missing_from_db: vec![],
             mismatched_records: vec!["run-2".to_owned()],
+            child_mismatches: vec![SyncConflict {
+                table: "segments".to_owned(),
+                key: "run-2/0".to_owned(),
+                reason: "payload differs".to_owned(),
+            }],
+            child_mismatches_truncated: false,
             is_valid: false,
         };
         let json_text = serde_json::to_string_pretty(&report).expect("serialize");
@@ -9814,6 +12278,7 @@ mod tests {
         assert!(!deserialized.is_valid);
         assert_eq!(deserialized.missing_from_jsonl, vec!["run-5"]);
         assert_eq!(deserialized.mismatched_records, vec!["run-2"]);
+        assert_eq!(deserialized.child_mismatches.len(), 1);
     }
 
     // ── bd-246.2: Compression tests ──
@@ -9971,6 +12436,174 @@ mod tests {
     }
 
     #[test]
+    fn plain_reexport_over_a_gzip_archive_does_not_leave_stale_gz_shadows() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("source.sqlite3");
+        let target_db = dir.path().join("target.sqlite3");
+        let export_dir = dir.path().join("archive");
+        let state_root = dir.path().join("state");
+        let source_store = RunStore::open(&source_db).expect("source store");
+        source_store
+            .persist_report(&fixture_report("reexport-1", &source_db))
+            .expect("persist first report");
+
+        let (_, compressed) =
+            export_with_compression(&source_db, &export_dir, &state_root, CompressionMode::Gzip)
+                .expect("gzip export");
+        assert_eq!(
+            compressed,
+            vec!["runs.jsonl.gz", "segments.jsonl.gz", "events.jsonl.gz"]
+        );
+        assert!(!export_dir.join("runs.jsonl").exists());
+
+        // New data, then a PLAIN export into the same directory. Readers prefer
+        // `.gz`, so stale compressed files would shadow the fresh plain ones.
+        source_store
+            .persist_report(&fixture_report("reexport-2", &source_db))
+            .expect("persist second report");
+        let (manifest, compressed) =
+            export_with_compression(&source_db, &export_dir, &state_root, CompressionMode::None)
+                .expect("plain re-export");
+        assert!(compressed.is_empty());
+        for stem in ["runs", "segments", "events"] {
+            assert!(
+                !export_dir.join(format!("{stem}.jsonl.gz")).exists(),
+                "stale {stem}.jsonl.gz must be gone"
+            );
+        }
+
+        let result = import(
+            &target_db,
+            &export_dir,
+            &dir.path().join("import_state"),
+            ConflictPolicy::Reject,
+        )
+        .expect("import the plain re-export");
+        assert_eq!(result.runs_imported, manifest.row_counts.runs);
+        assert_eq!(manifest.row_counts.runs, 2);
+    }
+
+    #[test]
+    fn multi_member_gzip_reads_every_member() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("rows.jsonl.gz");
+        let mut bytes = Vec::new();
+        for member in ["{\"id\":\"a\"}\n", "{\"id\":\"b\"}\n"] {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(member.as_bytes())
+                .expect("compress member");
+            bytes.extend(encoder.finish().expect("finish member"));
+        }
+        fs::write(&path, bytes).expect("write concatenated gzip");
+
+        let lines: Vec<String> = open_jsonl_reader(&path)
+            .expect("open multi-member gzip")
+            .lines()
+            .collect::<Result<_, _>>()
+            .expect("read lines");
+        assert_eq!(lines, vec!["{\"id\":\"a\"}", "{\"id\":\"b\"}"]);
+        assert_eq!(
+            sha256_jsonl_file(&path).expect("logical hash"),
+            sha256_reader(&b"{\"id\":\"a\"}\n{\"id\":\"b\"}\n"[..]).expect("plain hash")
+        );
+    }
+
+    #[test]
+    fn compressed_export_holds_the_sync_lock_through_compression() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("source.sqlite3");
+        let state_root = dir.path().join("state");
+        RunStore::open(&source_db)
+            .expect("source store")
+            .persist_report(&fixture_report("locked-1", &source_db))
+            .expect("persist report");
+        let held = SyncLock::acquire(&state_root, "other").expect("hold lock");
+        let error = export_with_compression(
+            &source_db,
+            &dir.path().join("archive"),
+            &state_root,
+            CompressionMode::Gzip,
+        )
+        .expect_err("export must not run while another sync holds the lock");
+        assert!(error.to_string().contains("lock"), "{error}");
+        drop(held);
+    }
+
+    #[test]
+    fn gzip_only_export_imports_logical_jsonl_bytes_exactly() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("gzip_source.sqlite3");
+        let target_db = dir.path().join("gzip_target.sqlite3");
+        let plain_export_dir = dir.path().join("plain_export");
+        let gzip_export_dir = dir.path().join("gzip_export");
+        let export_state_root = dir.path().join("export_state");
+        let import_state_root = dir.path().join("import_state");
+
+        let source_store = RunStore::open(&source_db).expect("source store");
+        let source_report = fixture_report("gzip-import-1", &source_db);
+        source_store
+            .persist_report(&source_report)
+            .expect("persist source report");
+        let manifest =
+            export(&source_db, &plain_export_dir, &export_state_root).expect("plain export");
+
+        fs::create_dir_all(&gzip_export_dir).expect("gzip export dir");
+        fs::copy(
+            plain_export_dir.join("manifest.json"),
+            gzip_export_dir.join("manifest.json"),
+        )
+        .expect("copy manifest");
+
+        for (stem, expected_logical_hash) in [
+            ("runs", &manifest.checksums.runs_jsonl_sha256),
+            ("segments", &manifest.checksums.segments_jsonl_sha256),
+            ("events", &manifest.checksums.events_jsonl_sha256),
+        ] {
+            let plain = plain_export_dir.join(format!("{stem}.jsonl"));
+            let gzip = gzip_export_dir.join(format!("{stem}.jsonl.gz"));
+            compress_jsonl(&plain, &gzip).expect("compress JSONL");
+            let physical_hash = sha256_file(&gzip).expect("hash physical gzip bytes");
+            assert_ne!(
+                physical_hash.as_str(),
+                expected_logical_hash.as_str(),
+                "physical gzip bytes must not accidentally satisfy the manifest"
+            );
+            let logical_hash = sha256_jsonl_file(&gzip).expect("hash logical JSONL bytes");
+            assert_eq!(
+                logical_hash.as_str(),
+                expected_logical_hash.as_str(),
+                "decompressed JSONL bytes must preserve the export checksum"
+            );
+        }
+
+        let result = import(
+            &target_db,
+            &gzip_export_dir,
+            &import_state_root,
+            ConflictPolicy::Reject,
+        )
+        .expect("gzip-only import");
+        assert_eq!(result.runs_imported, manifest.row_counts.runs);
+        assert_eq!(result.segments_imported, manifest.row_counts.segments);
+        assert_eq!(result.events_imported, manifest.row_counts.events);
+        assert!(result.conflicts.is_empty());
+
+        let target_store = RunStore::open(&target_db).expect("target store");
+        let imported = target_store
+            .load_run_details("gzip-import-1")
+            .expect("load imported run")
+            .expect("imported run exists");
+        assert_eq!(imported.transcript, source_report.result.transcript);
+        assert_eq!(imported.segments, source_report.result.segments);
+        assert_eq!(imported.events.len(), source_report.events.len());
+
+        let validation =
+            validate_sync(&target_db, &gzip_export_dir).expect("validate gzip-only import");
+        assert!(validation.is_valid, "gzip-only import must round-trip");
+    }
+
+    #[test]
     fn validate_sync_detects_segment_count_mismatch() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("val_seg_mismatch.sqlite3");
@@ -10090,22 +12723,25 @@ mod tests {
     }
 
     #[test]
-    fn json_str_or_empty_returns_empty_for_non_string_types() {
-        let obj = json!({
+    fn run_field_matches_requires_present_key_and_identical_type() {
+        let row = json!({
             "name": "alice",
+            "empty": "",
             "age": 42,
-            "active": true,
-            "scores": [1, 2, 3],
-            "meta": {"nested": "object"},
             "gone": null
         });
-        assert_eq!(json_str_or_empty(&obj, "name"), "alice");
-        assert_eq!(json_str_or_empty(&obj, "age"), "");
-        assert_eq!(json_str_or_empty(&obj, "active"), "");
-        assert_eq!(json_str_or_empty(&obj, "scores"), "");
-        assert_eq!(json_str_or_empty(&obj, "meta"), "");
-        assert_eq!(json_str_or_empty(&obj, "gone"), "");
-        assert_eq!(json_str_or_empty(&obj, "missing_key"), "");
+        let text = |value: &str| SqliteValue::Text(value.to_owned().into());
+        assert!(run_field_matches(Some(&text("alice")), &row, "name"));
+        assert!(!run_field_matches(Some(&text("bob")), &row, "name"));
+        assert!(run_field_matches(Some(&text("")), &row, "empty"));
+        assert!(run_field_matches(Some(&SqliteValue::Null), &row, "gone"));
+        assert!(run_field_matches(None, &row, "gone"));
+        // The bd-8l6f collapses: missing key vs empty TEXT, null vs empty
+        // TEXT, empty string vs NULL, and a non-string JSON value.
+        assert!(!run_field_matches(Some(&text("")), &row, "missing_key"));
+        assert!(!run_field_matches(Some(&text("")), &row, "gone"));
+        assert!(!run_field_matches(Some(&SqliteValue::Null), &row, "empty"));
+        assert!(!run_field_matches(Some(&text("42")), &row, "age"));
     }
 
     #[test]
@@ -10177,12 +12813,12 @@ mod tests {
     // -- seventeenth-pass edge case tests --
 
     #[test]
-    fn max_started_at_with_partial_filter_returns_matching_maximum() {
+    fn max_export_position_with_partial_mutation_filter_returns_matching_maximum() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("partial_filter.sqlite3");
         let store = RunStore::open(&db_path).expect("open");
 
-        // Persist two reports with different finished timestamps.
+        // Persist two reports in a known mutation order.
         let mut early = fixture_report("run-early", &db_path);
         early.finished_at_rfc3339 = "2026-01-01T00:00:05Z".to_owned();
         store.persist_report(&early).expect("persist early");
@@ -10193,8 +12829,13 @@ mod tests {
 
         let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
-        // Cursor positioned at early should return late's tuple.
-        let after_early = test_cursor("2026-01-01T00:00:05Z", Some("run-early"));
+        // A cursor positioned at the early mutation should return late's tuple.
+        let after_early = test_cursor(
+            &conn,
+            run_mutation_seq(&conn, "run-early"),
+            "2026-01-01T00:00:05Z",
+            Some("run-early"),
+        );
         let result = max_export_position(&conn, Some(&after_early)).expect("query");
         assert_eq!(
             result,
@@ -10202,10 +12843,15 @@ mod tests {
             "should return the max among filtered runs"
         );
 
-        // Cursor positioned at late should produce no newer rows.
-        let after_late = test_cursor("2026-06-15T12:00:05Z", Some("run-late"));
+        // A cursor positioned at the late mutation should produce no newer rows.
+        let after_late = test_cursor(
+            &conn,
+            run_mutation_seq(&conn, "run-late"),
+            "2026-06-15T12:00:05Z",
+            Some("run-late"),
+        );
         let result = max_export_position(&conn, Some(&after_late)).expect("query");
-        assert_eq!(result, None, "no runs strictly after late timestamp");
+        assert_eq!(result, None, "no runs strictly after the late mutation");
     }
 
     #[test]
@@ -10227,7 +12873,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_exported_run_ids_with_after_ts_filters_correctly() {
+    fn collect_exported_run_ids_with_mutation_cursor_filters_correctly() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("collect_ids.sqlite3");
         let store = RunStore::open(&db_path).expect("open");
@@ -10250,8 +12896,13 @@ mod tests {
         let all = collect_exported_run_ids(&conn, None).expect("all");
         assert_eq!(all.len(), 3, "no filter should return all runs");
 
-        // Cursor at run-a should return run-b and run-c (strictly after tuple).
-        let cursor = test_cursor("2026-01-01T00:00:05Z", Some("run-a"));
+        // Cursor at run-a should return later mutations run-b and run-c.
+        let cursor = test_cursor(
+            &conn,
+            run_mutation_seq(&conn, "run-a"),
+            "2026-01-01T00:00:05Z",
+            Some("run-a"),
+        );
         let filtered = collect_exported_run_ids(&conn, Some(&cursor)).expect("filtered");
         assert_eq!(filtered.len(), 2, "should exclude run-a");
         assert!(
@@ -10293,7 +12944,7 @@ mod tests {
     }
 
     #[test]
-    fn export_table_runs_incremental_filters_by_after_ts() {
+    fn export_table_runs_incremental_filters_by_mutation_sequence() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("inc_runs.sqlite3");
         let store = RunStore::open(&db_path).expect("open");
@@ -10321,7 +12972,12 @@ mod tests {
 
         // Cursor at inc-a -> only inc-b.
         let filtered_path = dir.path().join("filtered_runs.jsonl");
-        let cursor = test_cursor("2026-01-15T00:00:05Z", Some("inc-a"));
+        let cursor = test_cursor(
+            &conn,
+            run_mutation_seq(&conn, "inc-a"),
+            "2026-01-15T00:00:05Z",
+            Some("inc-a"),
+        );
         let (filtered_count, _sha256) =
             export_table_runs_incremental(&conn, &filtered_path, Some(&cursor)).expect("filtered");
         assert_eq!(filtered_count, 1, "filter should export only inc-b");
@@ -10740,24 +13396,32 @@ mod tests {
     }
 
     #[test]
-    fn load_jsonl_run_map_skips_non_string_and_missing_ids() {
+    fn load_jsonl_run_map_rejects_rows_without_a_string_id() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("mixed.jsonl");
-        let content = [
-            r#"{"id": "valid-1", "text": "ok"}"#,
-            r#"{"id": 42, "text": "integer id"}"#,
-            r#"{"id": null, "text": "null id"}"#,
-            r#"{"text": "no id field"}"#,
-            "",
-            r#"{"id": "valid-2", "text": "also ok"}"#,
-        ]
-        .join("\n");
-        fs::write(&path, content).expect("write");
+        for (line, bad_row) in [
+            (2, r#"{"id": 42, "text": "integer id"}"#),
+            (2, r#"{"id": null, "text": "null id"}"#),
+            (2, r#"{"text": "no id field"}"#),
+        ] {
+            let content = [r#"{"id": "valid-1", "text": "ok"}"#, bad_row, ""].join("\n");
+            fs::write(&path, content).expect("write");
+            let error = load_jsonl_run_map(&path)
+                .expect_err("a run row without a string id must fail closed");
+            assert!(
+                error.to_string().contains(&format!("line {line}")),
+                "{error}"
+            );
+        }
 
+        // Blank lines are still skipped.
+        fs::write(
+            &path,
+            [r#"{"id": "valid-1"}"#, "", "   ", r#"{"id": "valid-2"}"#].join("\n"),
+        )
+        .expect("write");
         let map = load_jsonl_run_map(&path).expect("load");
         assert_eq!(map.len(), 2);
-        assert!(map.contains_key("valid-1"));
-        assert!(map.contains_key("valid-2"));
     }
 
     #[test]
@@ -11280,6 +13944,271 @@ mod tests {
     }
 
     #[test]
+    fn import_skip_policy_preserves_preexisting_run_as_a_whole_aggregate() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("skip_aggregate_source.sqlite3");
+        let target_db = dir.path().join("skip_aggregate_target.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+        let run_id = "run-skip-aggregate";
+
+        let store = RunStore::open(&source_db).expect("store");
+        store
+            .persist_report(&fixture_report(run_id, &source_db))
+            .expect("persist");
+        export(&source_db, &export_dir, &state_root).expect("export");
+        import(&target_db, &export_dir, &state_root, ConflictPolicy::Skip).expect("seed target");
+
+        let dump_target = || {
+            let connection =
+                Connection::open(target_db.display().to_string()).expect("open target connection");
+            let strings = |columns: Vec<SqliteValue>| -> Vec<String> {
+                columns
+                    .iter()
+                    .map(|value| value_to_string_sqlite(Some(value)))
+                    .collect()
+            };
+            (
+                connection
+                    .query("SELECT id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs ORDER BY id")
+                    .expect("dump runs")
+                    .iter()
+                    .map(run_row_to_cols)
+                    .map(&strings)
+                    .collect::<Vec<_>>(),
+                connection
+                    .query("SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments ORDER BY run_id, idx")
+                    .expect("dump segments")
+                    .iter()
+                    .map(segment_row_to_cols)
+                    .map(&strings)
+                    .collect::<Vec<_>>(),
+                connection
+                    .query("SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events ORDER BY run_id, seq")
+                    .expect("dump events")
+                    .iter()
+                    .map(event_row_to_cols)
+                    .map(&strings)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let original_aggregate = dump_target();
+
+        let read_rows = |name: &str| -> Vec<serde_json::Value> {
+            fs::read_to_string(export_dir.join(name))
+                .expect("read JSONL")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("parse JSONL row"))
+                .collect()
+        };
+        let runs = read_rows("runs.jsonl");
+        let mut segments = read_rows("segments.jsonl");
+        let mut events = read_rows("events.jsonl");
+
+        // The parent remains byte-identical. Its early no-op must not stop the
+        // child phase from treating it as a target-preexisting aggregate.
+        segments[0]["text"] = json!("archive-only replacement");
+        segments.push(json!({
+            "run_id": run_id,
+            "idx": 99,
+            "start_sec": 5.0,
+            "end_sec": 6.0,
+            "speaker": null,
+            "text": "archive-only child",
+            "confidence": null
+        }));
+        events[0]["message"] = json!("archive-only replacement");
+        events.push(json!({
+            "run_id": run_id,
+            "seq": 99,
+            "ts_rfc3339": "2026-01-01T00:00:04Z",
+            "stage": "archive",
+            "code": "archive.only",
+            "message": "archive-only child",
+            "payload_json": "{}"
+        }));
+        write_jsonl_snapshot(&export_dir, &runs, &segments, &events);
+
+        for batch_import_enabled in [false, true] {
+            let result = import_inner_with_batch_mode(
+                &target_db,
+                &export_dir,
+                ConflictPolicy::Skip,
+                batch_import_enabled,
+            )
+            .expect("skip aggregate import");
+            assert!(result.conflicts.is_empty(), "Skip remains silent");
+            assert_eq!(result.runs_imported, 1, "processed parent row count");
+            assert_eq!(result.segments_imported, 3, "processed segment row count");
+            assert_eq!(result.events_imported, 3, "processed event row count");
+            assert_eq!(
+                dump_target(),
+                original_aggregate,
+                "Skip must preserve every stored parent and child column (batch={batch_import_enabled})"
+            );
+        }
+
+        let mut conflicting_runs = runs.clone();
+        conflicting_runs[0]["transcript"] = json!("archive-only transcript");
+        write_jsonl_snapshot(&export_dir, &conflicting_runs, &segments, &events);
+        for batch_import_enabled in [false, true] {
+            import_inner_with_batch_mode(
+                &target_db,
+                &export_dir,
+                ConflictPolicy::Skip,
+                batch_import_enabled,
+            )
+            .expect("skip conflicting aggregate");
+            assert_eq!(
+                dump_target(),
+                original_aggregate,
+                "a conflicting parent must also preserve its whole aggregate (batch={batch_import_enabled})"
+            );
+        }
+
+        let mut duplicate_run = runs[0].clone();
+        duplicate_run["transcript"] = json!("later duplicate parent");
+        write_jsonl_snapshot(
+            &export_dir,
+            &[runs[0].clone(), duplicate_run],
+            &segments,
+            &events,
+        );
+        for batch_import_enabled in [false, true] {
+            let duplicate_target = dir
+                .path()
+                .join(format!("duplicate_target_{batch_import_enabled}.sqlite3"));
+            let result = import_inner_with_batch_mode(
+                &duplicate_target,
+                &export_dir,
+                ConflictPolicy::Skip,
+                batch_import_enabled,
+            )
+            .expect("import archive-created duplicate parent");
+            assert_eq!(result.runs_imported, 2);
+            assert_eq!(result.segments_imported, 3);
+            assert_eq!(result.events_imported, 3);
+
+            let connection = Connection::open(duplicate_target.display().to_string())
+                .expect("open duplicate target");
+            let run_rows = connection
+                .query("SELECT transcript FROM runs")
+                .expect("query duplicate target run");
+            assert_eq!(run_rows.len(), 1);
+            assert_eq!(
+                value_to_string_sqlite(run_rows[0].get(0)),
+                "hello world from sync test",
+                "first parent row remains authoritative"
+            );
+            let segment_count = connection
+                .query("SELECT COUNT(*) FROM segments")
+                .expect("count segments");
+            assert_eq!(value_to_i64_sqlite(segment_count[0].get(0)), 3);
+            let event_count = connection
+                .query("SELECT COUNT(*) FROM events")
+                .expect("count events");
+            assert_eq!(value_to_i64_sqlite(event_count[0].get(0)), 3);
+        }
+
+        let child_only_segments = vec![json!({
+            "run_id": run_id,
+            "idx": 100,
+            "start_sec": 6.0,
+            "end_sec": 7.0,
+            "speaker": null,
+            "text": "child-only archive segment",
+            "confidence": null
+        })];
+        let child_only_events = vec![json!({
+            "run_id": run_id,
+            "seq": 100,
+            "ts_rfc3339": "2026-01-01T00:00:05Z",
+            "stage": "archive",
+            "code": "archive.child_only",
+            "message": "child-only archive event",
+            "payload_json": "{}"
+        })];
+        write_jsonl_snapshot(&export_dir, &[], &child_only_segments, &child_only_events);
+
+        for batch_import_enabled in [false, true] {
+            let child_only_result = import_inner_with_batch_mode(
+                &target_db,
+                &export_dir,
+                ConflictPolicy::Skip,
+                batch_import_enabled,
+            )
+            .expect("skip child-only archive");
+            assert_eq!(child_only_result.runs_imported, 0);
+            assert_eq!(child_only_result.segments_imported, 1);
+            assert_eq!(child_only_result.events_imported, 1);
+            assert!(child_only_result.conflicts.is_empty());
+            assert_eq!(
+                dump_target(),
+                original_aggregate,
+                "child-only archives must not graft onto target-resident runs (batch={batch_import_enabled})"
+            );
+        }
+
+        let malformed_segment = json!({
+            "run_id": run_id,
+            "idx": 101,
+            "start_sec": 7.0,
+            "end_sec": 8.0,
+            "speaker": null,
+            "confidence": null
+        });
+        write_jsonl_snapshot(&export_dir, &[], &[malformed_segment], &[]);
+        for batch_import_enabled in [false, true] {
+            let error = import_inner_with_batch_mode(
+                &target_db,
+                &export_dir,
+                ConflictPolicy::Skip,
+                batch_import_enabled,
+            )
+            .expect_err("skipped child rows must still validate required fields");
+            assert!(
+                error.to_string().contains("missing string field `text`"),
+                "unexpected malformed skipped-row error: {error}"
+            );
+            assert_eq!(
+                dump_target(),
+                original_aggregate,
+                "malformed skipped rows must roll the transaction back (batch={batch_import_enabled})"
+            );
+        }
+
+        let malformed_event = json!({
+            "run_id": run_id,
+            "seq": 101,
+            "ts_rfc3339": "2026-01-01T00:00:06Z",
+            "stage": "archive",
+            "code": "archive.malformed",
+            "message": "missing payload"
+        });
+        write_jsonl_snapshot(&export_dir, &[], &[], &[malformed_event]);
+        for batch_import_enabled in [false, true] {
+            let error = import_inner_with_batch_mode(
+                &target_db,
+                &export_dir,
+                ConflictPolicy::Skip,
+                batch_import_enabled,
+            )
+            .expect_err("skipped events must still validate required fields");
+            assert!(
+                error
+                    .to_string()
+                    .contains("missing string field `payload_json`"),
+                "unexpected malformed skipped-event error: {error}"
+            );
+            assert_eq!(
+                dump_target(),
+                original_aggregate,
+                "malformed skipped events must roll the transaction back (batch={batch_import_enabled})"
+            );
+        }
+    }
+
+    #[test]
     fn import_skip_policy_with_conflicting_segment_preserves_original_text() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("skip_seg.sqlite3");
@@ -11488,6 +14417,7 @@ mod tests {
         assert_eq!(m1.row_counts.runs, 1);
         let first_cursor_ts = m1.cursor_after.last_export_rfc3339.clone();
         let first_cursor_run_id = m1.cursor_after.last_export_run_id.clone();
+        let first_cursor_seq = m1.cursor_after.last_mutation_seq;
 
         // Second export: no new records.
         let export_dir_2 = dir.path().join("export2");
@@ -11495,6 +14425,10 @@ mod tests {
         assert_eq!(m2.row_counts.runs, 0);
 
         // Cursor values should be EXACTLY retained from the first export.
+        assert_eq!(
+            m2.cursor_after.last_mutation_seq, first_cursor_seq,
+            "mutation high-water mark should be retained when no changes exist"
+        );
         assert_eq!(
             m2.cursor_after.last_export_rfc3339, first_cursor_ts,
             "cursor timestamp should be retained when no new records exist"
@@ -11517,26 +14451,33 @@ mod tests {
         report.finished_at_rfc3339 = "2026-06-15T12:00:00Z".to_owned();
         store.persist_report(&report).expect("persist");
 
-        // Manually write a legacy cursor with last_export_run_id = None.
-        let legacy_cursor = r#"{"last_export_rfc3339":"2026-01-01T00:00:00Z","last_run_count":0}"#;
+        // Manually write a pre-identity cursor. Its numeric sequence is
+        // deliberately far ahead: without a database identity it must be
+        // ignored rather than interpreted in this database's sequence space.
+        let legacy_cursor = r#"{"last_mutation_seq":999999,"last_export_rfc3339":"2026-01-01T00:00:00Z","last_run_count":0}"#;
         fs::write(state_root.join(CURSOR_FILENAME), legacy_cursor).expect("write legacy cursor");
 
-        // Export should work — the cursor has None run_id, which is
-        // deserialized via #[serde(default)].
+        // Missing identity and run-id fields deserialize via defaults.
         let export_dir = dir.path().join("export");
         let manifest = export_incremental(&db_path, &export_dir, &state_root)
             .expect("export with legacy cursor");
 
-        // The run finished_at 2026-06-15 > cursor 2026-01-01, so it should be exported.
+        // A missing database identity deliberately treats the effective
+        // sequence as zero and causes a one-time safe full re-export.
         assert_eq!(
             manifest.row_counts.runs, 1,
-            "run after legacy cursor timestamp should be exported"
+            "current run should be re-exported after a legacy cursor upgrade"
         );
         // cursor_used should reflect the legacy cursor with None run_id.
         assert!(
             manifest.cursor_used.is_some(),
             "cursor_used should be populated"
         );
+        assert_eq!(
+            manifest.cursor_used.as_ref().unwrap().last_mutation_seq,
+            999999
+        );
+        assert!(manifest.cursor_used.as_ref().unwrap().database_id.is_none());
         assert!(
             manifest
                 .cursor_used
@@ -11550,6 +14491,10 @@ mod tests {
         assert!(
             manifest.cursor_after.last_export_run_id.is_some(),
             "cursor_after should have a run_id after export"
+        );
+        assert!(
+            manifest.cursor_after.database_id.is_some(),
+            "cursor_after should bind the upgraded cursor to this database"
         );
     }
 
@@ -11772,11 +14717,231 @@ mod tests {
         );
     }
 
+    // -- bd-768k: explicit deleted-run channel ------------------------------
+
+    fn delete_run_aggregate(db_path: &Path, run_id: &str) {
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
+        let params = [SqliteValue::Text(run_id.to_owned().into())];
+        for sql in [
+            "DELETE FROM segments WHERE run_id = ?1",
+            "DELETE FROM events WHERE run_id = ?1",
+            "DELETE FROM runs WHERE id = ?1",
+        ] {
+            conn.execute_with_params(sql, &params).expect("delete");
+        }
+    }
+
+    fn run_ids_in(db_path: &Path) -> Vec<String> {
+        let mut ids: Vec<String> = RunStore::open(db_path)
+            .expect("open")
+            .list_recent_runs(0)
+            .expect("list")
+            .into_iter()
+            .map(|summary| summary.run_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn incremental_export_propagates_parent_run_deletion_downstream() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let target = dir.path().join("target.sqlite3");
+        let state = dir.path().join("state");
+        let target_state = dir.path().join("target_state");
+        let store = RunStore::open(&source).expect("source");
+        for run_id in ["run-keep", "run-gone"] {
+            store
+                .persist_report(&fixture_report(run_id, &source))
+                .expect("persist");
+        }
+
+        // Baseline: both runs reach the target; nothing is deleted yet.
+        let first = dir.path().join("export-1");
+        let manifest = export_incremental(&source, &first, &state).expect("export 1");
+        assert_eq!(manifest.deleted_runs.as_ref().expect("channel").count, 0);
+        let imported =
+            import(&target, &first, &target_state, ConflictPolicy::Reject).expect("import 1");
+        assert_eq!(imported.runs_deleted, 0);
+        assert_eq!(run_ids_in(&target), ["run-gone", "run-keep"]);
+
+        // Delete one aggregate at the source; the next incremental snapshot
+        // carries no runs, so only the explicit channel can convey it.
+        delete_run_aggregate(&source, "run-gone");
+        let second = dir.path().join("export-2");
+        let manifest = export_incremental(&source, &second, &state).expect("export 2");
+        assert_eq!(manifest.row_counts.runs, 0);
+        let channel = manifest.deleted_runs.expect("channel");
+        assert_eq!(channel.format_version, DELETED_RUNS_FORMAT_VERSION);
+        assert_eq!(channel.count, 1);
+        let records = fs::read_to_string(second.join("deleted_runs.jsonl")).expect("read");
+        let record: DeletedRunRecord =
+            serde_json::from_str(records.trim()).expect("one tombstone record");
+        assert_eq!(record.run_id, "run-gone");
+
+        let imported =
+            import(&target, &second, &target_state, ConflictPolicy::Reject).expect("import 2");
+        assert_eq!(imported.runs_deleted, 1);
+        assert_eq!(run_ids_in(&target), ["run-keep"]);
+        let target_store = RunStore::open(&target).expect("target");
+        assert!(
+            target_store
+                .load_run_details("run-gone")
+                .expect("query")
+                .is_none(),
+            "the deleted aggregate (segments and events included) must be gone"
+        );
+
+        // The tombstone is consumed by the cursor: a third export is empty and
+        // re-importing an old tombstone for an absent run is a no-op.
+        let third = dir.path().join("export-3");
+        let manifest = export_incremental(&source, &third, &state).expect("export 3");
+        assert_eq!(manifest.deleted_runs.expect("channel").count, 0);
+        let replay = import(&target, &second, &target_state, ConflictPolicy::Reject)
+            .expect("replay import 2");
+        assert_eq!(replay.runs_deleted, 0);
+    }
+
+    #[test]
+    fn reinserted_run_is_not_published_as_deleted() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let state = dir.path().join("state");
+        let store = RunStore::open(&source).expect("source");
+        store
+            .persist_report(&fixture_report("run-x", &source))
+            .expect("persist");
+        export_incremental(&source, &dir.path().join("e1"), &state).expect("export 1");
+        delete_run_aggregate(&source, "run-x");
+        store
+            .persist_report(&fixture_report("run-x", &source))
+            .expect("re-persist");
+        let manifest =
+            export_incremental(&source, &dir.path().join("e2"), &state).expect("export 2");
+        assert_eq!(manifest.row_counts.runs, 1, "the live run is re-exported");
+        assert_eq!(manifest.deleted_runs.expect("channel").count, 0);
+    }
+
+    #[test]
+    fn skip_policy_preserves_target_run_listed_as_deleted() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let target = dir.path().join("target.sqlite3");
+        let state = dir.path().join("state");
+        let store = RunStore::open(&source).expect("source");
+        store
+            .persist_report(&fixture_report("run-gone", &source))
+            .expect("persist");
+        let first = dir.path().join("e1");
+        export_incremental(&source, &first, &state).expect("export 1");
+        import(
+            &target,
+            &first,
+            &dir.path().join("t1"),
+            ConflictPolicy::Reject,
+        )
+        .expect("import 1");
+
+        delete_run_aggregate(&source, "run-gone");
+        let second = dir.path().join("e2");
+        export_incremental(&source, &second, &state).expect("export 2");
+        let imported = import(
+            &target,
+            &second,
+            &dir.path().join("t2"),
+            ConflictPolicy::Skip,
+        )
+        .expect("skip import");
+        assert_eq!(imported.runs_deleted, 0);
+        assert_eq!(imported.conflicts.len(), 1);
+        assert_eq!(imported.conflicts[0].key, "run-gone");
+        assert_eq!(run_ids_in(&target), ["run-gone"]);
+    }
+
+    #[test]
+    fn deleted_run_channel_fails_closed_on_tampering() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let state = dir.path().join("state");
+        let store = RunStore::open(&source).expect("source");
+        store
+            .persist_report(&fixture_report("run-gone", &source))
+            .expect("persist");
+        export_incremental(&source, &dir.path().join("e1"), &state).expect("export 1");
+        delete_run_aggregate(&source, "run-gone");
+        let archive = dir.path().join("e2");
+        export_incremental(&source, &archive, &state).expect("export 2");
+
+        let tombstones = archive.join("deleted_runs.jsonl");
+        let original = fs::read_to_string(&tombstones).expect("read");
+        fs::write(&tombstones, original.replace("run-gone", "run-othr")).expect("tamper");
+        let error = import(
+            &dir.path().join("target.sqlite3"),
+            &archive,
+            &dir.path().join("t"),
+            ConflictPolicy::Reject,
+        )
+        .expect_err("checksum mismatch must fail closed");
+        assert!(error.to_string().contains("checksum mismatch"), "{error}");
+
+        fs::write(&tombstones, &original).expect("restore");
+        let manifest_path = archive.join("manifest.json");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest");
+        fs::write(
+            &manifest_path,
+            manifest.replace(DELETED_RUNS_FORMAT_VERSION, "deleted-runs-v99"),
+        )
+        .expect("bump version");
+        let error = import(
+            &dir.path().join("target.sqlite3"),
+            &archive,
+            &dir.path().join("t"),
+            ConflictPolicy::Reject,
+        )
+        .expect_err("unknown channel format must fail closed");
+        assert!(error.to_string().contains("deleted-runs format"), "{error}");
+    }
+
+    #[test]
+    fn full_export_without_channel_never_implies_deletion() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let target = dir.path().join("target.sqlite3");
+        let store = RunStore::open(&target).expect("target");
+        store
+            .persist_report(&fixture_report("run-target-only", &target))
+            .expect("persist target run");
+        RunStore::open(&source)
+            .expect("source")
+            .persist_report(&fixture_report("run-source", &source))
+            .expect("persist source run");
+        let archive = dir.path().join("full");
+        export(&source, &archive, &dir.path().join("s")).expect("full export");
+        // A stale tombstone file that the manifest does not declare is ignored.
+        fs::write(
+            archive.join("deleted_runs.jsonl"),
+            "{\"run_id\":\"run-target-only\",\"mutation_seq\":1}\n",
+        )
+        .expect("stale file");
+        let imported = import(
+            &target,
+            &archive,
+            &dir.path().join("t"),
+            ConflictPolicy::Reject,
+        )
+        .expect("import");
+        assert_eq!(imported.runs_deleted, 0);
+        assert_eq!(run_ids_in(&target), ["run-source", "run-target-only"]);
+    }
+
     #[test]
     fn save_and_load_cursor_round_trip_preserves_run_id() {
         let dir = tempdir().expect("tempdir");
         let cursor_path = dir.path().join("nested/deep/cursor.json");
         let cursor = SyncCursor {
+            last_mutation_seq: 42,
+            database_id: Some("00000000-0000-0000-0000-000000000042".to_owned()),
             last_export_rfc3339: "2026-06-15T12:00:00Z".to_owned(),
             last_export_run_id: Some("run-xyz-123".to_owned()),
             last_run_count: 42,
@@ -11795,7 +14960,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_exported_run_ids_cursor_with_none_run_id_uses_empty_tiebreaker() {
+    fn legacy_cursor_without_mutation_sequence_safely_reexports_all_runs() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("none_run_id.sqlite3");
         let store = RunStore::open(&db_path).expect("open");
@@ -11811,15 +14976,16 @@ mod tests {
 
         let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
-        // Cursor with None run_id → unwrap_or_default() = "".
-        // Both runs have finished_at == cursor ts, and id > "" for any real id.
-        // So both should be included.
-        let cursor = test_cursor("2026-06-01T00:00:05Z", None);
+        // Pre-v6 cursor files deserialize with sequence zero. Their legacy
+        // timestamp/run-id fields are intentionally ignored, causing one safe
+        // full re-export after migration.
+        let mut cursor = test_cursor(&conn, 0, "2026-06-01T00:00:05Z", None);
+        cursor.database_id = None;
         let ids = collect_exported_run_ids(&conn, Some(&cursor)).expect("collect");
         assert_eq!(
             ids.len(),
             2,
-            "cursor with None run_id should include all runs at same timestamp (id > empty)"
+            "legacy cursor should safely re-export every current run once"
         );
         assert!(ids.contains(&"run-a".to_owned()));
         assert!(ids.contains(&"run-b".to_owned()));
@@ -11848,7 +15014,7 @@ mod tests {
     }
 
     #[test]
-    fn load_jsonl_run_map_duplicate_id_last_entry_wins() {
+    fn load_jsonl_run_map_duplicate_id_is_rejected() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("dup.jsonl");
         let content = [
@@ -11859,14 +15025,11 @@ mod tests {
         .join("\n");
         fs::write(&path, content).expect("write");
 
-        let map = load_jsonl_run_map(&path).expect("load");
-        assert_eq!(map.len(), 2, "should have 2 unique IDs");
-        assert_eq!(
-            map["dup-1"]["version"].as_str(),
-            Some("second"),
-            "last entry with same id should overwrite earlier"
-        );
-        assert_eq!(map["dup-2"]["version"].as_str(), Some("only"));
+        let error = load_jsonl_run_map(&path).expect_err("duplicate run ID must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("duplicate run id"));
+        assert!(message.contains("dup-1"));
+        assert!(message.contains("line 2"));
     }
 
     #[test]
@@ -11907,6 +15070,7 @@ mod tests {
         // Older cursors without this field should deserialize to None.
         let json = r#"{"last_export_rfc3339":"2026-01-01T00:00:00Z","last_run_count":5}"#;
         let cursor: SyncCursor = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(cursor.last_mutation_seq, 0);
         assert_eq!(cursor.last_export_rfc3339, "2026-01-01T00:00:00Z");
         assert_eq!(
             cursor.last_export_run_id, None,
@@ -11917,6 +15081,7 @@ mod tests {
         // With the field present: should deserialize normally.
         let json_with = r#"{"last_export_rfc3339":"2026-06-01T00:00:00Z","last_export_run_id":"run-42","last_run_count":10}"#;
         let cursor2: SyncCursor = serde_json::from_str(json_with).expect("deserialize");
+        assert_eq!(cursor2.last_mutation_seq, 0);
         assert_eq!(cursor2.last_export_run_id, Some("run-42".to_owned()));
     }
 
@@ -12063,11 +15228,16 @@ mod tests {
         let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         let output_path = dir.path().join("runs.jsonl");
 
-        // Cursor with a future timestamp — no runs should match.
-        let cursor = test_cursor("2099-01-01T00:00:00Z", Some("zzz"));
+        // Cursor at the mutation high-water mark — no runs should match.
+        let cursor = test_cursor(
+            &conn,
+            mutation_high_water(&conn),
+            "2099-01-01T00:00:00Z",
+            Some("zzz"),
+        );
         let (count, _sha256) =
             export_table_runs_incremental(&conn, &output_path, Some(&cursor)).expect("export");
-        assert_eq!(count, 0, "no runs should match a far-future cursor");
+        assert_eq!(count, 0, "no runs should match a current high-water cursor");
 
         let content = fs::read_to_string(&output_path).expect("read");
         assert!(
@@ -12131,6 +15301,8 @@ mod tests {
             missing_from_jsonl: vec!["run-extra".to_owned()],
             missing_from_db: vec![],
             mismatched_records: vec!["run-001".to_owned(), "run-002".to_owned()],
+            child_mismatches: vec![],
+            child_mismatches_truncated: true,
             is_valid: false,
         };
         let json = serde_json::to_string(&report).expect("serialize");
@@ -12142,6 +15314,7 @@ mod tests {
         assert_eq!(parsed.missing_from_jsonl, vec!["run-extra"]);
         assert!(parsed.missing_from_db.is_empty());
         assert_eq!(parsed.mismatched_records.len(), 2);
+        assert!(parsed.child_mismatches_truncated);
         assert!(!parsed.is_valid);
     }
 
@@ -12203,6 +15376,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("cursor_rt2.json");
         let cursor = SyncCursor {
+            last_mutation_seq: 7,
+            database_id: Some("00000000-0000-0000-0000-000000000007".to_owned()),
             last_export_rfc3339: "2026-02-15T10:00:00Z".to_owned(),
             last_export_run_id: Some("run-42".to_owned()),
             last_run_count: 7,
@@ -12302,7 +15477,7 @@ mod tests {
     }
 
     #[test]
-    fn max_export_position_with_cursor_filters_older_runs() {
+    fn max_export_position_with_cursor_filters_earlier_mutations() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("test.sqlite3");
         let store = RunStore::open(&db_path).expect("store open");
@@ -12314,7 +15489,12 @@ mod tests {
         store.persist_report(&r2).expect("persist");
 
         let conn = Connection::open(db_path.display().to_string()).expect("conn");
-        let cursor = test_cursor("2026-01-01T00:00:05Z", None);
+        let cursor = test_cursor(
+            &conn,
+            run_mutation_seq(&conn, "run-x"),
+            "2026-01-01T00:00:05Z",
+            None,
+        );
         let pos = max_export_position(&conn, Some(&cursor)).expect("max_export_position");
         let (ts, run_id) = pos.expect("should find run-y after cursor");
         assert_eq!(ts, "2026-01-01T00:00:10Z");
@@ -12778,7 +15958,10 @@ mod tests {
                 events_jsonl_sha256: "ccc".to_owned(),
             },
             cursor_used: None,
+            deleted_runs: None,
             cursor_after: SyncCursor {
+                last_mutation_seq: 1,
+                database_id: Some("00000000-0000-0000-0000-000000000001".to_owned()),
                 last_export_rfc3339: "2026-01-01T00:00:00Z".to_owned(),
                 last_export_run_id: Some("run-new".to_owned()),
                 last_run_count: 0,
@@ -12797,6 +15980,7 @@ mod tests {
             runs_imported: 5,
             segments_imported: 20,
             events_imported: 15,
+            runs_deleted: 0,
             conflicts: vec![SyncConflict {
                 table: "runs".to_owned(),
                 key: "run-1".to_owned(),
@@ -12975,6 +16159,9 @@ mod tests {
 
         // Overwrite runs.jsonl with a row that has "id" but not "started_at".
         let runs_path = export_dir.join("runs.jsonl");
+        let valid_result_json =
+            serde_json::to_string(&fixture_report("run-no-started-at", &db_path).result)
+                .expect("serialize valid result");
         let bad_row = json!({
             "id": "run-no-started-at",
             "finished_at": "2026-01-01T00:00:05Z",
@@ -12982,7 +16169,7 @@ mod tests {
             "input_path": "test.wav",
             "normalized_wav_path": "normalized.wav",
             "request_json": "{}",
-            "result_json": "{}",
+            "result_json": valid_result_json,
             "warnings_json": "[]",
             "transcript": "hello"
             // "started_at" intentionally omitted
@@ -13498,7 +16685,7 @@ mod tests {
         // Batched.
         {
             let mut st = SegmentImportState::default();
-            let (imp, ovr) = (HashSet::new(), HashSet::new());
+            let (imp, ovr, skipped) = (HashSet::new(), HashSet::new(), HashSet::new());
             let mut chunk = import_rows.clone();
             let n = flush_segment_chunk(
                 &cbat,
@@ -13508,6 +16695,7 @@ mod tests {
                 &mut st,
                 &imp,
                 &ovr,
+                &skipped,
             )
             .expect("flush");
             assert_eq!(n, 3);
@@ -13639,7 +16827,7 @@ mod tests {
 
         {
             let mut st = EventImportState::default();
-            let (imp, ovr) = (HashSet::new(), HashSet::new());
+            let (imp, ovr, skipped) = (HashSet::new(), HashSet::new(), HashSet::new());
             let mut chunk = import_rows.clone();
             let n = flush_event_chunk(
                 &cbat,
@@ -13649,6 +16837,7 @@ mod tests {
                 &mut st,
                 &imp,
                 &ovr,
+                &skipped,
             )
             .expect("flush");
             assert_eq!(n, 3);

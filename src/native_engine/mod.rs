@@ -41,6 +41,7 @@ pub mod tokenizer;
 pub mod weights;
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -200,9 +201,13 @@ impl Mat {
 /// 7. `~/models/whisper` — the conventional whisper.cpp download location.
 ///
 /// Empty env vars are skipped. The home-relative entries are omitted entirely
-/// when `$HOME` is unset (rather than rooting at the filesystem root). This is
-/// the single source of truth shared by [`find_model_file`], [`resolve_model`],
-/// and [`native_model_available`], so the search order can never drift between
+/// when `$HOME` is unset (rather than rooting at the filesystem root). Unit
+/// tests also omit those implicit caches unless
+/// `FRANKEN_WHISPER_ULTRA_STRESS=1`; an explicit model/test-model directory is
+/// still honored. This keeps an ordinary `cargo test` bounded on developer
+/// machines that happen to have multi-gigabyte models installed. This is the
+/// single source of truth shared by [`find_model_file`], [`resolve_model`], and
+/// [`native_model_available`], so the search order can never drift between
 /// them.
 #[must_use]
 fn model_search_dirs() -> Vec<PathBuf> {
@@ -215,6 +220,14 @@ fn model_search_dirs() -> Vec<PathBuf> {
             root.join("whisper")
                 .join(crate::model_distribution::WHISPER_ARTIFACT_VERSION),
         );
+        dirs.push(
+            root.join("whisper")
+                .join(crate::model_distribution::TINY_EN_ARTIFACT_VERSION),
+        );
+        dirs.push(
+            root.join("whisper")
+                .join(crate::model_distribution::TINY_ARTIFACT_VERSION),
+        );
         dirs.push(root);
     }
     if let Ok(dir) = std::env::var("FRANKEN_WHISPER_TEST_MODEL_DIR")
@@ -222,13 +235,25 @@ fn model_search_dirs() -> Vec<PathBuf> {
     {
         dirs.push(PathBuf::from(dir));
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if implicit_home_models_enabled()
+        && let Some(home) = std::env::var_os("HOME")
+    {
         let home = PathBuf::from(home);
         let cache_root = home.join(".cache").join("franken_whisper").join("models");
         dirs.push(
             cache_root
                 .join("whisper")
                 .join(crate::model_distribution::WHISPER_ARTIFACT_VERSION),
+        );
+        dirs.push(
+            cache_root
+                .join("whisper")
+                .join(crate::model_distribution::TINY_EN_ARTIFACT_VERSION),
+        );
+        dirs.push(
+            cache_root
+                .join("whisper")
+                .join(crate::model_distribution::TINY_ARTIFACT_VERSION),
         );
         dirs.push(cache_root);
         dirs.push(
@@ -239,6 +264,10 @@ fn model_search_dirs() -> Vec<PathBuf> {
         dirs.push(home.join("models").join("whisper"));
     }
     dirs
+}
+
+fn implicit_home_models_enabled() -> bool {
+    !cfg!(test) || std::env::var("FRANKEN_WHISPER_ULTRA_STRESS").is_ok_and(|value| value == "1")
 }
 
 /// The on-disk filename a short model name maps to (`tiny.en` → `ggml-tiny.en.bin`).
@@ -438,33 +467,37 @@ pub(crate) fn enc_free_f32() -> bool {
     })
 }
 
-/// Cap on how many model-weight tensors load+quantize concurrently across the
-/// whole (encoder ∥ decoder) weight build. Applied as a scoped rayon pool around
-/// the `rayon::join` in [`decode::LoadedModel::from_ggml`], so both builds' layer
-/// `into_par_iter`s share it.
+/// Optional cap on how many model-weight tensors load+quantize concurrently
+/// across the whole (encoder ∥ decoder) weight build, below the run's own
+/// compute width. When set and smaller than the run's pool, the `rayon::join`
+/// in [`decode::LoadedModel::from_ggml`] runs in a transient pool of that many
+/// workers (both builds' layer `into_par_iter`s share it); otherwise the build
+/// runs in the run's pool.
 ///
-/// **Default = `host_parallelism()∧32`** (the all-core AVX freq-throttle knee —
-/// the same optimum the encoder *compute* already uses). Uncapped, the load fans
-/// across the full ambient pool (64-way on the 64-core box) AND each weight's
-/// `thread::scope` workers pile on top → oversubscription + throttle. Capping to
-/// 32 measured `model_weights` ~441 ms → ~394 ms (−11%, ~2% e2e single-shot),
-/// **byte-exact** (thread count never changes the quantized output); it also cut
-/// load-time voluntary context switches (122 k → far fewer). On ≤32-core hosts
-/// `host∧32 == host`, so nothing changes there.
+/// **Default = none: the load uses the run's `--threads` pool**
+/// (bd-threads-flag-unbounded-f4pq). The old default built a fresh
+/// `host∧32`-worker pool per load on top of the ambient pool, because the
+/// per-weight `thread::scope` workers piled onto the 64-way ambient pool and
+/// oversubscribed it (`model_weights` ~441 → ~394 ms with the cap, 64-core
+/// box). Those band splits now run as pool jobs (`plat::scope`), so that
+/// oversubscription is gone, and a second pool would put the run over its
+/// `--threads` bound. Byte-exact either way (thread count never changes the
+/// quantized output).
 ///
-/// `FW_LOAD_WORKERS=<N>` overrides: a smaller `N` further bounds the transient
-/// per-tensor buffers (most useful with [`ggml`]'s `FW_STREAM_LOAD` (bd-A14),
-/// where each in-flight tensor is an owned pread buffer incl. the ~133 MB token
-/// embedding — lower peak RSS, traded against a longer load). `FW_LOAD_WORKERS=0`
-/// (or non-numeric) = **uncapped** kill-switch (restores the old ambient pool).
+/// `FW_LOAD_WORKERS=<N>` sets the cap: a smaller `N` further bounds the
+/// transient per-tensor buffers (with [`ggml`]'s streaming loader, bd-A14,
+/// default on, each in-flight tensor holds a pooled read buffer, one of them
+/// sized for the ~133 MB token embedding — lower peak RSS, traded against a
+/// longer load).
+/// It is an explicit opt-in that adds those `N` threads for the duration of
+/// the load. `0` / non-numeric = no cap.
 pub(crate) fn load_worker_cap() -> Option<usize> {
     static CAP: OnceLock<Option<usize>> = OnceLock::new();
-    *CAP.get_or_init(|| match std::env::var("FW_LOAD_WORKERS") {
-        // Explicit override: <N> caps to N; 0 / non-numeric = uncapped kill-switch.
-        Ok(v) => v.trim().parse::<usize>().ok().filter(|&n| n >= 1),
-        // Default: cap at the ~32-thread throttle knee (byte-exact; single scoped
-        // pool covers both enc and dec builds via the join in from_ggml).
-        Err(_) => Some(host_parallelism().min(32)),
+    *CAP.get_or_init(|| {
+        std::env::var("FW_LOAD_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
     })
 }
 
@@ -518,12 +551,30 @@ pub(crate) fn enc_int8_attn_in() -> bool {
 }
 
 /// FULL quality-safe encoder int8: q/k/v/fc1/fc2 through the fast i7 maddubs
-/// GEMM (each individually proven proper-noun-safe) AND the residual-feeding
-/// `attn.out` through a **full i8** (per-output-channel amax/127, 8 bits) i32-
-/// accumulate GEMM ([`encoder::matmul_bias_i8`]) instead of the i7 maddubs.
-/// `FW_ENC_ATTN_OUT_I8I32`, **default OFF = f32 = byte-identical**.
+/// GEMM AND the residual-feeding `attn.out` through a **full i8**
+/// (per-output-channel amax/127, 8 bits) i32-accumulate GEMM
+/// ([`encoder::matmul_bias_i8`]) instead of the i7 maddubs.
 ///
-/// Prior digs proved full-encoder int8 mangles proper nouns ONLY through the
+/// Selected per model by [`encoder_int8_effective_policy_decision`]:
+/// `FW_ENC_ATTN_OUT_I8I32=1` forces it, `=0` forces f32, and unset follows
+/// [`encoder_int8_policy_decision`], which since calibration
+/// [`ENCODER_INT8_CALIBRATION_ID`] picks **f32 for every model**: both
+/// calibrated shapes measured a positive corpus WER delta against the 0.0
+/// budget (`docs/planning/DISCREPANCIES.md` DISC-010). The int8 arm stays a
+/// supported operator opt-in for throughput-bound work.
+///
+/// The decision picks the weights the CPU encoder runs. The macOS Metal
+/// encoder (models with `n_state` ≥ 1024 while
+/// [`encoder::gpu_encoder_available`]) never runs the int8 kernels under
+/// either arm: its GEMMs take f16 weights and f16-rounded activations with
+/// f32 accumulation ([`encoder::metal_encoder_precision`]). Without AVX2 the
+/// int8 arm runs the portable scalar kernels. The older owner gates
+/// `FRANKEN_WHISPER_ENC_INT8` and `FW_ENC_INT8_ATTN_IN` take precedence over
+/// the decision, and `FW_ENC_INT8_FC1` applies when it selects f32. Each run
+/// records what its encoder forwards actually ran, per GEMM family and with
+/// the gate that chose it, in `raw_output.encoder_execution`.
+///
+/// History. Prior digs proved full-encoder int8 mangles proper nouns ONLY through the
 /// residual-feeding `attn.out` ("Frank at"; [[project_turbo_encoder_dominates]]),
 /// and attributed it to "the maddubs arithmetic." But franken's maddubs is
 /// already i32-accumulate and non-saturating (i7 weight chosen so
@@ -535,8 +586,40 @@ pub(crate) fn enc_int8_attn_in() -> bool {
 /// int8 ⇒ 0 f32 GEMMs/layer ⇒ the fast non-monotonic-mix state (the f32-mix
 /// pessimum only bites at exactly 1 f32 GEMM) ⇒ **1.47× encoder_window** (jfk×3
 /// window-1, min-of-5) vs f32, beating the prior quality-safe max `attn_in` (1.23×)
-/// by ~20% at equal proper-noun fidelity. Owner-gated (non-byte-exact); default off.
-pub(crate) const ENCODER_INT8_CALIBRATION_ID: &str = "encoder-int8-calibration-2026-07-10";
+/// by ~20% at equal proper-noun fidelity. It was the default for `tiny.en` and
+/// `large-v3-turbo` from calibration `encoder-int8-calibration-2026-07-10`, whose
+/// only live transcript gate was the 11 s JFK clip (its "9/9 paired fixture
+/// corpus" compares committed JSON files and never runs the encoder).
+///
+/// The calibration record that sets the default encoder precision. Its corpus,
+/// commands and per-model results are in `docs/PERF_LEDGER.md` under this id.
+pub(crate) const ENCODER_INT8_CALIBRATION_ID: &str = "encoder-int8-calibration-2026-10-08";
+
+/// Largest corpus WER delta (int8 minus f32) that admits the int8 default.
+pub(crate) const ENCODER_INT8_WER_DELTA_BUDGET: f64 = 0.0;
+
+/// Per-layer relative-RMSE budget for the quantized encoder weights.
+const ENCODER_INT8_QUANT_REL_RMSE_BUDGET: f64 = 0.09;
+
+/// One model's row in calibration [`ENCODER_INT8_CALIBRATION_ID`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct EncoderInt8Calibration {
+    /// Pooled corpus WER of the quality-safe int8 encoder minus the f32 encoder:
+    /// same binary, both arms forced by `FW_ENC_ATTN_OUT_I8I32`, greedy decode,
+    /// `--language en`, scored against the human references.
+    pub corpus_wer_delta: f64,
+}
+
+/// `tiny.en`: 395 vs 389 word errors (int8 vs f32) over 7,659 reference words
+/// (61 TTS narration lines + 328 LibriSpeech test-clean utterances).
+const TINY_EN_ENCODER_INT8_CALIBRATION: EncoderInt8Calibration = EncoderInt8Calibration {
+    corpus_wer_delta: 6.0 / 7_659.0,
+};
+
+/// `large-v3-turbo`: 195 vs 187 word errors over the same 7,659 words.
+const LARGE_V3_TURBO_ENCODER_INT8_CALIBRATION: EncoderInt8Calibration = EncoderInt8Calibration {
+    corpus_wer_delta: 8.0 / 7_659.0,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EncoderInt8PolicyAction {
@@ -550,6 +633,9 @@ pub(crate) struct EncoderInt8PolicyDecision {
     pub reason: &'static str,
     pub calibration_id: &'static str,
     pub corpus_wer_delta_budget: f64,
+    /// The calibration's measured corpus WER delta for this model, or `None`
+    /// when the model shape has no calibration row.
+    pub measured_corpus_wer_delta: Option<f64>,
     pub quant_rel_rmse_budget: f64,
 }
 
@@ -562,45 +648,51 @@ impl EncoderInt8PolicyDecision {
 
 /// Expected-loss default policy for the quality-safe encoder int8 arm.
 ///
-/// State: model hparams/family, compiled CPU feature class, calibration corpus
-/// id, per-layer quantization-error budget, fixture WER/adversarial sentinels,
-/// and the operator override. Actions: f32 encoder or quality-safe int8. Loss:
-/// false-accepting int8 with WER/proper-noun drift is high loss; falling back to
-/// f32 only pays speed. Posterior/calibration artifact:
-/// [`ENCODER_INT8_CALIBRATION_ID`] in the performance ledger. Deterministic
-/// fallback: f32 for unknown hparams or non-AVX2 builds, and f32 when the
-/// kill-switch is set.
+/// State: compiled CPU feature class, the model's row in calibration
+/// [`ENCODER_INT8_CALIBRATION_ID`] (measured corpus WER delta), and the
+/// operator override (applied by [`encoder_int8_effective_policy_decision`]).
+/// Actions: f32 encoder or quality-safe int8. Loss: false-accepting int8 with
+/// word errors is high loss; falling back to f32 only pays speed. Admission:
+/// int8 needs a calibration row whose measured delta is inside
+/// [`ENCODER_INT8_WER_DELTA_BUDGET`]. Deterministic fallback: f32 for non-AVX2
+/// builds, unknown shapes, and every row over budget (currently both rows).
 #[must_use]
 pub(crate) fn encoder_int8_policy_decision(hparams: &WhisperHParams) -> EncoderInt8PolicyDecision {
-    const WER_DELTA_BUDGET: f64 = 0.0;
-    const QUANT_REL_RMSE_BUDGET: f64 = 0.09;
+    encoder_int8_policy_from_calibration(
+        encoder_i8_kernel_supported(),
+        encoder_int8_calibration(hparams),
+    )
+}
 
-    if !encoder_i8_kernel_supported() {
-        return EncoderInt8PolicyDecision {
-            action: EncoderInt8PolicyAction::F32Encoder,
-            reason: "cpu_feature_fallback",
-            calibration_id: ENCODER_INT8_CALIBRATION_ID,
-            corpus_wer_delta_budget: WER_DELTA_BUDGET,
-            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
-        };
-    }
-
-    if !calibrated_encoder_int8_model(hparams) {
-        return EncoderInt8PolicyDecision {
-            action: EncoderInt8PolicyAction::F32Encoder,
-            reason: "uncalibrated_model_fallback",
-            calibration_id: ENCODER_INT8_CALIBRATION_ID,
-            corpus_wer_delta_budget: WER_DELTA_BUDGET,
-            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
-        };
-    }
-
+/// The admission rule behind [`encoder_int8_policy_decision`], separated from
+/// the compile-time CPU check so every branch is testable on every target.
+#[must_use]
+fn encoder_int8_policy_from_calibration(
+    kernel_supported: bool,
+    calibration: Option<EncoderInt8Calibration>,
+) -> EncoderInt8PolicyDecision {
+    let (action, reason) = match calibration {
+        _ if !kernel_supported => (EncoderInt8PolicyAction::F32Encoder, "cpu_feature_fallback"),
+        None => (
+            EncoderInt8PolicyAction::F32Encoder,
+            "uncalibrated_model_fallback",
+        ),
+        Some(row) if row.corpus_wer_delta > ENCODER_INT8_WER_DELTA_BUDGET => (
+            EncoderInt8PolicyAction::F32Encoder,
+            "calibration_wer_budget_exceeded",
+        ),
+        Some(_) => (
+            EncoderInt8PolicyAction::QualitySafeInt8Encoder,
+            "calibrated_model_budget_pass",
+        ),
+    };
     EncoderInt8PolicyDecision {
-        action: EncoderInt8PolicyAction::QualitySafeInt8Encoder,
-        reason: "calibrated_model_budget_pass",
+        action,
+        reason,
         calibration_id: ENCODER_INT8_CALIBRATION_ID,
-        corpus_wer_delta_budget: WER_DELTA_BUDGET,
-        quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+        corpus_wer_delta_budget: ENCODER_INT8_WER_DELTA_BUDGET,
+        measured_corpus_wer_delta: calibration.map(|row| row.corpus_wer_delta),
+        quant_rel_rmse_budget: ENCODER_INT8_QUANT_REL_RMSE_BUDGET,
     }
 }
 
@@ -620,8 +712,10 @@ pub(crate) fn is_large_v3_turbo(hparams: &WhisperHParams) -> bool {
         && hparams.ftype == 1
 }
 
+/// The model's row in calibration [`ENCODER_INT8_CALIBRATION_ID`], or `None`
+/// for a shape the int8 encoder was never calibrated on.
 #[must_use]
-fn calibrated_encoder_int8_model(hparams: &WhisperHParams) -> bool {
+fn encoder_int8_calibration(hparams: &WhisperHParams) -> Option<EncoderInt8Calibration> {
     let tiny_en = hparams.n_vocab == 51_864
         && hparams.n_audio_ctx == 1_500
         && hparams.n_audio_state == 384
@@ -631,7 +725,13 @@ fn calibrated_encoder_int8_model(hparams: &WhisperHParams) -> bool {
         && hparams.n_text_layer == 4
         && hparams.n_mels == 80
         && hparams.ftype == 1;
-    tiny_en || is_large_v3_turbo(hparams)
+    if tiny_en {
+        Some(TINY_EN_ENCODER_INT8_CALIBRATION)
+    } else if is_large_v3_turbo(hparams) {
+        Some(LARGE_V3_TURBO_ENCODER_INT8_CALIBRATION)
+    } else {
+        None
+    }
 }
 
 /// Decide whether `ft_kernel_cpu`'s 8-lane poly softmax is admitted for a model.
@@ -652,11 +752,29 @@ pub(crate) fn sdpa_poly_exp_for(hparams: &WhisperHParams) -> bool {
 }
 
 #[must_use]
-fn encoder_i8_kernel_supported() -> bool {
+pub(crate) fn encoder_i8_kernel_supported() -> bool {
     cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
 }
 
-fn enc_attn_out_i8i32_override() -> Option<bool> {
+/// Each calibrated model with the default its calibration row selects on this
+/// build, before any operator override (for `fw capabilities --json`).
+#[must_use]
+pub(crate) fn encoder_int8_calibrated_defaults() -> [(&'static str, EncoderInt8PolicyDecision); 2] {
+    let decide =
+        |row| encoder_int8_policy_from_calibration(encoder_i8_kernel_supported(), Some(row));
+    [
+        ("tiny.en", decide(TINY_EN_ENCODER_INT8_CALIBRATION)),
+        (
+            "large-v3-turbo",
+            decide(LARGE_V3_TURBO_ENCODER_INT8_CALIBRATION),
+        ),
+    ]
+}
+
+/// The process-wide `FW_ENC_ATTN_OUT_I8I32` override: `Some(true)` forces the
+/// quality-safe int8 encoder, `Some(false)` forces f32, `None` (unset or
+/// unrecognized) keeps the calibrated default.
+pub(crate) fn enc_attn_out_i8i32_override() -> Option<bool> {
     static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
     *OVERRIDE.get_or_init(|| match std::env::var("FW_ENC_ATTN_OUT_I8I32") {
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
@@ -672,28 +790,41 @@ pub(crate) fn enc_attn_out_i8i32_for(hparams: &WhisperHParams) -> bool {
     encoder_int8_effective_policy_decision(hparams).enabled()
 }
 
+/// The encoder precision a load actually uses: the calibrated default
+/// ([`encoder_int8_policy_decision`]) unless `FW_ENC_ATTN_OUT_I8I32` overrides it.
 #[must_use]
 pub(crate) fn encoder_int8_effective_policy_decision(
     hparams: &WhisperHParams,
 ) -> EncoderInt8PolicyDecision {
-    const WER_DELTA_BUDGET: f64 = 0.0;
-    const QUANT_REL_RMSE_BUDGET: f64 = 0.09;
-    match enc_attn_out_i8i32_override() {
+    apply_encoder_int8_override(
+        enc_attn_out_i8i32_override(),
+        encoder_int8_policy_decision(hparams),
+    )
+}
+
+/// `Some(true)` forces the quality-safe int8 arm and `Some(false)` forces f32,
+/// on any model and target (for the CPU encoder; see
+/// [`ENCODER_INT8_CALIBRATION_ID`] for the Metal encoder); `None` keeps the
+/// calibrated default. The forced decisions keep the default's calibration
+/// fields, so a report still shows what the calibration measured for the
+/// model.
+#[must_use]
+fn apply_encoder_int8_override(
+    operator_override: Option<bool>,
+    default: EncoderInt8PolicyDecision,
+) -> EncoderInt8PolicyDecision {
+    match operator_override {
         Some(true) => EncoderInt8PolicyDecision {
             action: EncoderInt8PolicyAction::QualitySafeInt8Encoder,
             reason: "operator_forced_quality_safe_int8",
-            calibration_id: ENCODER_INT8_CALIBRATION_ID,
-            corpus_wer_delta_budget: WER_DELTA_BUDGET,
-            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+            ..default
         },
         Some(false) => EncoderInt8PolicyDecision {
             action: EncoderInt8PolicyAction::F32Encoder,
             reason: "operator_f32_kill_switch",
-            calibration_id: ENCODER_INT8_CALIBRATION_ID,
-            corpus_wer_delta_budget: WER_DELTA_BUDGET,
-            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+            ..default
         },
-        None => encoder_int8_policy_decision(hparams),
+        None => default,
     }
 }
 
@@ -1034,14 +1165,71 @@ pub fn find_model_file(short_name: &str) -> Option<PathBuf> {
 // Model resolution
 // ─────────────────────────────────────────────────────────────────────────
 
+/// A model selected for inference, preserving whether its bytes crossed the
+/// compiled package-authentication boundary.
+#[derive(Debug, Clone)]
+pub enum ResolvedWhisperModel {
+    /// User-selected path or short name. These bytes are intentionally outside
+    /// the release-package trust root and occupy a distinct cache generation.
+    Path(PathBuf),
+    /// Release package plus the still-open descriptor that passed SHA-256.
+    Authenticated(crate::model_distribution::CachedWhisperPackage),
+}
+
+impl ResolvedWhisperModel {
+    /// Display/provenance path associated with this source.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Path(path) => path,
+            Self::Authenticated(package) => &package.weights_path,
+        }
+    }
+
+    /// Load this exact source through the native model cache.
+    pub fn load(&self) -> FwResult<Arc<NativeWhisperModel>> {
+        match self {
+            Self::Path(path) => NativeWhisperModel::load(path),
+            Self::Authenticated(package) => NativeWhisperModel::load_authenticated(package),
+        }
+    }
+
+    /// Load this exact source while polling the caller's cancellation fence
+    /// between cold-load phases.
+    pub fn load_with_checkpoint(
+        &self,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Arc<NativeWhisperModel>> {
+        match self {
+            Self::Path(path) => NativeWhisperModel::load_with_checkpoint(path, checkpoint),
+            Self::Authenticated(package) => {
+                NativeWhisperModel::load_authenticated_with_checkpoint(package, checkpoint)
+            }
+        }
+    }
+}
+
+/// Whether `spec` is a bare sentinel for the authenticated release package.
+/// Path-bearing spellings are deliberately excluded even when their basename
+/// is `default` or `large-v3-turbo`.
+#[must_use]
+pub(crate) fn is_release_package_spec(spec: &str) -> bool {
+    let spec = spec.trim();
+    spec.is_empty()
+        || spec.eq_ignore_ascii_case("default")
+        || spec.eq_ignore_ascii_case("large-v3-turbo")
+}
+
 /// Resolve a user-supplied model `spec` to a concrete, canonicalized path to a
 /// ggml `.bin` file.
 ///
-/// Two forms are accepted:
-/// 1. **A filesystem path** (absolute or relative) that already exists — it is
+/// Three forms are accepted:
+/// 1. **A release-package sentinel** (`default`, `large-v3-turbo`, or blank) —
+///    resolved only through the authenticated package installed by `fw pull`.
+/// 2. **A filesystem path** (absolute or relative) that already exists — it is
 ///    canonicalized and returned verbatim. This lets callers point at any
 ///    `.bin` anywhere on disk.
-/// 2. **A short model name** such as `"tiny.en"` or `"base"` — searched as
+/// 3. **A short model name** such as `"tiny.en"` or `"base"` — searched as
 ///    `ggml-{name}.bin` across [`model_search_dirs`] in precedence order. The
 ///    canonical `"large-v3-turbo"` name and an unspecified/default request are
 ///    reserved for the authenticated release package installed by `fw pull`.
@@ -1061,17 +1249,46 @@ pub fn find_model_file(short_name: &str) -> Option<PathBuf> {
 /// set `$FRANKEN_WHISPER_MODEL_DIR`) is obvious. A canonicalization failure on
 /// an existing path surfaces as [`FwError::Io`].
 pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
+    match resolve_model_source_with_cancel(spec, &|| false)? {
+        ResolvedWhisperModel::Path(path) => Ok(path),
+        ResolvedWhisperModel::Authenticated(package) => {
+            package.weights_path.canonicalize().map_err(Into::into)
+        }
+    }
+}
+
+/// Resolve a model for execution without discarding an authenticated package's
+/// verified descriptor. Hashing package bytes polls `is_cancelled`; custom
+/// paths retain the historical canonical path behavior.
+pub fn resolve_model_source_with_cancel(
+    spec: &str,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> FwResult<ResolvedWhisperModel> {
     // Tolerate blank/whitespace specs — a common "dumb error" is `--model ""`
     // from an empty shell variable. Treat those as "no model specified" rather
     // than trying to open a file literally named "" (which fails obscurely).
     let spec = spec.trim();
 
-    // Form 1: an existing path wins, even if it happens to look like a name.
+    // Bare release names are trust-boundary sentinels, never CWD-relative
+    // paths. A custom file with the same basename remains selectable through
+    // an explicit path spelling such as `./default` or `/models/default`.
+    if is_release_package_spec(spec) {
+        // A batch residency authenticates the package once (see
+        // [`ModelResidency`]); single runs always hash.
+        if let Some(package) = resident_release_package() {
+            return Ok(ResolvedWhisperModel::Authenticated(package));
+        }
+        let package = crate::model_distribution::resolve_cached_whisper_with_cancel(is_cancelled)?;
+        remember_release_package(&package);
+        return Ok(ResolvedWhisperModel::Authenticated(package));
+    }
+
+    // Form 2: an existing explicit path wins over short-name lookup.
     if !spec.is_empty() {
         let as_path = Path::new(spec);
         if as_path.is_file() {
             if header_ftype_ok(as_path) {
-                return Ok(as_path.canonicalize()?);
+                return Ok(ResolvedWhisperModel::Path(as_path.canonicalize()?));
             }
             return Err(FwError::InvalidRequest(format!(
                 "Whisper model `{spec}` does not have a supported dense ggml f16/f32 header"
@@ -1079,26 +1296,10 @@ pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
         }
     }
 
-    // This canonical name is the release trust boundary, not an alias for an
-    // arbitrary same-named file in a legacy search directory. Operators can
-    // still request another compatible model by passing its explicit path.
-    if spec.eq_ignore_ascii_case("large-v3-turbo") {
-        let package = crate::model_distribution::resolve_cached_whisper()?;
-        return package.weights_path.canonicalize().map_err(Into::into);
-    }
-
     let dirs = model_search_dirs();
 
-    // The shipped default is the hash-pinned release package. Never substitute
-    // an arbitrary discovered model when that package is missing or corrupt;
-    // doing so would make the default depend on unrelated files on the host.
-    if spec.is_empty() || spec.eq_ignore_ascii_case("default") {
-        let package = crate::model_distribution::resolve_cached_whisper()?;
-        return package.weights_path.canonicalize().map_err(Into::into);
-    }
-
-    // Form 2: explicit short-name lookup across the shared search dirs.
-    resolve_model_in_dirs(spec, &dirs)
+    // Form 3: explicit short-name lookup across the shared search dirs.
+    resolve_model_in_dirs(spec, &dirs).map(ResolvedWhisperModel::Path)
 }
 
 /// Resolve a short-name `spec` against an explicit, ordered list of search
@@ -1158,27 +1359,16 @@ pub fn default_model_spec() -> Option<String> {
     }
 }
 
-/// Select the native Whisper model used when a request did not provide one.
-///
-/// An explicit `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` wins. Otherwise this
-/// delegates to [`resolve_model`] with its `default` sentinel, which requires
-/// the compiled-size/SHA-256 release package. The returned path is canonical,
-/// no network access is performed, and a non-UTF-8 path fails with an
-/// actionable error because downstream request model specifications are UTF-8
-/// strings.
-pub fn configured_or_release_model_spec() -> FwResult<String> {
+/// Select the native Whisper model spec used when a request did not provide
+/// one. An explicit `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` wins; otherwise the
+/// `default` sentinel is preserved so the execution resolver can retain the
+/// authenticated package descriptor instead of collapsing it to a path.
+#[must_use]
+pub fn configured_or_release_model_spec() -> String {
     if let Some(spec) = default_model_spec() {
-        return Ok(spec);
+        return spec;
     }
-
-    let path = resolve_model("default")?;
-    path.into_os_string().into_string().map_err(|_| {
-        FwError::InvalidRequest(
-            "the release Whisper model path is not valid UTF-8; pass an explicit \
-             UTF-8 --model path"
-                .to_owned(),
-        )
-    })
+    "default".to_owned()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1226,18 +1416,16 @@ pub fn native_model_available(spec: &str) -> bool {
 #[must_use]
 pub(crate) fn model_probe_path(spec: &str) -> Option<PathBuf> {
     let spec = spec.trim();
+    if is_release_package_spec(spec) {
+        return find_model_file("large-v3-turbo");
+    }
     let explicit_path = Path::new(spec);
     if explicit_path.is_file() {
         return header_ftype_ok(explicit_path)
             .then(|| explicit_path.canonicalize().ok())
             .flatten();
     }
-    let lookup = if spec.is_empty() || spec.eq_ignore_ascii_case("default") {
-        "large-v3-turbo"
-    } else {
-        spec
-    };
-    find_model_file(lookup)
+    find_model_file(spec)
 }
 
 /// Cheap availability check for the exact default model selection policy.
@@ -1276,10 +1464,12 @@ fn header_ftype_ok(path: &Path) -> bool {
 // Threading
 // ─────────────────────────────────────────────────────────────────────────
 
-/// The default inference thread count: the machine's available parallelism,
-/// capped at 32.
+/// The default inference thread count: the host's available parallelism on
+/// hosts with at most 32 logical CPUs; above that, the host's PHYSICAL core
+/// count, never below 32 (see the high-core NOTE below). It never exceeds the
+/// host's available parallelism.
 ///
-/// The cap was 16, but that MEASURED as far too low for the large-v3-turbo
+/// History: the cap was 16, then 32. 16 MEASURED as far too low for the large-v3-turbo
 /// encoder (the dominant ~82% cost, big `[1500,1280]×[1280,K]` sgemms). Fresh
 /// sweep on a 64-core box (`examples/encoder_scale_probe.rs`, min-of-N):
 /// encoder::forward best 4100 ms/win @16 → **3022 ms/win @32 (1.34×)**, then
@@ -1289,9 +1479,10 @@ fn header_ftype_ok(path: &Path) -> bool {
 /// and jfk×6, `e2e_probe`), e2e **~1.23–1.28×** (jfk×6 14.56 s → 11.3–12.3 s).
 /// 32 is the perf optimum AND still leaves half a 64-core host free (48/64
 /// regress anyway), preserving the "don't fully monopolize" intent. Falls back
-/// to `1` when parallelism cannot be queried. Callers should plumb
-/// `BackendParams.threads` through and only fall back to this when unset;
-/// `RAYON_NUM_THREADS` still overrides the pool entirely.
+/// to `1` when parallelism cannot be queried. This is only the fallback width:
+/// [`effective_compute_threads`] prefers `BackendParams.threads` (`--threads`),
+/// then `RAYON_NUM_THREADS`, and [`with_compute_threads`] sizes the run's pool
+/// to the result.
 ///
 /// NOTE (Threadripper / high-core hosts): the `min(32)` above was the ENCODER
 /// optimum (encoder_scale_probe, sequential). But the e2e is decoder-dominated
@@ -1307,7 +1498,13 @@ fn header_ftype_ok(path: &Path) -> bool {
 /// `RAYON_NUM_THREADS` / `BackendParams.threads` still override entirely.
 #[must_use]
 pub fn default_threads() -> usize {
-    let host = host_parallelism();
+    default_threads_for(host_parallelism(), physical_cores)
+}
+
+/// [`default_threads`] as a function of the host's shape: `host` logical CPUs
+/// and its physical core count (`None` when undetectable), queried only when
+/// the host has more than 32 logical CPUs.
+fn default_threads_for(host: usize, physical_cores: impl FnOnce() -> Option<usize>) -> usize {
     if host <= 32 {
         return host;
     }
@@ -1357,20 +1554,331 @@ pub(crate) fn host_parallelism() -> usize {
     })
 }
 
-/// Initialize Rayon before inference kernels touch the global pool.
-///
-/// Rayon defaults to the full host parallelism, which is a poor fit on large
-/// shared machines: this crate's kernels are tuned around [`default_threads`],
-/// and the caller can still opt into another value with `RAYON_NUM_THREADS`.
-pub(crate) fn ensure_default_rayon_pool() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        if std::env::var_os("RAYON_NUM_THREADS").is_none() {
-            let _ = rayon::ThreadPoolBuilder::new()
-                .num_threads(default_threads())
-                .build_global();
+/// The CPUs this process may run on: std's `available_parallelism`, which
+/// honors the scheduler affinity mask and, on Linux, the cgroup `cpu.max`
+/// quota (queried once, see [`host_parallelism`]).
+#[must_use]
+pub fn usable_cpus() -> usize {
+    host_parallelism()
+}
+
+/// A requested compute width larger than the CPUs this process may use
+/// (bd-threads-unclamped-pools-never-retired-7kuk).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputeThreadsClamp {
+    /// The width asked for (`--threads`, `BackendParams.threads`).
+    pub requested: usize,
+    /// The width used: [`usable_cpus`].
+    pub effective: usize,
+}
+
+impl ComputeThreadsClamp {
+    /// `Some` when `requested` exceeds `usable` CPUs.
+    #[must_use]
+    pub fn for_request(requested: usize, usable: usize) -> Option<Self> {
+        (requested > usable).then_some(Self {
+            requested,
+            effective: usable.max(1),
+        })
+    }
+
+    /// One-line human/robot warning text.
+    #[must_use]
+    pub fn warning(&self) -> String {
+        format!(
+            "--threads {} exceeds the {} CPUs this process may use; computing on {} threads",
+            self.requested, self.effective, self.effective
+        )
+    }
+}
+
+/// The compute-thread count for a run: the caller's request (`--threads`,
+/// `BackendParams.threads`, `DecodeParams.n_threads`) when it is at least 1,
+/// clamped to [`usable_cpus`] (a pool wider than the CPUs the process may run
+/// on only oversubscribes them and reserves a worker stack per thread);
+/// otherwise `RAYON_NUM_THREADS` when it parses to at least 1 (the
+/// long-standing environment override of the engine's pool, kept so
+/// existing deployments that bound fw that way keep the same width);
+/// otherwise [`default_threads`].
+#[must_use]
+pub fn effective_compute_threads(requested: Option<usize>) -> usize {
+    match requested.filter(|&n| n >= 1) {
+        Some(requested) => ComputeThreadsClamp::for_request(requested, usable_cpus())
+            .map_or(requested, |clamp| clamp.effective),
+        None => std::env::var("RAYON_NUM_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or_else(default_threads),
+    }
+}
+
+/// Worker stack size for the compute pools fw builds. A run's stage body
+/// (decode loop, model load) executes on a pool worker, and a waiting worker
+/// runs stolen jobs on top of its own frames, so workers get more than the
+/// 2 MiB the release stage threads ran this code on: 8 MiB in release, the
+/// stage threads' 64 MiB in debug builds (see
+/// `orchestrator::stage_thread_stack_bytes`). The reservation is virtual and
+/// committed lazily.
+#[cfg(not(target_arch = "wasm32"))]
+const COMPUTE_WORKER_STACK_BYTES: usize = if cfg!(debug_assertions) {
+    64 * 1024 * 1024
+} else {
+    8 * 1024 * 1024
+};
+
+/// Most distinct compute-pool widths kept alive
+/// (bd-threads-unclamped-pools-never-retired-7kuk). An idle pool waits for
+/// the next run of its width, so a batch of inputs (or any repeated call)
+/// reuses the same workers instead of recreating them; but a long-lived
+/// process serving runs of many widths (an embedding server, varied
+/// `BackendParams.threads`) used to keep one pool per width, and per
+/// concurrently live run of it, for its lifetime. When a run needs a width no
+/// live pool has and this many widths are live, the least recently used width
+/// whose pools are all idle is retired (its pools dropped, so their workers
+/// exit). A leased pool is never retired: runs in flight can still hold more
+/// widths than this until they end. A process normally holds one or two
+/// widths (a run's `--threads`, the two live-listen lanes).
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_LIVE_COMPUTE_POOL_WIDTHS: usize = 4;
+
+/// The compute pools fw has built and not retired.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct ComputePoolCache {
+    /// Every live pool, leased or idle, by id: its width and the pool.
+    pools: HashMap<usize, (usize, Arc<rayon::ThreadPool>)>,
+    /// Ids of the pools no run currently holds, by width.
+    idle: HashMap<usize, Vec<usize>>,
+    /// Each live width's last lease or release, in cache ticks.
+    last_used: HashMap<usize, u64>,
+    /// Pools retired so far, by width.
+    retired: HashMap<usize, u64>,
+    tick: u64,
+    last_id: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ComputePoolCache {
+    /// Hold an idle pool of `width` workers, or build one with
+    /// `build(id, width)` after retiring least-recently-used fully idle
+    /// widths so that at most [`MAX_LIVE_COMPUTE_POOL_WIDTHS`] stay live.
+    fn lease(
+        &mut self,
+        width: usize,
+        build: impl FnOnce(usize, usize) -> FwResult<rayon::ThreadPool>,
+    ) -> FwResult<(usize, Arc<rayon::ThreadPool>)> {
+        self.tick += 1;
+        if let Some(id) = self.idle.get_mut(&width).and_then(Vec::pop) {
+            self.last_used.insert(width, self.tick);
+            return Ok((id, Arc::clone(&self.pools[&id].1)));
         }
-    });
+        if !self.last_used.contains_key(&width) {
+            self.retire_idle_widths_beyond(MAX_LIVE_COMPUTE_POOL_WIDTHS - 1);
+        }
+        let id = self.last_id + 1;
+        let pool = Arc::new(build(id, width)?);
+        self.last_id = id;
+        self.pools.insert(id, (width, Arc::clone(&pool)));
+        self.last_used.insert(width, self.tick);
+        Ok((id, pool))
+    }
+
+    /// Return a leased pool to the idle list.
+    fn release(&mut self, id: usize, width: usize) {
+        self.tick += 1;
+        if self.pools.contains_key(&id) {
+            self.idle.entry(width).or_default().push(id);
+            self.last_used.insert(width, self.tick);
+        }
+    }
+
+    /// Retire least-recently-used widths whose pools are all idle until at
+    /// most `keep` widths are live or no live width is fully idle.
+    fn retire_idle_widths_beyond(&mut self, keep: usize) {
+        while self.last_used.len() > keep {
+            let Some(width) = self
+                .last_used
+                .iter()
+                .filter(|&(&width, _)| self.width_is_fully_idle(width))
+                .min_by_key(|&(_, &tick)| tick)
+                .map(|(&width, _)| width)
+            else {
+                return;
+            };
+            for id in self.idle.remove(&width).unwrap_or_default() {
+                self.pools.remove(&id);
+                *self.retired.entry(width).or_default() += 1;
+            }
+            self.last_used.remove(&width);
+        }
+    }
+
+    fn width_is_fully_idle(&self, width: usize) -> bool {
+        let idle = self.idle.get(&width).map_or(0, Vec::len);
+        let live = self.pools.values().filter(|(w, _)| *w == width).count();
+        idle == live
+    }
+
+    fn pool(&self, id: usize) -> Option<Arc<rayon::ThreadPool>> {
+        self.pools.get(&id).map(|(_, pool)| Arc::clone(pool))
+    }
+}
+
+/// The process's compute pools (see [`ComputePoolCache`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn compute_pools() -> std::sync::MutexGuard<'static, ComputePoolCache> {
+    static POOLS: OnceLock<Mutex<ComputePoolCache>> = OnceLock::new();
+    POOLS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// Id of the fw compute pool this thread is a worker of (0 = none).
+    static COMPUTE_POOL_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One run's exclusive hold on a compute pool; the pool goes back to the idle
+/// list when the run ends (also on unwind).
+#[cfg(not(target_arch = "wasm32"))]
+struct ComputePoolLease {
+    id: usize,
+    width: usize,
+    pool: Arc<rayon::ThreadPool>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for ComputePoolLease {
+    fn drop(&mut self) {
+        compute_pools().release(self.id, self.width);
+    }
+}
+
+/// Build compute pool `id` of `width` workers.
+#[cfg(not(target_arch = "wasm32"))]
+fn build_compute_pool(id: usize, width: usize) -> FwResult<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(width)
+        .stack_size(COMPUTE_WORKER_STACK_BYTES)
+        .thread_name(|i| format!("fw-compute-{i}"))
+        .start_handler(move |_| COMPUTE_POOL_ID.with(|cell| cell.set(id)))
+        .build()
+        .map_err(|e| FwError::Io(std::io::Error::other(format!("compute pool: {e}"))))
+}
+
+/// Take an idle pool of exactly `threads` workers, or build one.
+///
+/// A pool serves one run at a time. Two concurrent runs never share workers,
+/// so a worker can never steal another run's job onto its stack — the engine
+/// holds per-forward locks (the encoder's SDPA policy pin) that a different
+/// model's run on the same worker could never acquire.
+#[cfg(not(target_arch = "wasm32"))]
+fn lease_compute_pool(threads: usize) -> FwResult<ComputePoolLease> {
+    let (id, pool) = compute_pools().lease(threads, build_compute_pool)?;
+    Ok(ComputePoolLease {
+        id,
+        width: threads,
+        pool,
+    })
+}
+
+/// The fw compute pool the current thread is a worker of, if any — the pool
+/// of the run executing here. A helper OS thread of that run (the pipelining
+/// encoder) installs its compute into it.
+pub(crate) fn current_compute_pool() -> Option<Arc<rayon::ThreadPool>> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let id = COMPUTE_POOL_ID.with(std::cell::Cell::get);
+        if id == 0 {
+            return None;
+        }
+        compute_pools().pool(id)
+    }
+}
+
+/// Run `f` with every rayon pool and engine band split it reaches bounded to
+/// `threads` workers (bd-threads-flag-unbounded-f4pq).
+///
+/// `--threads N` used to reach only a discarded encoder hint, while the
+/// rayon global pool was sized by [`default_threads`] and every kernel band
+/// split spawned fresh OS threads (~1,380 thread creations per short clip at
+/// any `--threads`). Now:
+///
+/// - Called from a worker of an fw compute pool, `f` runs inline: the
+///   enclosing pool already is the run's pool (a nested engine call such as
+///   the model load inside a backend run, or a parallel range/lane), so its
+///   width is not second-guessed.
+/// - Otherwise the run leases a pool of exactly `threads` workers for its
+///   duration (an idle one of that width, or a new one) and executes `f` on
+///   it, so every rayon call `f` makes — FrankenTorch's kernels, the pooled
+///   [`plat::scope`] band splits, the weight build — lands on those workers.
+///   The caller only waits. Sequential runs of one width (each input of a
+///   batch, each stage of a run) reuse the same workers; concurrent runs get
+///   separate pools and never share workers (see `lease_compute_pool`).
+///
+/// The rayon global pool is not used by runs at all. Thread count never
+/// changes a kernel's band partition or reduction order, so outputs are
+/// byte-identical at every width. On wasm32 the host owns the workers and
+/// this is `f()`.
+///
+/// # Errors
+/// [`FwError::Io`] when a compute pool cannot be built.
+pub fn with_compute_threads<R, F>(threads: usize, f: F) -> FwResult<R>
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = threads;
+        Ok(f())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if COMPUTE_POOL_ID.with(std::cell::Cell::get) != 0 {
+            return Ok(f());
+        }
+        let lease = lease_compute_pool(threads.max(1))?;
+        Ok(lease.pool.install(f))
+    }
+}
+
+/// Receive from `rx` without starving the pool the caller may be a worker
+/// of: while nothing has arrived, a pool worker executes pending pool jobs
+/// (the sender may be waiting on exactly such a job — e.g. the pipelined
+/// encoder's work queued behind this worker on a 1-thread pool); any other
+/// thread simply blocks.
+pub(crate) fn recv_helping_pool<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+) -> Result<T, std::sync::mpsc::RecvError> {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+    loop {
+        match rx.try_recv() {
+            Ok(value) => return Ok(value),
+            Err(TryRecvError::Disconnected) => return Err(std::sync::mpsc::RecvError),
+            Err(TryRecvError::Empty) => {}
+        }
+        match rayon::yield_now() {
+            Some(rayon::Yield::Executed) => {}
+            Some(rayon::Yield::Idle) => {
+                match rx.recv_timeout(std::time::Duration::from_micros(200)) {
+                    Ok(value) => return Ok(value),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(std::sync::mpsc::RecvError);
+                    }
+                }
+            }
+            None => return rx.recv(),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1410,7 +1918,40 @@ pub struct NativeWhisperModel {
     version_tag: OnceLock<String>,
 }
 
-/// Global, process-wide model cache keyed by canonical path.
+/// An authenticated weights descriptor plus the `fstat` fingerprint it was
+/// hashed under (bd-iej1); the loader re-verifies it after reading every
+/// weight byte, before publishing the model under the authenticated digest.
+struct AuthenticatedWeights {
+    file: File,
+    fingerprint: crate::model_distribution::WeightsFingerprint,
+}
+
+/// One model cache generation. Authenticated and unverified loads never share
+/// a key, and replacing a package at the same path produces a new digest key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ModelCacheKey {
+    path: PathBuf,
+    authenticated_sha256: Option<String>,
+}
+
+impl ModelCacheKey {
+    fn unverified(path: PathBuf) -> Self {
+        Self {
+            path,
+            authenticated_sha256: None,
+        }
+    }
+
+    fn authenticated(path: PathBuf, sha256: String) -> Self {
+        Self {
+            path,
+            authenticated_sha256: Some(sha256),
+        }
+    }
+}
+
+/// Global, process-wide model cache keyed by source path and authentication
+/// generation.
 ///
 /// `Weak` values mean normal [`load`](NativeWhisperModel::load) never keeps a
 /// model alive on its own. [`load_resident`](NativeWhisperModel::load_resident)
@@ -1418,14 +1959,14 @@ pub struct NativeWhisperModel {
 /// OpenAI-style loaded-model residency without mmap/unsafe.
 #[derive(Default)]
 struct ModelCache {
-    weak: HashMap<PathBuf, Weak<NativeWhisperModel>>,
-    resident: Option<(PathBuf, Arc<NativeWhisperModel>)>,
+    weak: HashMap<ModelCacheKey, Weak<NativeWhisperModel>>,
+    resident: Option<(ModelCacheKey, Arc<NativeWhisperModel>)>,
     /// In-flight cold loads keyed by canonical path (`FW_LOAD_DEDUP`). A peer parsing
     /// the same model holds this per-path lock so concurrent cold loads serialize on
     /// the parse rather than all parsing (the default path re-checks + discards the
     /// redundant parse — correct but N× parse work + peak RSS on a cold burst). Empty
     /// unless the flag is set.
-    loading: HashMap<PathBuf, Arc<Mutex<()>>>,
+    loading: HashMap<ModelCacheKey, Arc<Mutex<()>>>,
 }
 
 static MODEL_CACHE: Mutex<Option<ModelCache>> = Mutex::new(None);
@@ -1438,6 +1979,142 @@ fn load_dedup_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("FW_LOAD_DEDUP").ok().as_deref() == Some("1"))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Batch model residency (bd-batch-transcribe-rraf)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Process-wide state behind [`ModelResidency`]: the number of live guards
+/// and everything they retain. Empty whenever no guard is alive.
+struct ResidencyState {
+    guards: usize,
+    models: Vec<Arc<NativeWhisperModel>>,
+    release_package: Option<crate::model_distribution::CachedWhisperPackage>,
+    components: Vec<(&'static str, Arc<dyn std::any::Any + Send + Sync>)>,
+}
+
+static RESIDENCY: Mutex<ResidencyState> = Mutex::new(ResidencyState {
+    guards: 0,
+    models: Vec::new(),
+    release_package: None,
+    components: Vec::new(),
+});
+
+fn lock_residency() -> std::sync::MutexGuard<'static, ResidencyState> {
+    RESIDENCY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Keeps native models resident across the runs of one batch.
+///
+/// While at least one guard is alive:
+/// - every native Whisper model a run loads stays resident (the guard holds a
+///   strong `Arc`, so the [`Weak`] model cache keeps returning it instead of
+///   re-parsing the file);
+/// - the release package's SHA-256 authentication runs once, and later
+///   resolutions reuse the verified descriptor;
+/// - components registered through [`retain_resident_component`] (the native
+///   Sortformer session) are reused.
+///
+/// A batch of N inputs therefore pays the multi-GB hash and parse once instead
+/// of N times. Each run still executes the normal pipeline against the same
+/// in-memory weights a single-input run would load, so per-input results are
+/// unchanged. Reusing the authenticated descriptor is sound because inference
+/// reads only the in-memory weights parsed from the verified bytes; every load
+/// still re-checks the descriptor's `fstat` fingerprint and fails closed if the
+/// file was rewritten in place after authentication. Dropping the last guard
+/// releases everything it retained.
+#[must_use = "dropping the guard ends model residency immediately"]
+pub struct ModelResidency {
+    _private: (),
+}
+
+impl ModelResidency {
+    /// Begin batch residency (guards nest; the last drop releases).
+    pub fn begin() -> Self {
+        lock_residency().guards += 1;
+        Self { _private: () }
+    }
+}
+
+impl Drop for ModelResidency {
+    fn drop(&mut self) {
+        let released = {
+            let mut state = lock_residency();
+            state.guards = state.guards.saturating_sub(1);
+            (state.guards == 0).then(|| {
+                (
+                    std::mem::take(&mut state.models),
+                    state.release_package.take(),
+                    std::mem::take(&mut state.components),
+                )
+            })
+        };
+        // Free the (multi-GB) weights outside the lock.
+        drop(released);
+    }
+}
+
+/// Whether a [`ModelResidency`] guard is currently alive.
+#[must_use]
+pub fn residency_active() -> bool {
+    lock_residency().guards > 0
+}
+
+/// Retain `model` for the active residency; a no-op without a guard, so a
+/// single run keeps the load-per-run lifetime of the [`Weak`] cache.
+fn retain_resident_model(model: &Arc<NativeWhisperModel>) {
+    let mut state = lock_residency();
+    if state.guards > 0 && !state.models.iter().any(|kept| Arc::ptr_eq(kept, model)) {
+        state.models.push(Arc::clone(model));
+    }
+}
+
+/// The release package this residency already authenticated, if any.
+fn resident_release_package() -> Option<crate::model_distribution::CachedWhisperPackage> {
+    let state = lock_residency();
+    if state.guards > 0 {
+        state.release_package.clone()
+    } else {
+        None
+    }
+}
+
+/// Remember an authenticated release package for the active residency.
+fn remember_release_package(package: &crate::model_distribution::CachedWhisperPackage) {
+    let mut state = lock_residency();
+    if state.guards > 0 && state.release_package.is_none() {
+        state.release_package = Some(package.clone());
+    }
+}
+
+/// Fetch the component the active residency retained under `key`, if any.
+#[must_use]
+pub fn resident_component<T: std::any::Any + Send + Sync>(key: &'static str) -> Option<Arc<T>> {
+    let state = lock_residency();
+    if state.guards == 0 {
+        return None;
+    }
+    state
+        .components
+        .iter()
+        .find(|(kept, _)| *kept == key)
+        .and_then(|(_, value)| Arc::clone(value).downcast::<T>().ok())
+}
+
+/// Retain `value` under `key` until the active residency ends; a no-op without
+/// a guard. The first value retained under a key wins.
+pub fn retain_resident_component<T: std::any::Any + Send + Sync>(
+    key: &'static str,
+    value: &Arc<T>,
+) {
+    let mut state = lock_residency();
+    if state.guards > 0 && !state.components.iter().any(|(kept, _)| *kept == key) {
+        let erased: Arc<dyn std::any::Any + Send + Sync> = value.clone();
+        state.components.push((key, erased));
+    }
 }
 
 impl NativeWhisperModel {
@@ -1456,7 +2133,64 @@ impl NativeWhisperModel {
     /// - Whatever [`ggml::GgmlModel::load`] / [`decode::LoadedModel::from_ggml`]
     ///   return for a malformed or unsupported model.
     pub fn load(path: &Path) -> FwResult<Arc<Self>> {
-        Self::load_inner(path, false)
+        Self::load_inner(path, false, &|| Ok(()), true)
+    }
+
+    /// Load a path while polling cancellation between cold-load phases. Unlike
+    /// [`Self::load`], this stage-owned path does not spawn detached version
+    /// hashing; the tag remains lazy if the stage succeeds.
+    pub fn load_with_checkpoint(
+        path: &Path,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Arc<Self>> {
+        Self::load_inner(path, false, checkpoint, false)
+    }
+
+    /// Load a release package from the exact descriptor that passed its
+    /// compiled SHA-256 check. The pathname is provenance only: it is not
+    /// reopened, and the digest is part of the cache generation.
+    pub fn load_authenticated(
+        package: &crate::model_distribution::CachedWhisperPackage,
+    ) -> FwResult<Arc<Self>> {
+        Self::load_authenticated_inner(package, &|| Ok(()), true)
+    }
+
+    /// Load an authenticated package while polling cancellation between
+    /// descriptor I/O, parse, and inference-weight construction phases.
+    pub fn load_authenticated_with_checkpoint(
+        package: &crate::model_distribution::CachedWhisperPackage,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Arc<Self>> {
+        Self::load_authenticated_inner(package, checkpoint, false)
+    }
+
+    fn load_authenticated_inner(
+        package: &crate::model_distribution::CachedWhisperPackage,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        warm_version_tag: bool,
+    ) -> FwResult<Arc<Self>> {
+        checkpoint()?;
+        let key = ModelCacheKey::authenticated(
+            package.weights_path.clone(),
+            package.weights_sha256.clone(),
+        );
+        let file = package.try_clone_weights_file()?;
+        // bd-iej1: the descriptor must still be the generation that was hashed
+        // (checked again after parsing, before the model is published).
+        package
+            .weights_fingerprint()
+            .verify(&file, &package.weights_path)?;
+        let authenticated = AuthenticatedWeights {
+            file,
+            fingerprint: package.weights_fingerprint().clone(),
+        };
+        Self::load_key(
+            key,
+            false,
+            Some(authenticated),
+            checkpoint,
+            warm_version_tag,
+        )
     }
 
     /// Load a model and keep one process-wide strong resident slot alive.
@@ -1467,7 +2201,7 @@ impl NativeWhisperModel {
     /// replaces the resident slot, so memory retention is capped to one model.
     /// Plain [`load`](Self::load) keeps the original Weak-only semantics.
     pub fn load_resident(path: &Path) -> FwResult<Arc<Self>> {
-        Self::load_inner(path, true)
+        Self::load_inner(path, true, &|| Ok(()), true)
     }
 
     /// Load a resident model from an already-canonicalized absolute path.
@@ -1491,29 +2225,76 @@ impl NativeWhisperModel {
                 "resident canonical model path must be absolute".to_owned(),
             ));
         }
-        Self::load_canonical(canonical_path.to_path_buf(), true)
+        Self::load_canonical(canonical_path.to_path_buf(), true, &|| Ok(()), true)
     }
 
-    fn load_inner(path: &Path, keep_resident: bool) -> FwResult<Arc<Self>> {
+    fn load_inner(
+        path: &Path,
+        keep_resident: bool,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        warm_version_tag: bool,
+    ) -> FwResult<Arc<Self>> {
+        checkpoint()?;
         let canonical = path.canonicalize()?;
-        Self::load_canonical(canonical, keep_resident)
+        checkpoint()?;
+        Self::load_canonical(canonical, keep_resident, checkpoint, warm_version_tag)
     }
 
-    fn load_canonical(canonical: PathBuf, keep_resident: bool) -> FwResult<Arc<Self>> {
+    fn load_canonical(
+        canonical: PathBuf,
+        keep_resident: bool,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        warm_version_tag: bool,
+    ) -> FwResult<Arc<Self>> {
+        Self::load_key(
+            ModelCacheKey::unverified(canonical),
+            keep_resident,
+            None,
+            checkpoint,
+            warm_version_tag,
+        )
+    }
+
+    fn load_key(
+        key: ModelCacheKey,
+        keep_resident: bool,
+        authenticated: Option<AuthenticatedWeights>,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        warm_version_tag: bool,
+    ) -> FwResult<Arc<Self>> {
+        let model = Self::load_key_cached(
+            key,
+            keep_resident,
+            authenticated,
+            checkpoint,
+            warm_version_tag,
+        )?;
+        retain_resident_model(&model);
+        Ok(model)
+    }
+
+    fn load_key_cached(
+        key: ModelCacheKey,
+        keep_resident: bool,
+        authenticated: Option<AuthenticatedWeights>,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        warm_version_tag: bool,
+    ) -> FwResult<Arc<Self>> {
+        checkpoint()?;
         // Fast path: a live cached instance.
         {
             let mut guard = lock_cache();
             let cache = guard.get_or_insert_with(ModelCache::default);
-            if let Some((resident_path, resident)) = &cache.resident
-                && resident_path == &canonical
+            if let Some((resident_key, resident)) = &cache.resident
+                && resident_key == &key
             {
                 return Ok(Arc::clone(resident));
             }
-            if let Some(weak) = cache.weak.get(&canonical)
+            if let Some(weak) = cache.weak.get(&key)
                 && let Some(existing) = weak.upgrade()
             {
                 if keep_resident {
-                    cache.resident = Some((canonical.clone(), Arc::clone(&existing)));
+                    cache.resident = Some((key.clone(), Arc::clone(&existing)));
                 }
                 return Ok(existing);
             }
@@ -1530,76 +2311,129 @@ impl NativeWhisperModel {
                 Arc::clone(
                     cache
                         .loading
-                        .entry(canonical.clone())
+                        .entry(key.clone())
                         .or_insert_with(|| Arc::new(Mutex::new(()))),
                 )
             };
             // Held across the parse below — `plock` and `_held` are both locals of
             // this block (no self-referential borrow); dropped on return. Lock order
             // is always per-path THEN cache (cache is only taken briefly), no deadlock.
-            let _held = plock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _held = loop {
+                checkpoint()?;
+                match plock.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        break poisoned.into_inner();
+                    }
+                }
+            };
+            checkpoint()?;
             // A peer may have published while we waited on the per-path lock.
             {
                 let mut guard = lock_cache();
                 let cache = guard.get_or_insert_with(ModelCache::default);
-                if let Some((rp, r)) = &cache.resident
-                    && rp == &canonical
+                if let Some((resident_key, resident)) = &cache.resident
+                    && resident_key == &key
                 {
-                    return Ok(Arc::clone(r));
+                    return Ok(Arc::clone(resident));
                 }
-                if let Some(w) = cache.weak.get(&canonical)
-                    && let Some(existing) = w.upgrade()
+                if let Some(weak) = cache.weak.get(&key)
+                    && let Some(existing) = weak.upgrade()
                 {
                     if keep_resident {
-                        cache.resident = Some((canonical.clone(), Arc::clone(&existing)));
+                        cache.resident = Some((key.clone(), Arc::clone(&existing)));
                     }
                     return Ok(existing);
                 }
             }
-            let model = Self::do_parse_and_publish(canonical.clone(), keep_resident)?;
+            let result = Self::do_parse_and_publish(
+                key.clone(),
+                keep_resident,
+                authenticated,
+                checkpoint,
+                warm_version_tag,
+            );
             // Drop our in-flight marker (waiting peers hold their own `Arc` clone).
             if let Some(cache) = lock_cache().as_mut() {
-                cache.loading.remove(&canonical);
+                cache.loading.remove(&key);
             }
-            return Ok(model);
+            return result;
         }
-        Self::do_parse_and_publish(canonical, keep_resident)
+        Self::do_parse_and_publish(
+            key,
+            keep_resident,
+            authenticated,
+            checkpoint,
+            warm_version_tag,
+        )
     }
 
     /// Parse the ggml model, quantize weights, publish to the cache, and warm the
     /// version tag on a background thread. Shared by the plain and `FW_LOAD_DEDUP`
     /// load paths; its own re-check-under-lock still handles a racing publisher on the
     /// plain (non-deduped) path.
-    fn do_parse_and_publish(canonical: PathBuf, keep_resident: bool) -> FwResult<Arc<Self>> {
-        // Parse outside the lock so a slow load doesn't block other paths.
-        let t_parse = crate::native_engine::plat::Instant::now();
-        let ggml = ggml::GgmlModel::load(&canonical)?;
-        perf_span("model_parse", t_parse.elapsed().as_secs_f64() * 1e3, "");
-        let t_weights = crate::native_engine::plat::Instant::now();
-        let inner = decode::LoadedModel::from_ggml(ggml)?;
-        perf_span("model_weights", t_weights.elapsed().as_secs_f64() * 1e3, "");
+    fn do_parse_and_publish(
+        key: ModelCacheKey,
+        keep_resident: bool,
+        authenticated: Option<AuthenticatedWeights>,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        warm_version_tag: bool,
+    ) -> FwResult<Arc<Self>> {
+        checkpoint()?;
+        // Parse outside the lock so a slow load doesn't block other paths. The
+        // parallel blob read and the weight build run in the caller's compute
+        // pool (a backend run's `--threads` pool), or at the default width for
+        // a direct load (bd-threads-flag-unbounded-f4pq).
+        let (inner, post_load_check) =
+            with_compute_threads(effective_compute_threads(None), || -> FwResult<_> {
+                let t_parse = crate::native_engine::plat::Instant::now();
+                let mut post_load_check = None;
+                let ggml = match authenticated {
+                    Some(AuthenticatedWeights { file, fingerprint }) => {
+                        post_load_check = Some((file.try_clone()?, fingerprint));
+                        ggml::GgmlModel::load_from_file_with_checkpoint(file, checkpoint)?
+                    }
+                    None => ggml::GgmlModel::load_with_checkpoint(&key.path, checkpoint)?,
+                };
+                perf_span("model_parse", t_parse.elapsed().as_secs_f64() * 1e3, "");
+                let t_weights = crate::native_engine::plat::Instant::now();
+                let inner = decode::LoadedModel::from_ggml_with_checkpoint(ggml, checkpoint)?;
+                perf_span("model_weights", t_weights.elapsed().as_secs_f64() * 1e3, "");
+                Ok((inner, post_load_check))
+            })??;
+        // bd-iej1: every weight byte has now been read (resident or streamed).
+        // Refuse to publish under the authenticated digest if the descriptor
+        // was rewritten in place at any point since it was hashed.
+        if let Some((file, fingerprint)) = &post_load_check {
+            fingerprint.verify(file, &key.path)?;
+        }
+        let version_tag = OnceLock::new();
+        if let Some(digest) = &key.authenticated_sha256 {
+            let prefix = digest.get(..12).unwrap_or(digest);
+            let _ = version_tag.set(format!("fw-native-v1+sha256:{prefix}"));
+        }
         let model = Arc::new(Self {
             inner,
-            model_path: canonical.clone(),
-            version_tag: OnceLock::new(),
+            model_path: key.path.clone(),
+            version_tag,
         });
+        checkpoint()?;
 
         // Re-check under the lock: a racing thread may have populated the slot
         // while we were parsing. If so, prefer the already-published instance.
         let mut guard = lock_cache();
         let cache = guard.get_or_insert_with(ModelCache::default);
-        if let Some((resident_path, resident)) = &cache.resident
-            && resident_path == &canonical
+        if let Some((resident_key, resident)) = &cache.resident
+            && resident_key == &key
         {
             return Ok(Arc::clone(resident));
         }
-        if let Some(weak) = cache.weak.get(&canonical)
+        if let Some(weak) = cache.weak.get(&key)
             && let Some(existing) = weak.upgrade()
         {
             if keep_resident {
-                cache.resident = Some((canonical.clone(), Arc::clone(&existing)));
+                cache.resident = Some((key.clone(), Arc::clone(&existing)));
             }
             return Ok(existing);
         }
@@ -1607,9 +2441,9 @@ impl NativeWhisperModel {
         // just the slot we are about to overwrite, so the cache cannot grow
         // unbounded with stale entries for models that are never reloaded.
         cache.weak.retain(|_, w| w.strong_count() > 0);
-        cache.weak.insert(canonical.clone(), Arc::downgrade(&model));
+        cache.weak.insert(key.clone(), Arc::downgrade(&model));
         if keep_resident {
-            cache.resident = Some((canonical, Arc::clone(&model)));
+            cache.resident = Some((key, Arc::clone(&model)));
         }
         drop(guard);
 
@@ -1620,13 +2454,17 @@ impl NativeWhisperModel {
         // blocks any concurrent `version_tag()` caller until the value is
         // ready, so observable behavior (the tag itself) is unchanged. The
         // clone keeps the model alive until the hash finishes (bounded by
-        // hash time; documented tradeoff).
-        let warm = Arc::clone(&model);
-        let _ = std::thread::Builder::new()
-            .name("fw-model-hash".into())
-            .spawn(move || {
-                let _ = warm.version_tag();
-            });
+        // hash time; documented tradeoff). An authenticated package already
+        // carries its tag, so no thread is spawned for it.
+        if warm_version_tag && model.version_tag.get().is_none() {
+            let warm = Arc::clone(&model);
+            let _ = std::thread::Builder::new()
+                .name("fw-model-hash".into())
+                .spawn(move || {
+                    let _ = warm.version_tag();
+                });
+        }
+        checkpoint()?;
         Ok(model)
     }
 
@@ -1649,6 +2487,21 @@ impl NativeWhisperModel {
         decode::transcribe_samples(&self.inner, samples, params, checkpoint)
     }
 
+    /// Detect the spoken language of 16 kHz mono `samples` without decoding
+    /// any text (whisper `--detect-language`); see
+    /// [`decode::detect_language_samples`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates encoder/decoder failures and `checkpoint` cancellation.
+    pub fn detect_language(
+        &self,
+        samples: &[f32],
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<decode::LanguageDetection> {
+        decode::detect_language_samples(&self.inner, samples, checkpoint)
+    }
+
     /// A stable identity string for this model's weights, of the form
     /// `"fw-native-v1+sha256:{first 12 hex of the model file's sha256}"`.
     ///
@@ -1666,6 +2519,34 @@ impl NativeWhisperModel {
                 format!("fw-native-v1+sha256:{prefix}")
             })
             .clone()
+    }
+
+    /// Return this model's stable identity while honoring stage cancellation.
+    ///
+    /// A custom model path may require streaming the whole file on the first
+    /// call. Checking between reads prevents a timed-out native stage from
+    /// remaining live solely to finish that diagnostic hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first cancellation or deadline error reported by
+    /// `checkpoint`.
+    pub fn version_tag_with_checkpoint(
+        &self,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<String> {
+        checkpoint()?;
+        if let Some(version_tag) = self.version_tag.get() {
+            checkpoint()?;
+            return Ok(version_tag.clone());
+        }
+
+        let prefix = file_sha256_prefix_with_checkpoint(&self.model_path, checkpoint)?
+            .unwrap_or_else(|| "unavailable".to_owned());
+        let candidate = format!("fw-native-v1+sha256:{prefix}");
+        let _ = self.version_tag.set(candidate.clone());
+        checkpoint()?;
+        Ok(self.version_tag.get().cloned().unwrap_or(candidate))
     }
 
     /// Borrow the underlying loaded model (parsed weights / tokenizer / etc.).
@@ -1686,24 +2567,41 @@ fn lock_cache() -> std::sync::MutexGuard<'static, Option<ModelCache>> {
 /// digest, or `None` on I/O failure.
 #[must_use]
 fn file_sha256_prefix(path: &Path) -> Option<String> {
+    file_sha256_prefix_with_checkpoint(path, &|| Ok(()))
+        .ok()
+        .flatten()
+}
+
+/// Cancellation-aware implementation of [`file_sha256_prefix`].
+fn file_sha256_prefix_with_checkpoint(
+    path: &Path,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<Option<String>> {
     use std::io::Read as _;
-    let mut file = std::fs::File::open(path).ok()?;
+    checkpoint()?;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = file.read(&mut buf).ok()?;
+        checkpoint()?;
+        let Ok(n) = file.read(&mut buf) else {
+            return Ok(None);
+        };
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
     }
+    checkpoint()?;
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(12);
     for byte in digest.iter().take(6) {
         use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
     }
-    Some(hex)
+    Ok(Some(hex))
 }
 
 #[cfg(test)]
@@ -1732,8 +2630,11 @@ mod tests {
         assert!(hp.is_multilingual(), "large-v3 family (51866)");
     }
 
+    /// bd-int8-encoder-mishears-m1q9: both calibrated shapes measured a positive
+    /// corpus WER delta, so the default is f32 on every target. On an AVX2 build
+    /// the old policy returned the int8 arm here.
     #[test]
-    fn encoder_int8_policy_allows_calibrated_model_shapes() {
+    fn encoder_int8_policy_defaults_calibrated_models_to_f32() {
         let tiny = WhisperHParams {
             n_vocab: 51_864,
             n_audio_ctx: 1_500,
@@ -1762,21 +2663,96 @@ mod tests {
         };
 
         for hp in [tiny, large_turbo] {
+            let row = encoder_int8_calibration(&hp).expect("calibrated shape has a row");
+            assert!(
+                row.corpus_wer_delta > ENCODER_INT8_WER_DELTA_BUDGET,
+                "calibration row {row:?} must record the measured over-budget delta"
+            );
+
+            // The admission rule on an int8-capable target, on every platform.
+            let avx2 = encoder_int8_policy_from_calibration(true, Some(row));
+            assert_eq!(avx2.action, EncoderInt8PolicyAction::F32Encoder);
+            assert_eq!(avx2.reason, "calibration_wer_budget_exceeded");
+            assert_eq!(avx2.measured_corpus_wer_delta, Some(row.corpus_wer_delta));
+
+            // The compiled default.
             let decision = encoder_int8_policy_decision(&hp);
+            assert_eq!(decision.action, EncoderInt8PolicyAction::F32Encoder);
+            assert!(!decision.enabled());
             if encoder_i8_kernel_supported() {
-                assert_eq!(
-                    decision.action,
-                    EncoderInt8PolicyAction::QualitySafeInt8Encoder
-                );
-                assert_eq!(decision.reason, "calibrated_model_budget_pass");
+                assert_eq!(decision, avx2);
             } else {
-                assert_eq!(decision.action, EncoderInt8PolicyAction::F32Encoder);
                 assert_eq!(decision.reason, "cpu_feature_fallback");
             }
             assert_eq!(decision.calibration_id, ENCODER_INT8_CALIBRATION_ID);
             assert_eq!(decision.corpus_wer_delta_budget, 0.0);
             assert_eq!(decision.quant_rel_rmse_budget, 0.09);
         }
+    }
+
+    #[test]
+    fn encoder_int8_policy_admits_int8_only_inside_the_wer_budget() {
+        let row = |corpus_wer_delta| Some(EncoderInt8Calibration { corpus_wer_delta });
+
+        let pass = encoder_int8_policy_from_calibration(true, row(0.0));
+        assert_eq!(pass.action, EncoderInt8PolicyAction::QualitySafeInt8Encoder);
+        assert_eq!(pass.reason, "calibrated_model_budget_pass");
+        let better = encoder_int8_policy_from_calibration(true, row(-0.001));
+        assert!(better.enabled(), "a negative delta is inside a 0.0 budget");
+
+        // One extra word error per million reference words is over a 0.0 budget.
+        let over = encoder_int8_policy_from_calibration(true, row(1e-6));
+        assert!(!over.enabled());
+        assert_eq!(over.reason, "calibration_wer_budget_exceeded");
+
+        let no_kernel = encoder_int8_policy_from_calibration(false, row(0.0));
+        assert!(!no_kernel.enabled());
+        assert_eq!(no_kernel.reason, "cpu_feature_fallback");
+
+        let unknown = encoder_int8_policy_from_calibration(true, None);
+        assert!(!unknown.enabled());
+        assert_eq!(unknown.reason, "uncalibrated_model_fallback");
+        assert_eq!(unknown.measured_corpus_wer_delta, None);
+    }
+
+    #[test]
+    fn encoder_int8_override_forces_either_arm_over_the_default() {
+        let row = EncoderInt8Calibration {
+            corpus_wer_delta: 0.004,
+        };
+        let f32_default = encoder_int8_policy_from_calibration(true, Some(row));
+        assert!(!f32_default.enabled());
+
+        let forced = apply_encoder_int8_override(Some(true), f32_default);
+        assert!(
+            forced.enabled(),
+            "FW_ENC_ATTN_OUT_I8I32=1 must still opt in"
+        );
+        assert_eq!(forced.reason, "operator_forced_quality_safe_int8");
+        assert_eq!(forced.measured_corpus_wer_delta, Some(0.004));
+
+        // A non-AVX2 target or an uncalibrated shape can still be forced.
+        let forced_anywhere = apply_encoder_int8_override(
+            Some(true),
+            encoder_int8_policy_from_calibration(false, None),
+        );
+        assert!(forced_anywhere.enabled());
+
+        let int8_default = encoder_int8_policy_from_calibration(
+            true,
+            Some(EncoderInt8Calibration {
+                corpus_wer_delta: 0.0,
+            }),
+        );
+        let killed = apply_encoder_int8_override(Some(false), int8_default);
+        assert!(!killed.enabled());
+        assert_eq!(killed.reason, "operator_f32_kill_switch");
+
+        assert_eq!(apply_encoder_int8_override(None, f32_default), f32_default);
+        assert_eq!(
+            apply_encoder_int8_override(None, int8_default),
+            int8_default
+        );
     }
 
     #[test]
@@ -1832,8 +2808,10 @@ mod tests {
             n_mels: 80,
             ftype: 1,
         };
+        assert_eq!(encoder_int8_calibration(&unknown), None);
         let decision = encoder_int8_policy_decision(&unknown);
         assert_eq!(decision.action, EncoderInt8PolicyAction::F32Encoder);
+        assert_eq!(decision.measured_corpus_wer_delta, None);
         if encoder_i8_kernel_supported() {
             assert_eq!(decision.reason, "uncalibrated_model_fallback");
         } else {
@@ -2111,15 +3089,34 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
+    fn release_package_specs_are_only_bare_sentinels() {
+        for spec in ["", "   ", "default", "DEFAULT", "large-v3-turbo"] {
+            assert!(is_release_package_spec(spec), "expected sentinel: {spec:?}");
+        }
+        for spec in [
+            "./default",
+            "/models/default",
+            "ggml-large-v3-turbo.bin",
+            "tiny.en",
+        ] {
+            assert!(
+                !is_release_package_spec(spec),
+                "explicit path or custom name must not be a sentinel: {spec:?}"
+            );
+        }
+    }
+
+    #[test]
     fn resolve_model_existing_path_is_canonicalized() {
         let dir = TempDir::new("path");
         let mut valid = Vec::new();
         push_valid_header(&mut valid, 1);
-        let path = write_file(dir.path(), "ggml-tiny.en.bin", &valid);
-        // Pass a relative-ish/non-canonical spec via the absolute path; result
-        // must be the canonical form of the same file.
+        let path = write_file(dir.path(), "default", &valid);
+        // Even a release-sentinel basename remains a custom model when the
+        // caller supplies an explicit absolute path.
         let resolved = resolve_model(path.to_str().expect("utf8")).expect("resolve");
         assert_eq!(resolved, path.canonicalize().expect("canon"));
+        assert!(native_model_available(path.to_str().expect("utf8")));
     }
 
     #[test]
@@ -2282,8 +3279,263 @@ mod tests {
 
     #[test]
     fn default_threads_in_bounds() {
+        // The width of the pool a run leases when neither `--threads` nor
+        // RAYON_NUM_THREADS is set: at least one worker, never more workers
+        // than the host can run. The old `1..=32` bound predated sizing
+        // high-core hosts by physical cores (64 on a 64-core/128-thread host,
+        // the width the --threads ledger row records for an unset flag).
+        let host = host_parallelism();
         let n = default_threads();
-        assert!((1..=32).contains(&n), "threads {n} must be 1..=32");
+        assert!((1..=host).contains(&n), "threads {n} must be 1..={host}");
+    }
+
+    #[test]
+    fn default_threads_follow_the_documented_host_shapes() {
+        // (logical CPUs, physical cores, pool width). Pure function of the
+        // shape, so every host checks the high-core rows, not just big ones.
+        let shapes: [(usize, Option<usize>, usize); 10] = [
+            (1, Some(1), 1),
+            (8, Some(4), 8),
+            (32, Some(16), 32),
+            (32, None, 32),
+            // Above 32 logical: physical cores, never below 32.
+            (48, Some(24), 32),
+            (64, Some(32), 32),
+            (96, Some(96), 96),
+            (128, Some(64), 64),
+            (256, Some(128), 128),
+            // SMT layout unreadable: logical parallelism.
+            (128, None, 128),
+        ];
+        for (host, physical, want) in shapes {
+            assert_eq!(
+                default_threads_for(host, || physical),
+                want,
+                "default threads for {host} logical / {physical:?} physical"
+            );
+        }
+        let queried = std::cell::Cell::new(false);
+        let _ = default_threads_for(16, || {
+            queried.set(true);
+            Some(8)
+        });
+        assert!(
+            !queried.get(),
+            "hosts with at most 32 logical CPUs must not read the SMT layout"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Compute pool bound (bd-threads-flag-unbounded-f4pq)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn effective_compute_threads_prefers_the_request() {
+        assert_eq!(effective_compute_threads(Some(3)), 3.min(usable_cpus()));
+        assert_eq!(effective_compute_threads(Some(1)), 1);
+        // 0 is not a pool: it falls back like an absent request.
+        assert!(effective_compute_threads(Some(0)) >= 1);
+        assert!(effective_compute_threads(None) >= 1);
+    }
+
+    /// bd-threads-unclamped-pools-never-retired-7kuk: a request wider than
+    /// the CPUs this process may use computes on that many CPUs.
+    #[test]
+    fn a_requested_width_beyond_the_usable_cpus_is_clamped_to_them() {
+        let usable = usable_cpus();
+        assert_eq!(effective_compute_threads(Some(usable + 5)), usable);
+        assert_eq!(effective_compute_threads(Some(512 * 1024)), usable);
+        assert_eq!(effective_compute_threads(Some(usable)), usable);
+        assert_eq!(
+            ComputeThreadsClamp::for_request(512, 14),
+            Some(ComputeThreadsClamp {
+                requested: 512,
+                effective: 14
+            })
+        );
+        assert_eq!(ComputeThreadsClamp::for_request(14, 14), None);
+        assert_eq!(ComputeThreadsClamp::for_request(3, 14), None);
+        assert_eq!(
+            ComputeThreadsClamp::for_request(512, 14).map(|clamp| clamp.warning()),
+            Some(
+                "--threads 512 exceeds the 14 CPUs this process may use; computing on 14 threads"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// Distinct OS threads that ran the items of a parallel loop.
+    fn worker_threads_of_a_parallel_loop() -> std::collections::BTreeSet<String> {
+        use rayon::prelude::*;
+        (0..256)
+            .into_par_iter()
+            .map(|_| {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                format!("{:?}", std::thread::current().id())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Inside a sized run every rayon pool the engine reaches — the rayon
+    /// calls themselves, FrankenTorch-style `current_num_threads` sizing and
+    /// the pooled band splits — is exactly `threads` wide.
+    #[test]
+    fn with_compute_threads_sizes_every_pool_the_run_reaches() {
+        let (width, loop_threads, band_threads) = with_compute_threads(3, || {
+            let band_threads: std::collections::BTreeSet<String> = plat::scope(|s| {
+                let handles: Vec<_> = (0..12)
+                    .map(|_| {
+                        s.spawn(|| {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            format!("{:?}", std::thread::current().id())
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            (
+                rayon::current_num_threads(),
+                worker_threads_of_a_parallel_loop(),
+                band_threads,
+            )
+        })
+        .expect("compute pool");
+        assert_eq!(width, 3);
+        assert!(
+            loop_threads.len() <= 3,
+            "loop ran on {} threads",
+            loop_threads.len()
+        );
+        assert!(
+            band_threads.len() <= 3,
+            "bands ran on {} threads",
+            band_threads.len()
+        );
+    }
+
+    /// A nested engine call (the model load inside a backend run, a parallel
+    /// range) inherits the enclosing run's pool instead of picking its own.
+    #[test]
+    fn nested_with_compute_threads_inherits_the_enclosing_run() {
+        let inner = with_compute_threads(2, || {
+            with_compute_threads(7, rayon::current_num_threads).expect("nested")
+        })
+        .expect("outer");
+        assert_eq!(inner, 2);
+    }
+
+    /// Repeated runs of one width (a batch's inputs) reuse the same workers
+    /// rather than building a pool per run. Width 5 is used by no other test
+    /// in this binary, so no concurrent test can hold the leased pool. Other
+    /// tests lease more widths than `MAX_LIVE_COMPUTE_POOL_WIDTHS`, so the
+    /// idle width-5 pool may be retired between two runs; each retirement
+    /// allows one more pool, and nothing else does.
+    #[test]
+    fn repeated_runs_of_one_width_reuse_the_same_workers() {
+        let retired = || compute_pools().retired.get(&5).copied().unwrap_or(0);
+        let retired_before = retired();
+        let mut all = std::collections::BTreeSet::new();
+        for _ in 0..4 {
+            let threads =
+                with_compute_threads(5, worker_threads_of_a_parallel_loop).expect("compute pool");
+            assert!(threads.len() <= 5);
+            all.extend(threads);
+        }
+        let pools_allowed = 1 + usize::try_from(retired() - retired_before).expect("small count");
+        assert!(
+            all.len() <= 5 * pools_allowed,
+            "4 runs at --threads 5 used {} distinct worker threads ({} width-5 retirements)",
+            all.len(),
+            pools_allowed - 1
+        );
+    }
+
+    fn build_test_pool(_id: usize, width: usize) -> FwResult<rayon::ThreadPool> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(width)
+            .build()
+            .map_err(|e| FwError::Io(std::io::Error::other(e.to_string())))
+    }
+
+    /// bd-threads-unclamped-pools-never-retired-7kuk: runs of more widths
+    /// than `MAX_LIVE_COMPUTE_POOL_WIDTHS` retire the least recently used
+    /// idle widths (their pools are dropped), never a leased pool, and a
+    /// width still cached is reused rather than rebuilt.
+    #[test]
+    fn compute_pool_cache_retires_least_recently_used_idle_widths_never_a_leased_pool() {
+        let mut cache = ComputePoolCache::default();
+        let (held, held_pool) = cache.lease(1, build_test_pool).expect("lease width 1");
+        let mut dropped = std::collections::BTreeMap::new();
+        for width in 2..=7 {
+            let (id, pool) = cache.lease(width, build_test_pool).expect("lease");
+            dropped.insert(width, Arc::downgrade(&pool));
+            drop(pool);
+            cache.release(id, width);
+            assert!(
+                cache.last_used.len() <= MAX_LIVE_COMPUTE_POOL_WIDTHS,
+                "{} live widths after width {width}",
+                cache.last_used.len()
+            );
+        }
+        // The held width plus the three most recently used idle widths.
+        let live: std::collections::BTreeSet<usize> = cache.last_used.keys().copied().collect();
+        assert_eq!(live, [1, 5, 6, 7].into_iter().collect());
+        for width in 2..=4 {
+            assert!(
+                dropped[&width].upgrade().is_none(),
+                "retired width {width} still has a pool"
+            );
+            assert_eq!(cache.retired.get(&width), Some(&1));
+        }
+        for width in 5..=7 {
+            assert!(
+                dropped[&width].upgrade().is_some(),
+                "width {width} was retired"
+            );
+        }
+        // The leased pool, the least recently used of all, was never retired
+        // and still computes.
+        assert!(cache.pool(held).is_some());
+        assert_eq!(held_pool.install(rayon::current_num_threads), 1);
+        // A cached width is reused, not rebuilt.
+        let never_build = |_: usize, width: usize| -> FwResult<rayon::ThreadPool> {
+            panic!("width {width} must come from the cache")
+        };
+        let (six, _) = cache.lease(6, never_build).expect("cached width 6");
+        cache.release(six, 6);
+        // Released, the held pool is idle and the next run of its width gets it.
+        cache.release(held, 1);
+        let (again, _) = cache.lease(1, never_build).expect("cached width 1");
+        assert_eq!(again, held);
+    }
+
+    /// Two runs in flight at once never share workers, so neither can steal
+    /// the other's job onto its stack (where a per-forward lock such as the
+    /// encoder's SDPA policy pin, held by the outer frame for a different
+    /// model, could never be acquired). Width 6 is used by no other test.
+    #[test]
+    fn concurrent_runs_of_one_width_get_disjoint_workers() {
+        let both_inside = std::sync::Barrier::new(2);
+        let run = || {
+            with_compute_threads(6, || {
+                both_inside.wait();
+                let threads = worker_threads_of_a_parallel_loop();
+                both_inside.wait();
+                threads
+            })
+            .expect("compute pool")
+        };
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(run);
+            let b = s.spawn(run);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert!(
+            a.is_disjoint(&b),
+            "concurrent runs shared workers: {a:?} vs {b:?}"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -2292,6 +3544,11 @@ mod tests {
 
     #[test]
     fn cache_returns_same_arc_then_reloads_after_drop() {
+        // A concurrently running residency test would retain this model and
+        // keep its `Weak` alive; serialize on the shared lifetime lock.
+        let _slot = RESIDENT_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new("cache");
         let path = write_file(dir.path(), "ggml-cache.bin", synthetic_model_bytes());
 
@@ -2354,7 +3611,8 @@ mod tests {
         let dir = TempDir::new("resident_cache");
         let path = write_file(dir.path(), "ggml-resident.bin", synthetic_model_bytes());
 
-        let a = NativeWhisperModel::load_inner(&path, true).expect("resident load a");
+        let a =
+            NativeWhisperModel::load_inner(&path, true, &|| Ok(()), true).expect("resident load a");
         let _ = a.version_tag();
         let weak = Arc::downgrade(&a);
         drop(a);
@@ -2362,11 +3620,135 @@ mod tests {
         let retained = weak
             .upgrade()
             .expect("resident cache must keep the model alive after caller drop");
-        let b = NativeWhisperModel::load_inner(&path, true).expect("resident load b");
+        let b =
+            NativeWhisperModel::load_inner(&path, true, &|| Ok(()), true).expect("resident load b");
         assert!(
             Arc::ptr_eq(&retained, &b),
             "resident reload must return the retained Arc"
         );
+    }
+
+    #[test]
+    fn batch_residency_retains_loaded_models_until_the_last_guard_drops() {
+        let _slot = RESIDENT_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = TempDir::new("batch_residency");
+        let path = write_file(dir.path(), "ggml-batch.bin", synthetic_model_bytes());
+
+        let outer = ModelResidency::begin();
+        let inner = ModelResidency::begin();
+        assert!(residency_active());
+        // `load_with_checkpoint` spawns no version-tag warm thread, so the
+        // only strong references are this test's and the residency's.
+        let first = NativeWhisperModel::load_with_checkpoint(&path, &|| Ok(())).expect("load");
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        let second =
+            NativeWhisperModel::load_with_checkpoint(&path, &|| Ok(())).expect("second load");
+        assert!(
+            weak.upgrade()
+                .is_some_and(|kept| Arc::ptr_eq(&kept, &second)),
+            "a batch reuses the resident model instead of re-parsing the file"
+        );
+        drop(second);
+        drop(inner);
+        assert!(
+            weak.upgrade().is_some(),
+            "a nested guard's drop must not end the outer residency"
+        );
+        drop(outer);
+        assert!(!residency_active());
+        assert!(
+            weak.upgrade().is_none(),
+            "the last guard releases every retained model"
+        );
+    }
+
+    #[test]
+    fn batch_residency_reuses_the_authenticated_release_package() {
+        let _slot = RESIDENT_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = TempDir::new("batch_release_package");
+        let bytes = synthetic_model_bytes();
+        let path = write_file(dir.path(), "ggml-batch-package.bin", bytes);
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let package = crate::model_distribution::CachedWhisperPackage::from_authenticated_test_file(
+            path.clone(),
+            digest,
+            std::fs::File::open(&path).expect("open verified generation"),
+        );
+
+        remember_release_package(&package);
+        assert!(
+            resident_release_package().is_none(),
+            "without a guard every resolution re-authenticates"
+        );
+        // Control: without a guard, a run's dropped handle frees the parse
+        // (the cache holds only a `Weak`), so the next run parses again.
+        let unguarded =
+            NativeWhisperModel::load_authenticated_with_checkpoint(&package, &|| Ok(()))
+                .expect("unguarded authenticated load");
+        let unguarded_weak = Arc::downgrade(&unguarded);
+        drop(unguarded);
+        assert!(
+            unguarded_weak.upgrade().is_none(),
+            "without a residency nothing keeps the authenticated model"
+        );
+
+        let residency = ModelResidency::begin();
+        remember_release_package(&package);
+        let reused = resident_release_package().expect("the residency keeps the package");
+        assert_eq!(reused, package);
+        // Each batch input drops its handle when its run ends; only the
+        // residency can keep the parsed model for the next input. (Holding
+        // the first handle while loading the second would get the same `Arc`
+        // from the `Weak` cache with or without a residency.)
+        let first = NativeWhisperModel::load_authenticated_with_checkpoint(&reused, &|| Ok(()))
+            .expect("first authenticated load");
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        let second = NativeWhisperModel::load_authenticated_with_checkpoint(&reused, &|| Ok(()))
+            .expect("second authenticated load");
+        assert!(
+            weak.upgrade()
+                .is_some_and(|kept| Arc::ptr_eq(&kept, &second)),
+            "one parse per batch: the residency kept the authenticated model"
+        );
+        drop(second);
+        drop(residency);
+        assert!(resident_release_package().is_none());
+        assert!(
+            weak.upgrade().is_none(),
+            "the last guard releases the authenticated model"
+        );
+    }
+
+    #[test]
+    fn batch_residency_components_live_only_inside_a_residency() {
+        let _slot = RESIDENT_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let value = Arc::new(7_u32);
+        retain_resident_component("test.batch_component", &value);
+        assert!(resident_component::<u32>("test.batch_component").is_none());
+
+        let residency = ModelResidency::begin();
+        retain_resident_component("test.batch_component", &value);
+        retain_resident_component("test.batch_component", &Arc::new(9_u32));
+        assert_eq!(
+            resident_component::<u32>("test.batch_component").as_deref(),
+            Some(&7),
+            "the first retained value wins"
+        );
+        assert!(
+            resident_component::<String>("test.batch_component").is_none(),
+            "a type mismatch is a miss, not a panic"
+        );
+        drop(residency);
+        assert!(resident_component::<u32>("test.batch_component").is_none());
+        assert_eq!(Arc::strong_count(&value), 1, "the residency released it");
     }
 
     #[test]
@@ -2443,6 +3825,108 @@ mod tests {
             m1.version_tag(),
             m2.version_tag(),
             "distinct file contents must hash differently"
+        );
+    }
+
+    #[test]
+    fn version_hash_honors_checkpoint_between_file_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = TempDir::new("vtag_cancel");
+        let bytes = vec![0u8; 3 * 64 * 1024];
+        let path = write_file(dir.path(), "ggml-vtag-cancel.bin", &bytes);
+        let checks = AtomicUsize::new(0);
+
+        let result = file_sha256_prefix_with_checkpoint(&path, &|| {
+            let check = checks.fetch_add(1, Ordering::SeqCst);
+            if check >= 2 {
+                Err(FwError::StageTimeout {
+                    stage: "backend".to_owned(),
+                    budget_ms: 20,
+                })
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(FwError::StageTimeout { .. })));
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            3,
+            "hashing must poll again after its first 64 KiB read"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_load_survives_path_replacement_without_cache_aliasing() {
+        let dir = TempDir::new("authenticated_replacement");
+        let original = synthetic_model_bytes();
+        let path = write_file(dir.path(), "ggml-authenticated.bin", original);
+        let verified_file = std::fs::File::open(&path).expect("open verified generation");
+        let digest = format!("{:x}", Sha256::digest(original));
+        let package = crate::model_distribution::CachedWhisperPackage::from_authenticated_test_file(
+            path.clone(),
+            digest.clone(),
+            verified_file,
+        );
+
+        // Replace the directory entry after authentication with another valid
+        // same-sized model generation whose first mel-filter value differs.
+        let mut replacement = original.to_vec();
+        replacement[56..60].copy_from_slice(&1.25_f32.to_le_bytes());
+        let replacement_path = write_file(dir.path(), "ggml-replacement.bin", &replacement);
+        std::fs::rename(&replacement_path, &path).expect("replace cache pathname");
+
+        let authenticated = NativeWhisperModel::load_authenticated(&package)
+            .expect("load verified descriptor generation");
+        let unverified = NativeWhisperModel::load(&path).expect("load replacement pathname");
+
+        assert_eq!(authenticated.loaded().filters.data[0], 0.0);
+        assert_eq!(unverified.loaded().filters.data[0], 1.25);
+        assert!(!Arc::ptr_eq(&authenticated, &unverified));
+        assert_eq!(
+            authenticated.version_tag(),
+            format!("fw-native-v1+sha256:{}", &digest[..12])
+        );
+        assert_ne!(authenticated.version_tag(), unverified.version_tag());
+    }
+
+    #[test]
+    fn authenticated_load_rejects_an_in_place_rewrite_after_verification() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        // bd-iej1: rewriting the SAME inode after authentication (no rename)
+        // must not reach inference under the authenticated digest.
+        let dir = TempDir::new("authenticated_in_place");
+        let original = synthetic_model_bytes();
+        let path = write_file(dir.path(), "ggml-in-place.bin", original);
+        let verified_file = std::fs::File::open(&path).expect("open verified generation");
+        let digest = format!("{:x}", Sha256::digest(original));
+        let package = crate::model_distribution::CachedWhisperPackage::from_authenticated_test_file(
+            path.clone(),
+            digest,
+            verified_file,
+        );
+
+        // Ensure the rewrite lands on a later timestamp tick on coarse clocks.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open for in-place rewrite");
+        writer.seek(SeekFrom::Start(56)).expect("seek");
+        writer
+            .write_all(&1.25_f32.to_le_bytes())
+            .expect("rewrite filter bytes");
+        writer.sync_all().expect("sync rewrite");
+
+        let Err(error) = NativeWhisperModel::load_authenticated(&package) else {
+            panic!("an in-place rewrite after authentication must fail closed");
+        };
+        assert!(
+            error.to_string().contains("changed after verification"),
+            "{error}"
         );
     }
 

@@ -9,11 +9,14 @@
 #
 # Modes (selected by inspecting the argument vector):
 #   --version                         -> prints a canned YYYY.MM.DD date line
-#   --flat-playlist --dump-json URL   -> prints 2 canned flat-playlist JSON lines
-#   -j ... (no --flat-playlist)       -> prints one canned full-metadata JSON object
-#   -f ba ... -o TEMPLATE --print after_move:filepath URL
+#   --flat-playlist --dump-json --simulate URL
+#                                     -> prints 2 canned flat-playlist JSON lines
+#   -j --simulate ... (no --flat-playlist)
+#                                     -> prints one canned full-metadata JSON object
+#   -f bestaudio/best ... -o TEMPLATE --print after_move:filepath URL
 #                                     -> copies $STUB_FIXTURE_WAV (default: the
-#                                        repo jfk.wav) to <dest_dir>/<id>.wav and
+#                                        tracked repo jfk_cut8.bin WAV) to
+#                                        <dest_dir>/<id>.wav and
 #                                        prints that path on its own stdout line
 #
 # Error injection via STUB_FAIL_MODE or an `fw_stub_fail=<mode>` URL query:
@@ -22,9 +25,18 @@
 #   429     -> stderr "ERROR: HTTP Error 429: Too Many Requests"                exit 1
 #   exit1   -> generic stderr + exit 1
 #
+# Download-shape injection via URL query:
+#   fw_stub_ext=flv  -> materialize and print the exact-id artifact with a .flv suffix
+#   fw_stub_ext=json -> materialize and print a non-media sidecar path
+#
+# Playlist-size injection via URL query:
+#   fw_stub_flat_lines=<abs path> -> in --flat-playlist mode, print that file
+#                                    verbatim instead of the two canned lines
+#                                    (path ends at the next `&`)
+#
 # Override knobs (env):
 #   STUB_VERSION        version string printed for --version   (default 2025.01.01)
-#   STUB_FIXTURE_WAV    source wav copied on download          (default repo jfk.wav)
+#   STUB_FIXTURE_WAV    source wav copied on download   (default tracked jfk_cut8.bin)
 #   STUB_VIDEO_ID       id used for the download output name    (default dQw4w9WgXcQ)
 #   STUB_LIVE_STATUS    live_status field in -j metadata        (default not_live)
 
@@ -38,20 +50,28 @@ fi
 
 # ---- error injection ------------------------------------------------------
 # The URL-query form keeps parallel Rust tests hermetic without creating and
-# immediately executing temporary wrapper scripts. Some Linux/network-backed
-# filesystems can reject that pattern transiently with ETXTBSY even after the
-# writer has closed the file.
+# immediately executing temporary wrapper scripts. On Linux, execve of a file
+# fails with ETXTBSY while ANY process holds it open for writing, and a child
+# that another test thread forks while the writer's descriptor is open keeps a
+# copy of it until that child execs: the writer closing its own copy is not
+# enough. A tracked script that no test writes cannot hit that race.
 FAIL_MODE="${STUB_FAIL_MODE:-}"
-if [ -z "$FAIL_MODE" ]; then
-  for arg in "$@"; do
-    case "$arg" in
-      *fw_stub_fail=private*) FAIL_MODE="private" ;;
-      *fw_stub_fail=geo*)     FAIL_MODE="geo" ;;
-      *fw_stub_fail=429*)     FAIL_MODE="429" ;;
-      *fw_stub_fail=exit1*)   FAIL_MODE="exit1" ;;
-    esac
-  done
-fi
+OUTPUT_EXT="wav"
+FLAT_LINES_FILE=""
+for arg in "$@"; do
+  case "$arg" in
+    *fw_stub_fail=private*) [ -n "$FAIL_MODE" ] || FAIL_MODE="private" ;;
+    *fw_stub_fail=geo*)     [ -n "$FAIL_MODE" ] || FAIL_MODE="geo" ;;
+    *fw_stub_fail=429*)     [ -n "$FAIL_MODE" ] || FAIL_MODE="429" ;;
+    *fw_stub_fail=exit1*)   [ -n "$FAIL_MODE" ] || FAIL_MODE="exit1" ;;
+    *fw_stub_ext=flv*)      OUTPUT_EXT="flv" ;;
+    *fw_stub_ext=json*)     OUTPUT_EXT="json" ;;
+    *fw_stub_flat_lines=*)
+      FLAT_LINES_FILE="${arg#*fw_stub_flat_lines=}"
+      FLAT_LINES_FILE="${FLAT_LINES_FILE%%&*}"
+      ;;
+  esac
+done
 
 case "$FAIL_MODE" in
   private)
@@ -76,9 +96,13 @@ esac
 WANT_VERSION=0
 WANT_FLAT=0
 WANT_J=0
+WANT_SIMULATE=0
+WANT_NO_SIMULATE=0
 WANT_DOWNLOAD=0
+WANT_SEARCH=0
 DEST_TEMPLATE=""
 NEXT_IS_OUTPUT=0
+OPTIONS_DONE=0
 
 LAST_URL=""
 for arg in "$@"; do
@@ -87,20 +111,39 @@ for arg in "$@"; do
     NEXT_IS_OUTPUT=0
     continue
   fi
+  if [ "$OPTIONS_DONE" -eq 1 ]; then
+    case "$arg" in
+      ytsearch*) WANT_SEARCH=1 ;;
+      *)         LAST_URL="$arg" ;;
+    esac
+    continue
+  fi
   case "$arg" in
+    --)               OPTIONS_DONE=1 ;;
     --version)        WANT_VERSION=1 ;;
     --flat-playlist)  WANT_FLAT=1 ;;
     -j)               WANT_J=1 ;;
-    -f)               WANT_DOWNLOAD=1 ;;  # `-f ba` only appears on the download path
+    --simulate)       WANT_SIMULATE=1 ;;
+    --no-simulate)    WANT_NO_SIMULATE=1 ;;
+    ytsearch*)        WANT_SEARCH=1 ;;
+    -f)               WANT_DOWNLOAD=1 ;;  # format selection only appears on downloads
     -o)               NEXT_IS_OUTPUT=1 ;;
     http*)            LAST_URL="$arg" ;;  # remember the URL for id derivation
   esac
 done
 
+require_simulation() {
+  if [ "$WANT_SIMULATE" -ne 1 ] || [ "$WANT_NO_SIMULATE" -ne 0 ]; then
+    echo "ERROR: metadata-only operation must use --simulate and must not use --no-simulate" >&2
+    exit 2
+  fi
+}
+
 # Derive a stable video id from a watch URL so multi-URL runs stay distinct
 # and self-consistent. Falls back to STUB_VIDEO_ID for non-watch inputs.
 url_to_id() {
   local u="$1" id=""
+  u="${u%%#*}"
   case "$u" in
     *watch?v=*)   id="${u#*watch?v=}"; id="${id%%&*}" ;;
     *youtu.be/*)  id="${u#*youtu.be/}"; id="${id%%[?&]*}" ;;
@@ -116,8 +159,33 @@ if [ "$WANT_VERSION" -eq 1 ]; then
   exit 0
 fi
 
+# ---- catalog search (bd-m7fv) ---------------------------------------------
+if [ "$WANT_SEARCH" -eq 1 ]; then
+  require_simulation
+  if [ "$WANT_FLAT" -eq 1 ]; then
+    echo '{"id":"srchflat0001","title":"Flat Search Hit One","url":"https://www.youtube.com/watch?v=srchflat0001","duration":95.0}'
+    echo '{"id":"srchflat0002","title":"Flat Search Hit Two","webpage_url":"https://www.youtube.com/watch?v=srchflat0002","duration":150}'
+  else
+    # Third line repeats the first id: exercises the caller's dedup-by-id.
+    cat <<'EOF'
+{"id":"srchenr0001","title":"Enriched Search Hit One","channel":"Search Channel","view_count":4242,"upload_date":"20250301","duration":187.5,"url":"https://www.youtube.com/watch?v=srchenr0001"}
+{"id":"srchenr0002","title":"Enriched Search Hit Two","channel":"Other Channel","duration":99.0,"webpage_url":"https://www.youtube.com/watch?v=srchenr0002"}
+{"id":"srchenr0001","title":"Enriched Search Hit One (repeat)","url":"https://www.youtube.com/watch?v=srchenr0001"}
+EOF
+  fi
+  exit 0
+fi
+
 # ---- playlist expansion ---------------------------------------------------
 if [ "$WANT_FLAT" -eq 1 ]; then
+  require_simulation
+  if [ -n "$FLAT_LINES_FILE" ]; then
+    if [ ! -f "$FLAT_LINES_FILE" ]; then
+      echo "ERROR: stub flat-lines file not found at $FLAT_LINES_FILE" >&2
+      exit 2
+    fi
+    exec cat "$FLAT_LINES_FILE"
+  fi
   echo '{"id":"vid000000001","title":"First Playlist Entry","url":"https://www.youtube.com/watch?v=vid000000001","duration":61.0}'
   # Second line intentionally uses webpage_url instead of url (fallback path)
   # and an integer duration to exercise numeric coercion.
@@ -127,6 +195,7 @@ fi
 
 # ---- full metadata --------------------------------------------------------
 if [ "$WANT_J" -eq 1 ] && [ "$WANT_DOWNLOAD" -eq 0 ]; then
+  require_simulation
   MID="$(url_to_id "$LAST_URL")"
   cat <<EOF
 {"id":"$MID","title":"Stub Title $MID","channel":"Stub Channel","uploader":"Stub Uploader","upload_date":"20240115","duration":212.0,"webpage_url":"https://www.youtube.com/watch?v=$MID","description":"A canned description.","availability":"public","live_status":"${STUB_LIVE_STATUS:-not_live}"}
@@ -149,16 +218,17 @@ if [ "$WANT_DOWNLOAD" -eq 1 ]; then
 
   SRC_WAV="${STUB_FIXTURE_WAV:-}"
   if [ -z "$SRC_WAV" ]; then
-    # Default: jfk.wav relative to this script (tests/fixtures/native/jfk.wav).
+    # The .bin suffix bypasses the fixture-size ignore rule; the bytes are a
+    # valid RIFF/WAVE file tracked in Git and therefore present on RCH workers.
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    SRC_WAV="$SCRIPT_DIR/../native/jfk.wav"
+    SRC_WAV="$SCRIPT_DIR/../native/jfk_cut8.bin"
   fi
   if [ ! -f "$SRC_WAV" ]; then
     echo "ERROR: stub fixture wav not found at $SRC_WAV" >&2
     exit 1
   fi
 
-  OUT_PATH="$DEST_DIR/$VIDEO_ID.wav"
+  OUT_PATH="$DEST_DIR/$VIDEO_ID.$OUTPUT_EXT"
   cp "$SRC_WAV" "$OUT_PATH"
 
   # Emulate yt-dlp's `--print after_move:filepath`: print the final path on
