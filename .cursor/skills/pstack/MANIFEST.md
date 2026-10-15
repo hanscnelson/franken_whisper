@@ -1,0 +1,3 @@
+# pstack snapshot (copied 2026-10-14 from the box plugin /home/box/agent-data/plugins/pstack/pstack/skills/)
+Copied verbatim: SKILL.md of poteto-mode (+ playbooks/bug-fix.md), how, why, architect, arena, figure-it-out, blast-radius, benchmark-checklist, correct, create-verification-skill, show-me-your-work, bro, and principle-{prove-it-works, never-block-on-the-human, foundational-thinking, laziness-protocol, sequence-verifiable-units, separate-before-serializing-shared-state, encode-lessons-in-structure}.
+Not copied: automate-me (personal, only on request), other poteto-mode playbooks, and every skill's references/ and scripts/ subfolders (not readable from the source listing). Skills mention those files; treat them as absent.
