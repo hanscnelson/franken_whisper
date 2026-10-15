@@ -1,0 +1,37 @@
+---
+description: Load the vendored pstack workflow for every agent in this repo.
+alwaysApply: true
+---
+
+# Pstack
+
+Read `.cursor/skills/pstack/<name>/SKILL.md` before citing it. Cite only what you read.
+
+The vendored snapshot is `.cursor/skills/pstack/`. Update it only with `scripts/sync-pstack.sh <source-dir>`.
+
+## Decision table
+
+| Task type | pstack sequence |
+|---|---|
+| Bug fix | poteto-mode Bug fix playbook: reproduce on the real surface, then why (regression history) or how, then binary-search with runtime evidence, then architect if the fix crosses a boundary, then failing repro before the fix (sequence-verifiable-units), then prove-it-works on the same surface |
+| New feature | how, then foundational-thinking (data shape), then architect (with arena inside), then implement in verifiable units, then prove-it-works (verify-<app> skill if it exists) |
+| Refactor or migration | how, then why if layering changes, then laziness-protocol and subtract first, then figure-it-out for a large one, then sequence-verifiable-units with per-unit checks, then blast-radius |
+| Perf work | benchmark-checklist on the baseline, then Perf issue or Hillclimb playbook, then one change per measurement, then benchmark-checklist again before reporting any number |
+| Design decision | how, then why, then architect (2 or more designs through arena), and an opt-in checkpoint only on a one-way door |
+| Risky change (image Jacob will deploy, prod data) | blast-radius (prove the safety fact by running it), then prove-it-works, and Hans approves only truly irreversible steps |
+| Repeated correction | correct: add a rule row, enforce it at the highest level, and prove the check fails on the past mistake |
+| Explaining code | how (what it does) or why (motivation), then bro if Hans needs it in plain words |
+| Delegating (CLI review, Cloud agent) | the delegation contract (section 2b), with skills named per row above, then judge the returned evidence, and reject work that has none |
+| Long or unattended run | figure-it-out plus show-me-your-work |
+
+## Evidence a PR must return
+
+Return all of the following or the work is rejected:
+
+1. Commit SHA(s) and branch, plus the PR URL it landed on.
+2. The exact commands run and their verbatim output (failing then passing for each check), with the Actions run URLs.
+3. For any number: run count, median, range, limiter (benchmark-checklist).
+4. Verdict VERIFIED / NOT VERIFIED / INCONCLUSIVE against the predicate, and what is still unproven.
+5. Deviations from the plan, each with its reason.
+
+Put that evidence in the PR body's `## Verification` section. Fill `Predicate:`, `Commands:`, `Output:`, and `Verdict:`. CI `pr-evidence` fails while any of those four is empty or still a placeholder.

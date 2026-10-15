@@ -62,6 +62,27 @@ parameters explicitly on every row.
 
 ---
 
+## Pstack workflow (always on)
+
+Cursor agents load `.cursor/rules/pstack.mdc` (`alwaysApply: true`). That rule is the task-type decision table. The skills it names are vendored at `.cursor/skills/pstack/`. Read `.cursor/skills/pstack/<name>/SKILL.md` before citing a skill. Cite only what you read. The only supported update path is `scripts/sync-pstack.sh <source-dir>`.
+
+Production images and release builds come only from merged `main`. This repo has no image build. The gate is `scripts/check-build-from-main.sh`, and `.github/workflows/registry-release.yml` runs `check` and `push` before qualification on the preflight, Linux, and macOS jobs. The gate fetches `origin main` and refuses unless `HEAD` is an ancestor of `origin/main`, `git status --porcelain` is empty, free disk is at least `FW_MIN_FREE_MB` (default 2048), and, when `FW_IMAGE_TAG` is set, the tag equals the `Cargo.toml` package version or `v` plus that version. There is no `producer_version` in this repo. On success the gate prints `org.opencontainers.image.revision=<sha>` so the image label can be applied. There is no Dockerfile to attach that label today. `FW_ALLOW_NON_MAIN_IMAGE=1` is a logged override for a local dev image. `scripts/check-build-from-main.sh push` exits non-zero while that override is set, so the image is never pushed.
+
+| Rule | Enforced by | Level |
+|---|---|---|
+| Cloud agents get pstack automatically | vendored `.cursor/skills/pstack` plus `alwaysApply` rule, and CI `pstack-present` | architecture + CI |
+| Production images come only from merged main | build script ancestry check, a SHA label on the image, and branch protection | architecture |
+| Bug fixes land with a failing test first | CI `test-before-fix` | CI test |
+| Every PR carries verification evidence | PR template plus CI `pr-evidence` body check | CI lint |
+| Every delegation names skills, a predicate, and the evidence to return | pstack-always preflight; CAL II rejects returns with no evidence | process (judgment) |
+| Numbers are vetted before reporting | benchmark-checklist named in the contract; return item 3 required | process |
+| No quiet method switches | contract item 5 "deviations", plus a pstack-always hard rule | process |
+| Minimize Hans asks | never-block principle in pstack-always; asks bundled | docs (judgment) |
+| A repeat correction becomes a rule | /correct; a rule with no enforcer that repeats is escalated | process |
+| Parallel agents don't share a branch or disk budget | each Cloud agent gets its own branch; the build script checks free disk before building | architecture |
+
+---
+
 ## Project Mission
 
 `franken_whisper` is a native Rust, memory-safe, high-performance speech system that merges ideas from:
